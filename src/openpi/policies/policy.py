@@ -32,6 +32,7 @@ class Policy(BasePolicy):
     ):
         self._sample_actions = nnx_utils.module_jit(model.sample_actions)
         self._input_transform = _transforms.compose(transforms)
+        # import pdb; pdb.set_trace()
         self._output_transform = _transforms.compose(output_transforms)
         self._rng = rng or jax.random.key(0)
         self._sample_kwargs = sample_kwargs or {}
@@ -39,16 +40,30 @@ class Policy(BasePolicy):
 
     @override
     def infer(self, obs: dict) -> dict:  # type: ignore[misc]
-        # Make a copy since transformations may modify the inputs in place.
+        # Make a copy since transformations may modify the inputs in place.        
+        retargeted_actions = obs.pop("retargeted_actions", None)
+        time = obs.pop("time", 1.0)
+        action_dim_used = obs.pop("action_dim_used", None)
+        
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
+
         # Make a batch and convert to jax.Array.
         inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
+        
+        if retargeted_actions is not None:
+            # Convert retargeted actions to jax.Array and add batch dimension.
+            # this only works for PI droid!!!!
+            retargeted_actions_norm = self._input_transform.transforms[2]({"actions":retargeted_actions})['actions']
+
+        else:
+            retargeted_actions_norm = None
 
         self._rng, sample_rng = jax.random.split(self._rng)
+        
         outputs = {
             "state": inputs["state"],
-            "actions": self._sample_actions(sample_rng, _model.Observation.from_dict(inputs), **self._sample_kwargs),
+            "actions": self._sample_actions(sample_rng, _model.Observation.from_dict(inputs), retargeted_actions_norm = retargeted_actions_norm, time= time, action_dim_used = action_dim_used,  **self._sample_kwargs),
         }
 
         # Unbatch and convert to np.ndarray.
