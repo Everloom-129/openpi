@@ -2,7 +2,6 @@ import dataclasses
 import os
 from PIL import Image
 
-import jax
 import numpy as np
 
 from openpi.models import model as _model
@@ -76,9 +75,12 @@ def vis_example(example: dict, name: str):
 
 
 if __name__ == "__main__":
-    config = _config.get_config("pi0_fast_droid")
-    checkpoint_dir = download.maybe_download("gs://openpi-assets/checkpoints/pi0_fast_droid")
-    print(checkpoint_dir)
+
+
+    config = _config.get_config("pi05_droid")
+    checkpoint_dir = "/home/tony/projects/openpi/checkpoints/viz/pi05_droid_pytorch"
+
+    # Create a trained policy (automatically detects PyTorch format)
     policy = _policy_config.create_trained_policy(config, checkpoint_dir)
 
     camera = "left"
