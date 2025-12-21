@@ -2,21 +2,30 @@
 
 - [x] hacky viusalize overall map
     - [x] overlay heatmap on image
-    - [ ] resize image to 224x224
+    - [x] resize image to 224x224
 
 - [ ] viusalize all individual heads
-    - [ ] vibe checking
+    - [x] vibe checking
 
 - [ ] improve output into single big image
+- [x] combine output into video
 
-- [ ] understand imbedding type
+- [ ] understand embedding type
 - [ ] viusalize each step?
     - [ ] understand denoising effect 
     - [ ] 
 
+### Q&A
+- [ ] Ask Edward
+- [ ] Ask Manling
+- [ ] Ask Dinesh
+- [ ] Ask 
+
+
 ### writing 
-- [ ] overleaf start
-    - [ ]
+- [x] overleaf start
+    - [ ] 
+    - [ ] reference list 
 - [ ] literature review
 - [ ]
 

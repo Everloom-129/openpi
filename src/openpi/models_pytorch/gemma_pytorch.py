@@ -1,6 +1,8 @@
 from typing import Literal
 
 import pytest
+import numpy as np
+import os
 import torch
 from torch import nn
 from transformers import GemmaForCausalLM
@@ -107,7 +109,20 @@ class PaliGemmaWithExpertModel(nn.Module):
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 adarms_cond=adarms_cond[0] if adarms_cond is not None else None,
+                output_attentions=True,
             )
+
+            # --- HACK: Save Attention ---
+            if not self.training:
+                # prefix_output.attentions is a tuple of tensors, one per layer
+                if prefix_output.attentions is not None:
+                    os.makedirs("results/layers_prefix", exist_ok=True)
+                    for i, layer_attn in enumerate(prefix_output.attentions):
+                        save_path = f"results/layers_prefix/attn_map_layer_{i}.npy"
+                        np.save(save_path, layer_attn.detach().cpu().to(torch.float32).numpy())
+                    print(f"Saved {len(prefix_output.attentions)} layers of Prefix Attention to results/layers_prefix/")
+            # ----------------------------
+
             prefix_past_key_values = prefix_output.past_key_values
             prefix_output = prefix_output.last_hidden_state
             suffix_output = None
@@ -119,7 +134,19 @@ class PaliGemmaWithExpertModel(nn.Module):
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 adarms_cond=adarms_cond[1] if adarms_cond is not None else None,
+                output_attentions=True,
             )
+
+            # # --- HACK: Save Attention ---
+            # if not self.training:
+            #     if suffix_output.attentions is not None:
+            #         os.makedirs("results/layers_suffix", exist_ok=True)
+            #         for i, layer_attn in enumerate(suffix_output.attentions):
+            #             save_path = f"results/layers_suffix/attn_map_layer_{i}.npy"
+            #             np.save(save_path, layer_attn.detach().cpu().to(torch.float32).numpy())
+            #         # print(f"Saved {len(suffix_output.attentions)} layers of Suffix Attention to results/layers_suffix/")
+            # # ----------------------------
+
             suffix_output = suffix_output.last_hidden_state
             prefix_output = None
             prefix_past_key_values = None
@@ -278,4 +305,8 @@ class PaliGemmaWithExpertModel(nn.Module):
             suffix_output = outputs_embeds[1]
             prefix_past_key_values = None
 
+        # print("prefix_output", prefix_output)
+        # print("suffix_output", suffix_output) # None
+        # print("prefix_past_key_values", prefix_past_key_values)
+        # import pdb; pdb.set_trace()
         return [prefix_output, suffix_output], prefix_past_key_values
