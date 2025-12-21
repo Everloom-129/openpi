@@ -18,7 +18,7 @@ TIMESTEPS = range(TOTAL_FRAMES)
 # TIMESTEPS = get_keyframes(TOTAL_FRAMES, ACTION_HORIZON)
 
 
-def get_image_path(timestep_idx, layer, head):
+def get_duck_image_path(timestep_idx, layer, head):
     """Construct path to the visualization image."""
     folder_name = f"duck_{CAMERA}_{timestep_idx}"
     filename = f"head_{head:02d}.jpg"
@@ -27,84 +27,58 @@ def get_image_path(timestep_idx, layer, head):
     return path
 
 
-def get_summary_image_path(timestep_idx, layer, mode="max"):
+def get_image_path(timestep_idx, layer, head, base_dir=BASE_DIR, camera=CAMERA):
+    """Construct path to the visualization image."""
+    # This assumes the structure is base_dir/duck_{camera}_{timestep}/...
+    # But in the new pipeline, base_dir is already .../episode
+    # and the frames are in .../episode/{timestep:05d}/...
+
+    # Check if base_dir has "duck" in it, otherwise assume it's the episode dir
+    folder_name = f"duck_{camera}_{timestep_idx}"
+    path_duck = os.path.join(base_dir, folder_name, f"L{layer}_{ATTN_MODE}_heads", f"head_{head:02d}.jpg")
+
+    if os.path.exists(path_duck):
+        return path_duck
+
+    # New structure: base_dir/{timestep:05d}/L{layer}_prefix_heads/head_{head:02d}.jpg
+    # where base_dir is results_toy/success/.../episode
+
+    folder_name_new = f"{timestep_idx:05d}"
+    path_new = os.path.join(base_dir, folder_name_new, f"L{layer}_{ATTN_MODE}_heads", f"head_{head:02d}.jpg")
+
+    return path_new
+
+
+def get_summary_image_path(timestep_idx, layer, mode="max", base_dir=BASE_DIR, camera=CAMERA):
     """Construct path to the summary overlay image."""
-    folder_name = f"duck_{CAMERA}_{timestep_idx}"
-    # Example: results/duck_left_0/prefix_L15_attn_vis_max.jpg
+    folder_name = f"duck_{camera}_{timestep_idx}"
     filename = f"{ATTN_MODE}_L{layer}_attn_vis_{mode}.jpg"
-    path = os.path.join(BASE_DIR, folder_name, filename)
-    return path
+
+    path_duck = os.path.join(base_dir, folder_name, filename)
+    if os.path.exists(path_duck):
+        return path_duck
+
+    # New structure: base_dir/{timestep:05d}/prefix_L{layer}_attn_vis_max.jpg
+    folder_name_new = f"{timestep_idx:05d}"
+    path_new = os.path.join(base_dir, folder_name_new, filename)
+    return path_new
 
 
-def calculate_focus_score(image_path):
-    """
-    Calculate a score indicating how 'focused' the attention is.
-    We use the Variance of the heatmap region as a proxy.
-    Higher Variance = More focused spots (High peaks vs Low background).
-    Lower Variance = Diffuse/Uniform attention.
-    """
-    if not os.path.exists(image_path):
-        return 0.0
-
-    img = cv2.imread(image_path)
-    if img is None:
-        return 0.0
-
-    # Image layout is 3 columns: [Ext Attn] [Wrist Attn] [Ref Images]
-    # We focus on the first column (Exterior Attention) for scoring
-    height, width, _ = img.shape
-    one_third_width = width // 3
-
-    # Crop the Exterior Attention Heatmap part
-    ext_attn_img = img[:, :one_third_width, :]
-
-    # Convert to grayscale to measure intensity variance
-    gray = cv2.cvtColor(ext_attn_img, cv2.COLOR_BGR2GRAY)
-
-    # Calculate Variance
-    score = np.var(gray)
-    return score
-
-
-def rank_best_heads(reference_timestep=0):
-    """
-    Scans all layers and heads for a specific timestep and ranks them by focus score.
-    """
-    print(f"Analyzing heads for timestep {reference_timestep} to find the best ones...")
-    scores = []
-
-    # Assume 18 layers and 8 heads (standard for PaliGemma/Pi0)
-    for layer in range(18):
-        for head in range(8):
-            path = get_image_path(reference_timestep, layer, head)
-            score = calculate_focus_score(path)
-            if score > 0:
-                scores.append(((layer, head), score))
-
-    # Sort by score descending (High variance first)
-    scores.sort(key=lambda x: x[1], reverse=True)
-
-    print(f"\nTop 10 Most Focused Heads (Layer, Head):")
-    for (layer, head), score in scores[:10]:
-        print(f"Layer {layer:02d}, Head {head:02d} | Score: {score:.2f}")
-
-    return [x[0] for x in scores[:10]]
-
-
-def create_video_for_head(layer, head, output_filename=None):
+def create_video_for_head(
+    layer, head, fps=FPS_VIDEO, timesteps=TIMESTEPS, output_dir="results/videos", input_dir=BASE_DIR
+):
     """Creates a video sequence for a specific layer/head across all timesteps."""
 
     # Try VP90 (VP9) - Newer standard, often better supported
     fourcc_code = "VP90"
     ext = ".webm"
 
-    if output_filename is None:
-        os.makedirs("results/videos", exist_ok=True)
-        output_filename = f"results/videos/L{layer:02d}_H{head:02d}_{ATTN_MODE}{ext}"
+    os.makedirs(output_dir, exist_ok=True)
+    output_filename = os.path.join(output_dir, f"L{layer:02d}_H{head:02d}_{ATTN_MODE}{ext}")
 
     frames = []
-    for t in TIMESTEPS:
-        path = get_image_path(t, layer, head)
+    for t in timesteps:
+        path = get_image_path(t, layer, head, base_dir=input_dir)
         if os.path.exists(path):
             img = cv2.imread(path)
             # Add text annotation for timestep
@@ -120,15 +94,24 @@ def create_video_for_head(layer, head, output_filename=None):
     height, width, _ = frames[0].shape
 
     # Try creating video writer
-    fourcc = cv2.VideoWriter_fourcc(*fourcc_code)
-    fps = FPS_VIDEO
+    # fourcc = cv2.VideoWriter_fourcc(*fourcc_code)
+
+    # Check extension to decide codec
+    ext = os.path.splitext(output_filename)[1]
+    if ext == ".webm":
+        fourcc = cv2.VideoWriter_fourcc(*"VP90")
+    elif ext == ".mp4":
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    else:
+        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+
     out = cv2.VideoWriter(output_filename, fourcc, fps, (width, height))
 
-    # Fallback to MJPG (.avi) if WebM fails
+    # Fallback to MJPG (.avi) if writer fails
     if not out.isOpened():
-        print(f"Warning: Could not open video writer with {fourcc_code}. Falling back to MJPG (.avi).")
+        print(f"Warning: Could not open video writer for {output_filename}. Falling back to MJPG (.avi).")
+        output_filename = os.path.splitext(output_filename)[0] + ".avi"
         fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-        output_filename = output_filename.replace(ext, ".avi")
         out = cv2.VideoWriter(output_filename, fourcc, fps, (width, height))
 
     for frame in frames:
@@ -138,19 +121,16 @@ def create_video_for_head(layer, head, output_filename=None):
     print(f"Saved video to {output_filename}")
 
 
-def create_summary_video(layer, mode="max"):
+def create_summary_video(
+    layer, mode="max", fps=FPS_VIDEO, output_dir="results/videos/summary", timesteps=TIMESTEPS, input_dir=BASE_DIR
+):
     """Creates a video sequence for the summary overlay of a specific layer."""
-    output_dir = "results/videos/summary"
     os.makedirs(output_dir, exist_ok=True)
-
-    # Try VP90 (VP9) - Newer standard, often better supported
-    fourcc_code = "VP90"
-    ext = ".webm"
-    output_filename = os.path.join(output_dir, f"L{layer:02d}_{ATTN_MODE}_{mode}{ext}")
+    output_filename = os.path.join(output_dir, f"L{layer:02d}_{ATTN_MODE}_{mode}.webm")
 
     frames = []
-    for t in TIMESTEPS:
-        path = get_summary_image_path(t, layer, mode)
+    for t in timesteps:
+        path = get_summary_image_path(t, layer, mode, base_dir=input_dir)
         if os.path.exists(path):
             img = cv2.imread(path)
             if img is not None:
@@ -170,15 +150,22 @@ def create_summary_video(layer, mode="max"):
     height, width, _ = frames[0].shape
 
     # Try creating video writer
-    fourcc = cv2.VideoWriter_fourcc(*fourcc_code)
-    fps = FPS_VIDEO
+    ext = os.path.splitext(output_filename)[1]
+
+    if ext == ".webm":
+        fourcc = cv2.VideoWriter_fourcc(*"VP90")
+    elif ext == ".mp4":
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    else:
+        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+
     out = cv2.VideoWriter(output_filename, fourcc, fps, (width, height))
 
     # Fallback to MJPG (.avi) if WebM fails
     if not out.isOpened():
-        print(f"Warning: Could not open video writer with {fourcc_code}. Falling back to MJPG (.avi).")
+        print(f"Warning: Could not open video writer for {output_filename}. Falling back to MJPG (.avi).")
         fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-        output_filename = output_filename.replace(ext, ".avi")
+        output_filename = os.path.splitext(output_filename)[0] + ".avi"
         out = cv2.VideoWriter(output_filename, fourcc, fps, (width, height))
 
     for frame in frames:
@@ -201,6 +188,6 @@ if __name__ == "__main__":
     # Optional: Manually generate for specific layers you are interested in (e.g. L15)
     for layer in [1, 4, 5, 7, 10]:
         print(f"Generating videos for layer {layer}")
-        create_summary_video(layer, mode="max")
+        create_summary_video(layer, mode="max", timesteps=TIMESTEPS)
         # for head in range(8):
-        #     create_video_for_head(layer, head)
+        #     create_video_for_head(layer, head, timesteps=TIMESTEPS)

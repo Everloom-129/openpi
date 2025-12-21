@@ -17,7 +17,7 @@ import combine_video
 from attn_map import visualize_attention, visualize_heads, get_keyframes, process_episode
 
 OPEN_LOOP_HORIZON = 8
-
+LAYERS = [1, 4, 5, 7, 10]
 
 # # Ensure src is in pythonpath
 # sys.path.append(os.path.join(os.getcwd(), "src"))
@@ -55,7 +55,7 @@ def timer(func):
     return wrapper_timer
 
 
-def load_toy_example(data_dir: Path, index: int, camera: str = "left"):
+def load_toy_example(data_dir: Path, index: int, camera: str = "right"):
     if camera == "left":
         side_camera = "varied_camera_1"
     elif camera == "right":
@@ -73,7 +73,6 @@ def load_toy_example(data_dir: Path, index: int, camera: str = "left"):
     with open(instruction_path, "r") as f:
         instruction = f.read().strip()
     print(f"Instruction: {instruction}")
-
 
     return {
         "observation/exterior_image_1_left": ext_img,
@@ -99,7 +98,7 @@ def main():
         sys.exit(1)
 
     DATA_ROOT = Path(sys.argv[1])
-    RESULTS_ROOT = Path("results_toy")
+    RESULTS_ROOT = Path("results_toy_right")
 
     # Load Policy
     checkpoint_dir = "./checkpoints/viz/pi05_droid_pytorch"
@@ -140,15 +139,40 @@ def main():
                     # if (output_base_dir / f"{index:05d}").exists(): continue
 
                     try:
-                        example = load_toy_example(data_dir, index, camera="left")
+                        example = load_toy_example(data_dir, index, camera="right")
                         # Create subfolder for timestep: results_toy/.../episode/{index}
-                        attn_map.process_episode(policy, example, str(output_base_dir), f"{index:05d}")
+                        attn_map.process_episode(policy, example, str(output_base_dir), f"{index:05d}", layers=LAYERS)
                     except Exception as e:
                         print(f"Error processing frame {index}: {e}")
-                
+
                 # Create a marker file to indicate processing is complete
                 marker_file = output_base_dir / "pi05.md"
-                marker_file.write_text(f"# Processing Complete\n\nEpisode: {episode_id}\nOutcome: {outcome}\nDate: {date_dir.name}\nTotal Frames: {total_frames}\nKeyframes: {keyframes}\n")
+                marker_file.write_text(
+                    f"# Processing Complete\n\nEpisode: {episode_id}\nOutcome: {outcome}\nDate: {date_dir.name}\nTotal Frames: {total_frames}\nKeyframes: {keyframes}\n"
+                )
+
+                for layer in LAYERS:
+                    # Find images: output_base_dir/*/prefix_L{layer}_attn_vis_max.jpg
+                    pattern = str(output_base_dir / "*" / f"prefix_L{layer}_attn_vis_max.jpg")
+                    image_paths = sorted(glob.glob(pattern))
+
+                    if image_paths:
+                        # Video output path: results_toy_video/{success/failure}/{date}/{episode}/L{layer}_prefix_max.mp4
+                        video_output_dir = Path("results_toy_video_right") / rel_path
+                        video_output_dir.mkdir(parents=True, exist_ok=True)
+
+                        combine_video.create_summary_video(
+                            layer,
+                            mode="max",
+                            output_dir=video_output_dir,
+                            timesteps=keyframes,
+                            input_dir=output_base_dir,
+                        )
+                        # for head in range(8):
+                        #     combine_video.create_video_for_head(
+                        #         layer, head, timesteps=keyframes, output_dir=video_output_dir, input_dir=output_base_dir
+                        #     )
+
 
 if __name__ == "__main__":
     main()
