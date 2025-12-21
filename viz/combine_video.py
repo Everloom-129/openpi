@@ -11,7 +11,7 @@ CAMERA = "left"
 ATTN_MODE = "prefix"  # or "suffix"
 TOTAL_FRAMES = 90
 ACTION_HORIZON = 8
-
+FPS_VIDEO = 5
 
 
 TIMESTEPS = range(TOTAL_FRAMES)
@@ -24,6 +24,15 @@ def get_image_path(timestep_idx, layer, head):
     filename = f"head_{head:02d}.jpg"
     # Path: results/duck_left_0/L15_prefix_heads/head_03.jpg
     path = os.path.join(BASE_DIR, folder_name, f"L{layer}_{ATTN_MODE}_heads", filename)
+    return path
+
+
+def get_summary_image_path(timestep_idx, layer, mode="max"):
+    """Construct path to the summary overlay image."""
+    folder_name = f"duck_{CAMERA}_{timestep_idx}"
+    # Example: results/duck_left_0/prefix_L15_attn_vis_max.jpg
+    filename = f"{ATTN_MODE}_L{layer}_attn_vis_{mode}.jpg"
+    path = os.path.join(BASE_DIR, folder_name, filename)
     return path
 
 
@@ -85,8 +94,8 @@ def rank_best_heads(reference_timestep=0):
 def create_video_for_head(layer, head, output_filename=None):
     """Creates a video sequence for a specific layer/head across all timesteps."""
 
-    # Try VP80 (WebM) first - Good VS Code support, open standard
-    fourcc_code = "vp80"
+    # Try VP90 (VP9) - Newer standard, often better supported
+    fourcc_code = "VP90"
     ext = ".webm"
 
     if output_filename is None:
@@ -112,7 +121,7 @@ def create_video_for_head(layer, head, output_filename=None):
 
     # Try creating video writer
     fourcc = cv2.VideoWriter_fourcc(*fourcc_code)
-    fps = 2
+    fps = FPS_VIDEO
     out = cv2.VideoWriter(output_filename, fourcc, fps, (width, height))
 
     # Fallback to MJPG (.avi) if WebM fails
@@ -129,6 +138,56 @@ def create_video_for_head(layer, head, output_filename=None):
     print(f"Saved video to {output_filename}")
 
 
+def create_summary_video(layer, mode="max"):
+    """Creates a video sequence for the summary overlay of a specific layer."""
+    output_dir = "results/videos/summary"
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Try VP90 (VP9) - Newer standard, often better supported
+    fourcc_code = "VP90"
+    ext = ".webm"
+    output_filename = os.path.join(output_dir, f"L{layer:02d}_{ATTN_MODE}_{mode}{ext}")
+
+    frames = []
+    for t in TIMESTEPS:
+        path = get_summary_image_path(t, layer, mode)
+        if os.path.exists(path):
+            img = cv2.imread(path)
+            if img is not None:
+                # Add text annotation for timestep
+                cv2.putText(
+                    img, f"Timestep: {t}", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA
+                )
+                frames.append(img)
+        else:
+            # print(f"Warning: Missing summary frame for T={t} at {path}")
+            pass
+
+    if not frames:
+        print(f"No summary frames found for L{layer}, skipping video.")
+        return
+
+    height, width, _ = frames[0].shape
+
+    # Try creating video writer
+    fourcc = cv2.VideoWriter_fourcc(*fourcc_code)
+    fps = FPS_VIDEO
+    out = cv2.VideoWriter(output_filename, fourcc, fps, (width, height))
+
+    # Fallback to MJPG (.avi) if WebM fails
+    if not out.isOpened():
+        print(f"Warning: Could not open video writer with {fourcc_code}. Falling back to MJPG (.avi).")
+        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+        output_filename = output_filename.replace(ext, ".avi")
+        out = cv2.VideoWriter(output_filename, fourcc, fps, (width, height))
+
+    for frame in frames:
+        out.write(frame)
+
+    out.release()
+    print(f"Saved summary video to {output_filename}")
+
+
 if __name__ == "__main__":
     # 1. Analyze and find best heads based on the first timestep (or index 30 which might be more active)
     # Using index 0 as baseline
@@ -140,7 +199,8 @@ if __name__ == "__main__":
     #     create_video_for_head(layer, head)
 
     # Optional: Manually generate for specific layers you are interested in (e.g. L15)
-    print(f"Generating videos for specific layers...")
     for layer in [1, 4, 5, 7, 10]:
-        for head in range(8):
-            create_video_for_head(layer, head)
+        print(f"Generating videos for layer {layer}")
+        create_summary_video(layer, mode="max")
+        # for head in range(8):
+        #     create_video_for_head(layer, head)

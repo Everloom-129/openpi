@@ -37,12 +37,13 @@ def load_duck_example(camera: str = "left", index: int = 0):
     ext_img = np.array(Image.open(ext_path))
     hand_img = np.array(Image.open(hand_path))
 
+    instruction =  "place the duck toy into the pink bowl"
     return {
         "observation/exterior_image_1_left": ext_img,
         "observation/wrist_image_left": hand_img,
-        "observation/joint_position": np.random.rand(7),  # Placeholder
+        "observation/joint_position": np.random.rand(7),  # Placeholder # TODO read from real data
         "observation/gripper_position": np.random.rand(1),  # Placeholder
-        "prompt": "place the duck toy into the pink bowl",
+        "prompt": instruction,
     }
 
 
@@ -263,8 +264,6 @@ if __name__ == "__main__":
         print(f"VLA index {index}")
         example = load_duck_example(camera=camera, index=index)
 
-        result_dir = f"results_{camera}_{index}"
-        os.makedirs(result_dir, exist_ok=True)
         vis_example(example, f"duck_{camera}_{index}")
         # 1. Run Inference (generates .npy files)
         result = policy.infer(example)

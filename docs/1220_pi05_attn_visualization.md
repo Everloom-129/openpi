@@ -56,6 +56,7 @@ self.sample_actions = self._sample_actions
 将 Attention Map 叠加在原图上，用于快速判断该层是否关注了正确物体。
 - **操作**: 对 Heads 取平均 (或最大值)。
 - **布局**: 2x2 网格 (原图 vs 叠加图)。
+- **输出**: 保存为 `results/{name}/{prefix/suffix}_L{layer}_attn_vis_{mode}.jpg`。
 
 ### 3.3 模式 2: Detailed Heads (`visualize_heads`)
 按照论文风格，单独展示每一层的 8 个 Head，观察不同的 Head 是否分化出了不同的功能（如：有的关注手，有的关注物体）。
