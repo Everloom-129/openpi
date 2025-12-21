@@ -12,6 +12,10 @@ from openpi.shared import download
 from openpi.training import config as _config
 from openpi.training import data_loader as _data_loader
 
+
+from openpi.shared import image_tools
+import jax.numpy as jnp
+
 import matplotlib.pyplot as plt
 
 
@@ -37,7 +41,7 @@ def load_duck_example(camera: str = "left", index: int = 0):
     ext_img = np.array(Image.open(ext_path))
     hand_img = np.array(Image.open(hand_path))
 
-    instruction =  "place the duck toy into the pink bowl"
+    instruction = "place the duck toy into the pink bowl"
     return {
         "observation/exterior_image_1_left": ext_img,
         "observation/wrist_image_left": hand_img,
@@ -47,8 +51,10 @@ def load_duck_example(camera: str = "left", index: int = 0):
     }
 
 
-def vis_example(example: dict, name: str):
-    os.makedirs(f"results/{name}", exist_ok=True)
+# TODO: refactor this, outdated now
+def vis_example(example: dict, name: str, base_dir: str = "results"):
+    out_dir = os.path.join(base_dir, name)
+    os.makedirs(out_dir, exist_ok=True)
     fig = plt.figure(figsize=(12, 8))
 
     plt.suptitle(example["prompt"], fontsize=16)
@@ -70,16 +76,24 @@ def vis_example(example: dict, name: str):
     plt.title("Gripper Position")
 
     plt.tight_layout()
-    fig_path = f"results/{name}/origin_{example['prompt']}.jpg"
+    fig_path = os.path.join(out_dir, f"origin_{example['prompt']}.jpg")
     plt.savefig(fig_path)
     plt.close()
     print(f"Saved example to {fig_path}")
 
 
-def visualize_attention(example: dict, name: str, attn_mode: str, mode: str = "avg", layer_idx: int = 20):
+def visualize_attention(
+    example: dict,
+    name: str,
+    attn_mode: str,
+    mode: str = "avg",
+    layer_idx: int = 20,
+    input_dir: str = "results",
+    output_dir: str = "results",
+):
     """Visualizes the attention map overlaid on the images (Summary View)."""
 
-    attn_path = f"results/layers_{attn_mode}/attn_map_layer_{layer_idx}.npy"
+    attn_path = os.path.join(input_dir, "layers_" + attn_mode, f"attn_map_layer_{layer_idx}.npy")
     if not os.path.exists(attn_path):
         print(f"Warning: Attention file {attn_path} not found. Skipping visualization.")
         return
@@ -123,8 +137,6 @@ def visualize_attention(example: dict, name: str, attn_mode: str, mode: str = "a
     img2_attn = text_attn_to_image[num_image_tokens:].reshape(16, 16)
 
     def overlay_heatmap(img, heatmap):
-        from openpi.shared import image_tools
-        import jax.numpy as jnp
 
         img_jax = jnp.array(img)
         img_resized = image_tools.resize_with_pad(img_jax, 224, 224)
@@ -157,18 +169,23 @@ def visualize_attention(example: dict, name: str, attn_mode: str, mode: str = "a
     for ax in axs.flatten():
         ax.axis("off")
 
-    out_path = f"results/{name}/{attn_mode}_L{layer_idx}_attn_vis_{mode}.jpg"
+    # out_path = f"results/{name}/{attn_mode}_L{layer_idx}_attn_vis_{mode}.jpg"
+    final_out_dir = os.path.join(output_dir, name)
+    os.makedirs(final_out_dir, exist_ok=True)
+    out_path = os.path.join(final_out_dir, f"{attn_mode}_L{layer_idx}_attn_vis_{mode}.jpg")
     plt.savefig(out_path, bbox_inches="tight", dpi=150)
     plt.close()
-    print(f"Saved summary visualization to {out_path}")
+    # print(f"Saved summary visualization to {out_path}")
 
 
-def visualize_heads(example: dict, name: str, attn_mode: str, layer_idx: int):
+def visualize_heads(
+    example: dict, name: str, attn_mode: str, layer_idx: int, input_dir: str = "results", output_dir: str = "results"
+):
     """Visualizes attention maps for EACH HEAD separately (Detailed View)."""
     from openpi.shared import image_tools
     import jax.numpy as jnp
 
-    attn_path = f"results/layers_{attn_mode}/attn_map_layer_{layer_idx}.npy"
+    attn_path = os.path.join(input_dir, "layers_" + attn_mode, f"attn_map_layer_{layer_idx}.npy")
     if not os.path.exists(attn_path):
         return
 
@@ -180,7 +197,8 @@ def visualize_heads(example: dict, name: str, attn_mode: str, layer_idx: int):
     num_heads = attn_map.shape[0]
 
     # Setup output dir
-    head_dir = f"results/{name}/L{layer_idx}_{attn_mode}_heads"
+    # head_dir = f"results/{name}/L{layer_idx}_{attn_mode}_heads"
+    head_dir = os.path.join(output_dir, name, f"L{layer_idx}_{attn_mode}_heads")
     os.makedirs(head_dir, exist_ok=True)
 
     num_image_tokens = 256
@@ -246,6 +264,36 @@ def get_keyframes(total_frames: int, horizon: int) -> list[int]:
     return list(range(0, total_frames, horizon))
 
 
+def get_policy(checkpoint_dir: str):
+    config = _config.get_config("pi05_droid")
+    policy = _policy_config.create_trained_policy(config, checkpoint_dir)
+    return policy
+
+
+def process_episode(policy, example, output_dir, name, layers=[1, 4, 5, 7, 10]):
+    # 1. Run Inference
+    # This generates .npy files in results/layers_prefix/... (hardcoded in model)
+    result = policy.infer(example)
+
+    # 2. Visualize
+    for layer in layers:
+        # A. Summary View (Overlay) - Best layers
+        for mode in ["max"]:
+            visualize_attention(
+                example,
+                name,
+                attn_mode="prefix",
+                mode=mode,
+                layer_idx=layer,
+                input_dir="results",
+                output_dir=output_dir,
+            )
+        # B. Detailed Head View (Side-by-Side) - All layers
+        visualize_heads(example, name, attn_mode="prefix", layer_idx=layer, input_dir="results", output_dir=output_dir)
+
+    return result
+
+
 if __name__ == "__main__":
     config = _config.get_config("pi05_droid")
     checkpoint_dir = "./checkpoints/viz/pi05_droid_pytorch"
@@ -263,23 +311,8 @@ if __name__ == "__main__":
     for index in keyframes:
         print(f"VLA index {index}")
         example = load_duck_example(camera=camera, index=index)
-
+        # print out the joint post
         vis_example(example, f"duck_{camera}_{index}")
-        # 1. Run Inference (generates .npy files)
-        result = policy.infer(example)
-        print("Actions shape:", result["actions"].shape)
-
-        # 2. Visualize
-        # A. Summary View (Overlay) - Best layers
-        for layer in [1, 4, 5, 7, 10]:
-            for mode in ["max"]:
-                visualize_attention(example, f"duck_{camera}_{index}", attn_mode="prefix", mode=mode, layer_idx=layer)
-                # visualize_attention(example, f"duck_{camera}_{index}", attn_mode="suffix", mode=mode, layer_idx=layer)
-
-        # B. Detailed Head View (Side-by-Side) - All layers
-        # Visualize ALL layers to find the best head
-        for layer in [1, 4, 5, 7, 10]:
-            visualize_heads(example, f"duck_{camera}_{index}", attn_mode="prefix", layer_idx=layer)
-            # visualize_heads(example, f"duck_{camera}_{index}", attn_mode="suffix", layer_idx=layer)
+        process_episode(policy, example, "results", f"duck_{camera}_{index}")
 
     del policy
