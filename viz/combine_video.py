@@ -1,9 +1,6 @@
-import cv2
 import os
-import numpy as np
-import glob
-from tqdm import tqdm
-from attn_map import get_keyframes
+
+import cv2
 
 # Configuration
 BASE_DIR = "results"
@@ -68,13 +65,10 @@ def create_video_for_head(
     layer, head, fps=FPS_VIDEO, timesteps=TIMESTEPS, output_dir="results/videos", input_dir=BASE_DIR
 ):
     """Creates a video sequence for a specific layer/head across all timesteps."""
-
-    # Try VP90 (VP9) - Newer standard, often better supported
-    fourcc_code = "VP90"
     ext = ".webm"
-
-    os.makedirs(output_dir, exist_ok=True)
-    output_filename = os.path.join(output_dir, f"L{layer:02d}_H{head:02d}_{ATTN_MODE}{ext}")
+    layer_dir = os.path.join(output_dir, f"L{layer}")
+    os.makedirs(layer_dir, exist_ok=True)
+    output_filename = os.path.join(layer_dir, f"H{head:02d}_{ATTN_MODE}{ext}")
 
     frames = []
     for t in timesteps:
@@ -93,9 +87,6 @@ def create_video_for_head(
 
     height, width, _ = frames[0].shape
 
-    # Try creating video writer
-    # fourcc = cv2.VideoWriter_fourcc(*fourcc_code)
-
     # Check extension to decide codec
     ext = os.path.splitext(output_filename)[1]
     if ext == ".webm":
@@ -106,13 +97,6 @@ def create_video_for_head(
         fourcc = cv2.VideoWriter_fourcc(*"MJPG")
 
     out = cv2.VideoWriter(output_filename, fourcc, fps, (width, height))
-
-    # Fallback to MJPG (.avi) if writer fails
-    if not out.isOpened():
-        print(f"Warning: Could not open video writer for {output_filename}. Falling back to MJPG (.avi).")
-        output_filename = os.path.splitext(output_filename)[0] + ".avi"
-        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-        out = cv2.VideoWriter(output_filename, fourcc, fps, (width, height))
 
     for frame in frames:
         out.write(frame)
@@ -161,13 +145,6 @@ def create_summary_video(
 
     out = cv2.VideoWriter(output_filename, fourcc, fps, (width, height))
 
-    # Fallback to MJPG (.avi) if WebM fails
-    if not out.isOpened():
-        print(f"Warning: Could not open video writer for {output_filename}. Falling back to MJPG (.avi).")
-        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-        output_filename = os.path.splitext(output_filename)[0] + ".avi"
-        out = cv2.VideoWriter(output_filename, fourcc, fps, (width, height))
-
     for frame in frames:
         out.write(frame)
 
@@ -176,16 +153,6 @@ def create_summary_video(
 
 
 if __name__ == "__main__":
-    # 1. Analyze and find best heads based on the first timestep (or index 30 which might be more active)
-    # Using index 0 as baseline
-    # top_heads = rank_best_heads(reference_timestep=0)
-
-    # 2. Generate videos for the Top 5 heads
-    # print("\nGenerating videos for top 5 heads...")
-    # for layer, head in top_heads[:5]:
-    #     create_video_for_head(layer, head)
-
-    # Optional: Manually generate for specific layers you are interested in (e.g. L15)
     for layer in [1, 4, 5, 7, 10]:
         print(f"Generating videos for layer {layer}")
         create_summary_video(layer, mode="max", timesteps=TIMESTEPS)

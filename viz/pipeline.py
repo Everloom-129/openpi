@@ -1,40 +1,31 @@
 from __future__ import annotations
-import json, logging, os
+
+import functools
+import glob
+import logging
+import os
 from pathlib import Path
-import cv2
-import numpy as np
+import shutil
 import sys
 import time
 import functools
 import shutil
 import glob
+import numpy as np
 
+from attn_map import get_keyframes
 from PIL import Image
 
 import attn_map
 import combine_video
 
-from attn_map import visualize_attention, visualize_heads, get_keyframes, process_episode
 
 OPEN_LOOP_HORIZON = 8
 LAYERS = [1, 4, 5, 7, 10]
+FPS = 2
+CREATE_SUMMARY_VIDEO = True
+CREATE_HEAD_VIDEOS = True
 
-# # Ensure src is in pythonpath
-# sys.path.append(os.path.join(os.getcwd(), "src"))
-# # Ensure current dir (viz) is in pythonpath if running from root
-# if os.getcwd() not in sys.path:
-#     sys.path.append(os.getcwd())
-
-
-# except ImportError:
-#     try:
-#         from viz import attn_map
-#         from viz import combine_video
-#     except ImportError:
-#         # Fallback if running from inside viz directory
-#         sys.path.append(str(Path(__file__).parent))
-#         import attn_map
-#         import combine_video
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
@@ -70,7 +61,7 @@ def load_toy_example(data_dir: Path, index: int, camera: str = "right"):
     hand_img = np.array(Image.open(hand_path))
 
     instruction_path = os.path.join(data_dir, "instruction.txt")
-    with open(instruction_path, "r") as f:
+    with open(instruction_path) as f:
         instruction = f.read().strip()
     print(f"Instruction: {instruction}")
 
@@ -89,6 +80,13 @@ def get_video_length(data_dir: Path):
         return 0
     jpg_files = list(hand_camera_dir.glob("*.jpg"))
     return len(jpg_files)
+
+
+def copy_instruction(data_dir: Path, output_dir: Path):
+    instruction_path = data_dir / "instruction.txt"
+    if not instruction_path.exists():
+        return
+    shutil.copy(instruction_path, output_dir / "instruction.txt")
 
 
 @timer
@@ -124,6 +122,12 @@ def main():
                 output_base_dir = RESULTS_ROOT / rel_path
                 output_base_dir.mkdir(parents=True, exist_ok=True)
 
+                # Skip if already processed
+                marker_file = output_base_dir / "pi05.md"
+                if marker_file.exists():
+                    print(f"Skipping episode {episode_id} (already processed)")
+                    continue
+
                 # Determine Frames
                 total_frames = get_video_length(data_dir)
                 if total_frames == 0:
@@ -146,7 +150,7 @@ def main():
                         print(f"Error processing frame {index}: {e}")
 
                 # Create a marker file to indicate processing is complete
-                marker_file = output_base_dir / "pi05.md"
+                # marker_file = output_base_dir / "pi05.md"
                 marker_file.write_text(
                     f"# Processing Complete\n\nEpisode: {episode_id}\nOutcome: {outcome}\nDate: {date_dir.name}\nTotal Frames: {total_frames}\nKeyframes: {keyframes}\n"
                 )
@@ -156,22 +160,34 @@ def main():
                     pattern = str(output_base_dir / "*" / f"prefix_L{layer}_attn_vis_max.jpg")
                     image_paths = sorted(glob.glob(pattern))
 
-                    if image_paths:
-                        # Video output path: results_toy_video/{success/failure}/{date}/{episode}/L{layer}_prefix_max.mp4
-                        video_output_dir = Path("results_toy_video_right") / rel_path
-                        video_output_dir.mkdir(parents=True, exist_ok=True)
+                    if not image_paths:
+                        print(f"No images found for layer {layer}, skipping.")
+                        continue
+                    # Video output path: results_toy_video/{success/failure}/{date}/{episode}/L{layer}_prefix_max.mp4
+                    video_output_dir = Path("results_toy_video_right") / rel_path
+                    video_output_dir.mkdir(parents=True, exist_ok=True)
 
+                    if CREATE_SUMMARY_VIDEO:
                         combine_video.create_summary_video(
                             layer,
+                            fps=FPS,
                             mode="max",
                             output_dir=video_output_dir,
                             timesteps=keyframes,
                             input_dir=output_base_dir,
                         )
-                        # for head in range(8):
-                        #     combine_video.create_video_for_head(
-                        #         layer, head, timesteps=keyframes, output_dir=video_output_dir, input_dir=output_base_dir
-                        #     )
+                    if CREATE_HEAD_VIDEOS:
+                        for head in range(8):
+                            combine_video.create_video_for_head(
+                                layer,
+                                head,
+                                fps=FPS,
+                                timesteps=keyframes,
+                                output_dir=video_output_dir,
+                                input_dir=output_base_dir,
+                            )
+
+                    copy_instruction(data_dir, video_output_dir)
 
 
 if __name__ == "__main__":
