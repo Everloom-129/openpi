@@ -1,4 +1,4 @@
-# Pi0.5 PaliGemma Attention Visualization 实践记录 '
+# Pi0.5 PaliGemma Attention Visualization 实践记录
 2024-12-20
 
 ## 1. 目标
@@ -15,76 +15,85 @@
 
 Hugging Face 的 Transformer 默认不返回 Attention Weights。我们在 `forward` 函数中强制开启 `output_attentions=True`，并使用 Hack 方式将 Tensor 转存为 `.npy` 文件。
 
-```python
-# 在 PaliGemmaWithExpertModel.forward 中:
-
-# 1. 开启 Attention 输出
-outputs = self.paligemma.language_model(..., output_attentions=True)
-
-# 2. Hack: 直接保存每一层的 Attention 到磁盘 (仅非训练模式)
-if not self.training:
-    import numpy as np
-    # 保存 Prefix Attention
-    if prefix_output.attentions is not None:
-        os.makedirs("results/layers_prefix", exist_ok=True)
-        for i, layer_attn in enumerate(prefix_output.attentions):
-            # layer_attn shape: [Batch, NumHeads, SeqLen, SeqLen]
-            np.save(f"results/layers_prefix/attn_map_layer_{i}.npy", layer_attn.detach().cpu().float().numpy())
-```
-
 ### 2.2 禁用 Torch Compile
 **文件**: `src/openpi/models_pytorch/pi0_pytorch.py`
 
 由于我们插入了 I/O 操作 (`numpy.save`) 且需要使用 `pdb` 调试，必须禁用 `torch.compile`。JIT 编译会隐藏中间变量并导致图捕获错误。
 
-```python
-# 注释掉 compile
-# self.sample_actions = torch.compile(self._sample_actions, mode="max-autotune")
-self.sample_actions = self._sample_actions
-```
+## 3. 工具脚本说明
 
-## 3. 可视化脚本逻辑
-**脚本**: `viz/attn_map.py`
+我们开发了一套工具链用于分析 Attention Map。
 
-我们实现了两种可视化模式：
+### 3.1 可视化生成 (`viz/attn_map.py`)
+- **功能**: 加载模型推理，提取 Attention，生成可视化图片。
+- **Keyframe Inference**: 针对 Open-Loop Control，只在关键帧 (t=0, 8, 16...) 进行推理和可视化。
+- **两种模式**:
+    - **Summary Overlay**: 叠加热力图到原图，快速预览。
+    - **Detailed Heads**: 分离展示 Layer 的 8 个 Head，用于精细分析。
 
-### 3.1 预处理对齐  
-模型输入图片被 Resize 到了 224x224 (保持比例并 Padding)。
-- [x] 为了确保 Attention Map 和图片对齐，我们在可视化时必须对原图进行相同的 `resize_with_pad` 操作。
 
-### 3.2 模式 1: Summary Overlay (`visualize_attention`)
-将 Attention Map 叠加在原图上，用于快速判断该层是否关注了正确物体。
-- **操作**: 对 Heads 取平均 (或最大值)。
-- **布局**: 2x2 网格 (原图 vs 叠加图)。
-- **输出**: 保存为 `results/{name}/{prefix/suffix}_L{layer}_attn_vis_{mode}.jpg`。
+### 3.2 视频合成 (`viz/combine_video.py`)
+- **功能**: 将多个关键帧的可视化图片合成为 `.webm` 或 `.avi` 视频。
+- **用途**: 观察 Attention 随时间步的动态变化。
+- **自动筛选**: 包含简单的方差筛选逻辑，自动推荐“最活跃”的 Head。
 
-### 3.3 模式 2: Detailed Heads (`visualize_heads`)
-按照论文风格，单独展示每一层的 8 个 Head，观察不同的 Head 是否分化出了不同的功能（如：有的关注手，有的关注物体）。
-- **操作**: 不进行叠加，直接绘制 `viridis` 热力图。
-- **布局**: 3列布局 (Exterior Attention | Wrist Attention | Reference Images)。
-- **输出**: 保存为 `results/{name}/L{layer}_heads/head_{i}.jpg`。
+### 3.3 批量流水线处理 (`viz/pipeline.py`)
+- **功能**: 针对大规模数据集（如 Toy Cube Benchmark）进行批量处理。
+- **流程**:
+    1. 遍历 `"/data3/tonyw/toy_cube_benchmark"` (DROID格式) 下的所有 Episode。
+    2. 加载 `recordings` 中的视频帧（自动识别 Side/Wrist Camera）。
+    3. 调用 `attn_map.py` 的核心逻辑生成 Attention Map 和可视化图片。
+    4. 调用 `combine_video.py` 生成 Suffix/Prefix Attention 视频。
+    5. **断点续传**: 通过检测 `pi05.md` 标记文件跳过已处理的 Episode。
+- **输出结构**: 
+    - 图片: `results_toy/{outcome}/{date}/{episode}/{frame_idx}/...`
+    - 视频: `results_toy_video/{outcome}/{date}/{episode}/L{layer}_prefix_max.mp4`
 
-## 4. Attention 维度解析
+## 4. Hypothesis and Validations
 
-PaliGemma 的 Attention Map 维度处理：
 
-1. **Token 数量**:
-   - 图像 Patch 大小为 14，输入 224x224 -> 16x16 = 256 Tokens。
-   - Droid 模型有两个相机 (Exterior, Wrist)，共 512 Image Tokens。
-   
-2. **Prefix Attention (Context -> Context)**:
-   - Shape: `[Batch, Heads, TotalLen, TotalLen]` (方阵)。
-   - 我们关注: `Attention[TextTokens, ImageTokens]`。即文本 Prompt 看了图的哪里。
+### 4.1 因果性验证 (`viz/h1_mask_effect.py`)
+- **功能**: 通过遮挡实验验证 Attention Map 的真实性（Fidelity）。
+    - **High Mask**: 遮挡 Attention 高亮区域。
+    - **Low Mask**: 随机遮挡等面积的背景区域。
+    - **Metric**: 计算 Action 的 Scale-Invariant MSE 变化。
+- **多视角测试**: 支持分别测试 Both, Side Only, Wrist Only 视角的遮挡效果。
+- **输出**: 自动生成 Markdown 报告，对比各层的因果性得分。
 
-3. **Suffix Attention (Action -> Context)**:
-   - Shape: `[Batch, Heads, ActionLen, TotalLen]` (长方形矩阵)。
-   - 我们关注: `Attention[ActionTokens, ImageTokens]`。即生成的动作看了图的哪里。
+-  初步观察 (Observation)
 
-## 5. 结果示例
-生成的图片保存在 `results/` 目录下：
-- `results/duck_left_0/prefix_L15_attn_vis_max.jpg`: 第15层 Prefix Attention 叠加图。
-- `results/duck_left_0/L15_prefix_heads/head_03.jpg`: 第15层 第3个 Head 的原始热力图。
+基于少量样本的定性分析：
 
-## 6. 结论
-通过 Layer 4, 10, 15, 17 的可视化，我们可以观察到模型在深层网络中逐渐聚焦于与 Prompt 相关的物体（如 "duck" 或 "bowl"）。
+1.  **分层功能差异**:
+    - **浅层 (Layer 0-2)**: 关注底层特征，遮挡后对输出影响极大（破坏性最强）。
+    - **语义层 (Layer 10)**: 能够准确定位语义物体（如 "duck", "bowl"），表现出较强的双目融合特性。
+    - **动作层 (Layer 17)**: 在输出前的最后一层，高度聚焦于 **Wrist Camera**，显示出手眼协调在动作生成阶段的主导地位。
 
+2.  **视角依赖**:
+    - 不同层级对 Side vs Wrist 视角的依赖程度不同。中间层偏向全局 Side View，深层偏向局部 Wrist View。
+
+3.  **Scale vs Direction**:
+    - 遮挡高关注区往往导致 Action 幅度（Scale）剧烈变化。
+    - 遮挡背景区有时会显著干扰 Action 的轨迹形状（Direction），暗示背景包含重要的定位信息。
+
+
+
+## TODO
+
+### 4.2 生成动力学分析 (Generative Dynamics)
+
+**核心问题**：在生成 Action 的序列（Suffix Phase）中，模型的注意力是如何随时间演变的？
+
+#### Hypothesis 2: 时间维度的注意力漂移 (Temporal Shift)
+
+> **假设**：在生成 Action 的初期（Start Tokens），模型关注“物体位置”以规划路径；在生成 Action 的末期（End Tokens），模型关注“目标容器”或“抓手状态”以完成交互。
+
+- **实验设计**:
+    
+    1. 提取 Suffix Phase 中不同时间步 $t$ 的 Action Token 对图像的 Attention。
+        
+    2. 定义感兴趣区域 (ROI): Object ROI, Gripper ROI, Goal/Container ROI。
+        
+    3. **Plot**: 绘制一条曲线，X轴是 Action Token Index (0 to N)，Y轴是落在各 ROI 内的 Attention 总和。
+        
+    - **预期结果**: 你可能会观察到 Attention 重心从 Object -> Gripper -> Goal 的流动。
