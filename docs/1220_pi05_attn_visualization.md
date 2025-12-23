@@ -77,23 +77,3 @@ Hugging Face 的 Transformer 默认不返回 Attention Weights。我们在 `forw
     - 遮挡背景区有时会显著干扰 Action 的轨迹形状（Direction），暗示背景包含重要的定位信息。
 
 
-
-## TODO
-
-### 4.2 生成动力学分析 (Generative Dynamics)
-
-**核心问题**：在生成 Action 的序列（Suffix Phase）中，模型的注意力是如何随时间演变的？
-
-#### Hypothesis 2: 时间维度的注意力漂移 (Temporal Shift)
-
-> **假设**：在生成 Action 的初期（Start Tokens），模型关注“物体位置”以规划路径；在生成 Action 的末期（End Tokens），模型关注“目标容器”或“抓手状态”以完成交互。
-
-- **实验设计**:
-    
-    1. 提取 Suffix Phase 中不同时间步 $t$ 的 Action Token 对图像的 Attention。
-        
-    2. 定义感兴趣区域 (ROI): Object ROI, Gripper ROI, Goal/Container ROI。
-        
-    3. **Plot**: 绘制一条曲线，X轴是 Action Token Index (0 to N)，Y轴是落在各 ROI 内的 Attention 总和。
-        
-    - **预期结果**: 你可能会观察到 Attention 重心从 Object -> Gripper -> Goal 的流动。

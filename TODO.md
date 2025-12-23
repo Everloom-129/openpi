@@ -4,7 +4,7 @@
     - [x] overlay heatmap on image
     - [x] resize image to 224x224
 
-- [ ] viusalize all individual heads
+- [x] viusalize all individual heads
     - [x] vibe checking
 
 - [ ] improve output into single big image
@@ -16,8 +16,8 @@
     - [ ] 
 
 ### Q&A
-- [ ] Ask Edward
-- [ ] Ask Manling
+- [x] Ask Edward
+- [x] Ask Manling
 - [ ] Ask Dinesh
 - [ ] Ask 
 
