@@ -137,7 +137,6 @@ def visualize_attention(
     img2_attn = text_attn_to_image[num_image_tokens:].reshape(16, 16)
 
     def overlay_heatmap(img, heatmap):
-
         img_jax = jnp.array(img)
         img_resized = image_tools.resize_with_pad(img_jax, 224, 224)
         img_resized = np.array(img_resized).astype(np.uint8)
@@ -255,6 +254,133 @@ def visualize_heads(
     print(f"Saved head visualizations to {head_dir}")
 
 
+def visualize_tokenizer(example: dict, name: str, output_dir: str = "results"):
+    """Visualizes the tokenization of the prompt:
+    Row 1: The reconstructed sentence with tokens colored.
+    Row 2: The list of tokens (ID and text) also colored.
+    """
+    import matplotlib.pyplot as plt
+    from openpi.models.tokenizer import PaligemmaTokenizer
+
+    try:
+        tokenizer = PaligemmaTokenizer()
+
+        joint_pos = example.get("observation/joint_position", np.zeros(7))
+        gripper_pos = example.get("observation/gripper_position", np.zeros(1))
+        state = np.concatenate([joint_pos, gripper_pos])
+
+        instruction = example["prompt"].strip().replace("_", " ").replace("\n", " ")
+        discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+        state_str = " ".join(map(str, discretized_state))
+        full_prompt = f"Task: {instruction}, State: {state_str};\nAction: "
+
+        token_ids = tokenizer._tokenizer.encode(full_prompt, add_bos=True)
+        tokens = [tokenizer._tokenizer.id_to_piece(i) for i in token_ids]
+    except Exception as e:
+        print(f"Tokenizer visualization failed: {e}")
+        return
+
+    # Colors (Pastel for readability)
+    cmap = plt.get_cmap("Set3")
+    colors = [cmap(i % 12) for i in range(len(tokens))]
+
+    # Black background, compact size
+    fig = plt.figure(figsize=(16, 9), facecolor="black")
+
+    # Helper to plot tokens with wrapping
+    def plot_tokens(ax, title, token_list, color_list=None, use_ids=False):
+        ax.set_title(title, fontsize=16, loc="left", pad=10, color="white")
+        ax.axis("off")
+        ax.set_ylim(0, 1)
+        ax.set_xlim(0, 1)
+
+        # Layout parameters
+        fontsize = 12
+        fontname = "monospace"
+
+        char_w_frac = 0.011
+
+        # Estimate number of lines needed
+        total_chars = sum(len(str(item)) for item in token_list)
+        chars_per_line = int(0.97 / char_w_frac)  # Approximate chars that fit in one line
+        estimated_lines = max(1, total_chars // chars_per_line + 2)
+
+        # Dynamically adjust line height based on estimated lines
+        line_h_frac = min(0.12, 0.85 / estimated_lines)
+
+        x_start, y_start = 0.01, 0.95
+        x, y = x_start, y_start
+        x_limit = 0.98
+
+        for i, token_item in enumerate(token_list):
+            if use_ids:
+                # token_item is (id, text)
+                tid, text = token_item
+                display_str = f"[{tid}: '{text}']"
+                w = len(display_str) * char_w_frac
+                bg_color = color_list[i] if color_list else None
+                text_color = "black" if bg_color else "white"
+            else:
+                display_str = token_item.replace("\n", "\\n")
+                w = len(display_str) * char_w_frac
+                bg_color = color_list[i] if color_list else None
+                text_color = "black" if bg_color else "white"
+
+            # Check wrap
+            is_newline = token_item == "\n" or token_item == "\\n"
+            if (x + w > x_limit) or is_newline:
+                x = x_start
+                y -= line_h_frac
+            if is_newline and not use_ids:
+                pass
+            # Check overflow
+            if y < 0:
+                ax.text(x, y + line_h_frac, "...", fontsize=fontsize, fontname=fontname, color="white")
+                break
+            # Draw
+            kwargs = dict(
+                fontsize=fontsize,
+                fontname=fontname,
+                va="top",
+                color=text_color,
+            )
+            if bg_color:
+                kwargs["backgroundcolor"] = bg_color
+                kwargs["bbox"] = dict(facecolor=bg_color, edgecolor="none", pad=1.5)
+
+            ax.text(x, y, display_str, **kwargs)
+
+            x += w + 0.001  # Tighter gap
+
+    # Use GridSpec for custom height ratios: ax1 and ax2 each get 1/5, ax3 gets 3/5
+    from matplotlib.gridspec import GridSpec
+
+    gs = GridSpec(5, 1, figure=fig, height_ratios=[1, 1, 3, 0, 0], hspace=0.01)
+
+    # 1. Original Prompt (White text, no background)
+    ax1 = fig.add_subplot(gs[0])
+    state_tokens = state_str.split(" ")
+    display_tokens_1 = ["Task:", instruction, "\n", "State:"] + state_tokens + ["\n", "Action:"]
+
+    plot_tokens(ax1, "Original Prompt Structure", display_tokens_1, color_list=None, use_ids=False)
+
+    # 2. Reconstructed Prompt (Colored)
+    ax2 = fig.add_subplot(gs[1])
+    plot_tokens(ax2, "Reconstructed Prompt (Colored by Token)", tokens, colors, use_ids=False)
+
+    # 3. Token List
+    ax3 = fig.add_subplot(gs[2])
+    token_pairs = list(zip(token_ids, tokens))
+    plot_tokens(ax3, "Token List (IDs)", token_pairs, colors, use_ids=True)
+
+    out_dir = os.path.join(output_dir, name)
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "tokenizer_vis.png")
+    plt.savefig(out_path, bbox_inches="tight")
+    plt.close()
+    print(f"Saved tokenizer visualization to {out_path}")
+
+
 def get_keyframes(total_frames: int, horizon: int) -> list[int]:
     """
     Returns a list of keyframe indices where the model inference actually happens.
@@ -271,6 +397,9 @@ def get_policy(checkpoint_dir: str):
 
 
 def process_episode(policy, example, output_dir, name, layers=[1, 4, 5, 7, 10]):
+    # 0. Visualize Tokenizer (Once per episode)
+    visualize_tokenizer(example, name, output_dir)
+
     # 1. Run Inference
     # This generates .npy files in results/layers_prefix/... (hardcoded in model)
     result = policy.infer(example)
@@ -304,7 +433,7 @@ if __name__ == "__main__":
     TOTAL_FRAMES = 90
     ACTION_HORIZON = 8  # Pi0 default action horizon
 
-    keyframes = get_keyframes(TOTAL_FRAMES, ACTION_HORIZON)
+    keyframes = get_keyframes(TOTAL_FRAMES, ACTION_HORIZON)[:3]
     print(f"Running visualization on Keyframes: {keyframes}")
 
     # Visualize for keyframes only
