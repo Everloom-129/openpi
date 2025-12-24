@@ -10,9 +10,14 @@
 - [ ] improve output into single big image
 - [x] combine output into video
 
-- [ ] understand embedding type
+- [x] understand embedding type
 - [ ] viusalize each step?
     - [ ] understand denoising effect 
+    - [ ] 
+
+- [ ] cherry pick the gold episode 
+    - [ ] add instruction.txt
+    - [ ] add bbox 
     - [ ] 
 
 ### Q&A
