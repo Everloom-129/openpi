@@ -3,14 +3,10 @@ from __future__ import annotations
 import functools
 import glob
 import logging
-import os
 from pathlib import Path
 import shutil
 import sys
 import time
-import functools
-import shutil
-import glob
 import numpy as np
 
 from attn_map import get_keyframes
@@ -18,13 +14,14 @@ from PIL import Image
 
 import attn_map
 import combine_video
+from h1_mask_effect import run_fidelity_test
 
 
 OPEN_LOOP_HORIZON = 8
 LAYERS = [1, 4, 5, 7, 10]
 FPS = 2
-CREATE_SUMMARY_VIDEO = True
-CREATE_HEAD_VIDEOS = True
+CREATE_SUMMARY_VIDEO = False
+CREATE_HEAD_VIDEOS = False
 
 
 logger = logging.getLogger(__name__)
@@ -47,6 +44,12 @@ def timer(func):
 
 
 def load_toy_example(data_dir: Path, index: int, camera: str = "right"):
+    """
+    Loads a toy example (images + instruction) from the given directory.
+    Compatible with load_duck_example structure.
+    """
+    data_dir = Path(data_dir)
+
     if camera == "left":
         side_camera = "varied_camera_1"
     elif camera == "right":
@@ -54,15 +57,26 @@ def load_toy_example(data_dir: Path, index: int, camera: str = "right"):
     else:
         raise ValueError("camera must be 'left' or 'right'")
 
-    ext_path = os.path.join(data_dir, "recordings", "frames", side_camera, f"{index:05d}.jpg")
-    hand_path = os.path.join(data_dir, "recordings", "frames", "hand_camera", f"{index:05d}.jpg")
+    # Use pathlib for path construction
+    frames_dir = data_dir / "recordings" / "frames"
+    ext_path = frames_dir / side_camera / f"{index:05d}.jpg"
+    hand_path = frames_dir / "hand_camera" / f"{index:05d}.jpg"
+
+    if not ext_path.exists():
+        raise FileNotFoundError(f"Exterior image not found: {ext_path}")
+    if not hand_path.exists():
+        raise FileNotFoundError(f"Hand image not found: {hand_path}")
 
     ext_img = np.array(Image.open(ext_path))
     hand_img = np.array(Image.open(hand_path))
 
-    instruction_path = os.path.join(data_dir, "instruction.txt")
-    with open(instruction_path) as f:
-        instruction = f.read().strip()
+    instruction_path = data_dir / "instruction.txt"
+    if instruction_path.exists():
+        instruction = instruction_path.read_text().strip()
+    else:
+        print(f"Warning: Instruction file not found at {instruction_path}, using default.")
+        instruction = "find the pineapple toy and pick it up"
+
     print(f"Instruction: {instruction}")
 
     return {
@@ -106,6 +120,8 @@ def main():
 
     for outcome in ["success", "failure"]:
         outcome_dir = DATA_ROOT / outcome
+        if not outcome_dir.exists():
+            continue
 
         for date_dir in outcome_dir.iterdir():
             if not date_dir.is_dir():
@@ -145,7 +161,26 @@ def main():
                     try:
                         example = load_toy_example(data_dir, index, camera="right")
                         # Create subfolder for timestep: results_toy/.../episode/{index}
-                        attn_map.process_episode(policy, example, str(output_base_dir), f"{index:05d}", layers=LAYERS)
+                        # This generates the attention maps in results/layers_prefix
+                        result = attn_map.process_episode(
+                            policy, example, str(output_base_dir), f"{index:05d}", layers=LAYERS
+                        )
+
+                        # Run Fidelity Test immediately after inference (while attn maps exist)
+                        print(f"  Running Fidelity Test for frame {index}...")
+                        fidelity_results = run_fidelity_test(
+                            policy,
+                            example,
+                            result["actions"],  # action_orig
+                            output_dir=output_base_dir / f"{index:05d}" / "fidelity",
+                            layers=LAYERS,
+                            attn_root_dir="results",
+                            save_vis=True,
+                        )
+                        if fidelity_results:
+                            best = max(fidelity_results, key=lambda x: x["fidelity"])
+                            print(f"  Fidelity Test Best: Layer {best['layer']} Score {best['fidelity']:.4f}")
+
                     except Exception as e:
                         print(f"Error processing frame {index}: {e}")
 

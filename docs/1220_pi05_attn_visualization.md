@@ -401,3 +401,33 @@ results_toy_video_right/
   - Attention Videos: 48 episodes (~59%, 更多 episode 已完成)
 
 
+---
+
+## 6. Hypothesis 1.1: Attention-Object Correlation (2024-12-24)
+
+### 6.1 研究问题
+
+**核心假设**: VLM attention maps 会聚焦在 DINO-X 检测到的物体上，且不同层级的聚焦程度不同。
+
+### 6.2 实现方案
+
+- **数据**: DROID episodes + DINO-X object detection masks
+- **关键修正**: 使用 **Wrist Camera** attention (tokens 256-511)，而非 Side Camera
+- **指标**: 
+  - Overlap Ratio: 物体上的 attention 比例
+  - Attention Concentration: 物体内外 attention 均值比
+  - IoU: 二值化 attention 与 mask 的空间重叠度
+
+### 6.3 工具脚本
+
+- **`viz/h1_1_object_detection.py`**: 单 episode 分析，生成逐帧可视化和视频
+- **`viz/object_pipeline.py`**: 批量处理 pipeline，支持多 episode 聚合分析
+
+### 6.4 主要发现 (初步)
+
+- **Layer 5**: Overlap 和 Concentration 峰值，语义物体识别的关键层
+- **Layer 8**: 第二峰值，任务导向的物体关注
+- **Layer 14-17**: Concentration <1.0，attention 转向动作规划（gripper、轨迹）
+- **分层功能**: 识别 (L3-5) → 转换 (L6) → 任务规划 (L7-8) → 动作执行 (L14+)
+
+
