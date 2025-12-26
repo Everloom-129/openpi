@@ -14,6 +14,7 @@ from openpi.training import data_loader as _data_loader
 
 
 from openpi.shared import image_tools
+import torch
 import jax.numpy as jnp
 
 import matplotlib.pyplot as plt
@@ -390,13 +391,13 @@ def get_keyframes(total_frames: int, horizon: int) -> list[int]:
     return list(range(0, total_frames, horizon))
 
 
-def get_policy(checkpoint_dir: str):
+def get_policy(checkpoint_dir: str, device: str = "cuda:0"):
     config = _config.get_config("pi05_droid")
-    policy = _policy_config.create_trained_policy(config, checkpoint_dir)
+    policy = _policy_config.create_trained_policy(config, checkpoint_dir, pytorch_device=device)
     return policy
 
 
-def process_episode(policy, example, output_dir, name, layers=[1, 4, 5, 7, 10]):
+def process_episode(policy, example, output_dir, name, layers=[1, 4, 5, 7, 10], device_id: str = "0"):
     # 0. Visualize Tokenizer (Once per episode)
     visualize_tokenizer(example, name, output_dir)
 
@@ -406,6 +407,7 @@ def process_episode(policy, example, output_dir, name, layers=[1, 4, 5, 7, 10]):
 
     # 2. Visualize
     for layer in layers:
+        input_dir = f"attn/{device_id}/layers_prefix"
         # A. Summary View (Overlay) - Best layers
         for mode in ["max"]:
             visualize_attention(
@@ -414,20 +416,50 @@ def process_episode(policy, example, output_dir, name, layers=[1, 4, 5, 7, 10]):
                 attn_mode="prefix",
                 mode=mode,
                 layer_idx=layer,
-                input_dir="results",
+                input_dir=input_dir,
                 output_dir=output_dir,
             )
         # B. Detailed Head View (Side-by-Side) - All layers
-        visualize_heads(example, name, attn_mode="prefix", layer_idx=layer, input_dir="results", output_dir=output_dir)
+        visualize_heads(example, name, attn_mode="prefix", layer_idx=layer, input_dir=input_dir, output_dir=output_dir)
 
     return result
+
+
+def select_best_gpu():
+    """Automatically select the GPU with the most free memory."""
+    if not torch.cuda.is_available():
+        return "cpu"
+
+    num_gpus = torch.cuda.device_count()
+    if num_gpus == 1:
+        return "cuda:0"
+
+    # Get free memory for each GPU
+    max_free_memory = 0
+    best_gpu = 0
+    for i in range(num_gpus):
+        torch.cuda.set_device(i)
+        free_memory = torch.cuda.mem_get_info()[0]  # Returns (free, total)
+        print(f"GPU {i}: {free_memory / 1e9:.2f} GB free")
+        if free_memory > max_free_memory:
+            max_free_memory = free_memory
+            best_gpu = i
+
+    selected_device = f"cuda:{best_gpu}"
+    print(f"Auto-selected {selected_device} with {max_free_memory / 1e9:.2f} GB free")
+    return best_gpu
 
 
 if __name__ == "__main__":
     config = _config.get_config("pi05_droid")
     checkpoint_dir = "./checkpoints/viz/pi05_droid_pytorch"
 
-    policy = _policy_config.create_trained_policy(config, checkpoint_dir)
+    # Auto-select GPU with most free memory
+    device_id = select_best_gpu()
+    device = f"cuda:{device_id}"
+
+    policy = _policy_config.create_trained_policy(config, checkpoint_dir, pytorch_device=device)
+    print(f"Policy loaded on device: {device}")
 
     camera = "left"
     TOTAL_FRAMES = 90
@@ -442,6 +474,6 @@ if __name__ == "__main__":
         example = load_duck_example(camera=camera, index=index)
         # print out the joint post
         vis_example(example, f"duck_{camera}_{index}")
-        process_episode(policy, example, "results", f"duck_{camera}_{index}")
+        process_episode(policy, example, "results", f"duck_{camera}_{index}", device_id=device_id)
 
     del policy

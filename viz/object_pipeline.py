@@ -24,6 +24,7 @@ from h1_1_object_detection import (
 )
 from openpi.shared import image_tools
 from pipeline import copy_instruction, get_video_length, load_toy_example, timer
+from attn_map import select_best_gpu
 
 
 # ============================================================================
@@ -45,9 +46,9 @@ COUNTERFACTUAL_LAYERS = range(18)  # Key layers for counterfactual analysis
 COUNTERFACTUAL_PROMPTS = {
     "baseline": "find the {object} and pick it up",
     "duck": "find the duck toy and pick it up",
-    "banana": "find the banana and pick it up",
-    "cat": "find the cat toy and pick it up",
+    "pen": "find the pen and pick it up",
     "bottle": "find the bottle and pick it up",
+    "empty": "",  # No prompt - test default attention behavior
 }
 ANALYSIS_CAMERA = "wrist"  # Which camera's attention to analyze for counterfactual
 
@@ -111,7 +112,8 @@ def extract_attention_map_from_policy(policy, example, layer: int, camera: str =
         Attention map (16x16) or None if not found
     """
     # Load attention map (should already exist from policy.infer call)
-    attn_path = Path("results") / "layers_prefix" / f"attn_map_layer_{layer}.npy"
+    device_id = str(select_best_gpu())
+    attn_path = Path(f"attn/{device_id}/layers_prefix") / f"attn_map_layer_{layer}.npy"
     if not attn_path.exists():
         return None
 
@@ -1460,9 +1462,9 @@ def main():
     #     print("Usage: python viz/object_pipeline.py <DATA_ROOT>")
     #     print("Example: python viz/object_pipeline.py /data3/tonyw/aawr_offline/dual/")
     #     sys.exit(1)
-    # TEST_CASE = "/data3/tonyw/aawr_offline/gold/"
+    TEST_CASE = "/data3/tonyw/aawr_offline/gold/"
     # TEST_CASE = "/data3/tonyw/aawr_offline/dual/"
-    TEST_CASE = "/data3/tonyw/aawr_offline/bookshelf_d/"
+    # TEST_CASE = "/data3/tonyw/aawr_offline/bookshelf_d/"
     DATA_ROOT = Path(TEST_CASE)
     RESULTS_ROOT = Path("/data3/tonyw/aawr_offline/pi05/") / DATA_ROOT.name / CAMERA
 

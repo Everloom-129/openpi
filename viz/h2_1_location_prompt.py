@@ -6,9 +6,17 @@ Uses counterfactual prompts to verify semantic grounding capability.
 
 Experiment Design:
 1. Same visual scene (pineapple on table)
-2. Multiple prompts: "pick up the pineapple", "pick up the duck", "pick up the banana", etc.
+2. Multiple prompts:
+   - Baseline: "pick up the pineapple" (ground truth object)
+   - Counterfactuals: "pick up the duck", "pick up the banana", etc. (non-existent objects)
+   - Empty: "" (no text guidance - tests default visual attention)
 3. Compare attention maps across different prompts
 4. Expected: Attention should shift based on prompt, even if object doesn't exist
+
+Special Case - Empty Prompt:
+- Tests model's default attention behavior without text guidance
+- Reveals whether model has visual priors independent of language
+- Helps distinguish text-driven vs vision-driven attention patterns
 """
 
 import json
@@ -24,6 +32,8 @@ from PIL import Image
 from openpi.policies import policy_config as _policy_config
 from openpi.shared import image_tools
 from openpi.training import config as _config
+
+from attn_map import select_best_gpu
 
 
 def load_example_with_prompt(camera: str = "left", index: int = 0, prompt: str = None):
@@ -80,7 +90,8 @@ def extract_attention_map(policy, example, layer: int, camera: str = "wrist"):
     _ = policy.infer(example)
 
     # Load attention map
-    attn_path = Path("results") / "layers_prefix" / f"attn_map_layer_{layer}.npy"
+    device_id = str(select_best_gpu())
+    attn_path = Path(f"attn/{device_id}/layers_prefix") / f"attn_map_layer_{layer}.npy"
     if not attn_path.exists():
         print(f"Warning: Attention map not found for Layer {layer}")
         return None
@@ -319,6 +330,7 @@ def main():
         "banana": "find the banana and pick it up",
         "cat": "find the cat toy and pick it up",
         "bottle": "find the bottle and pick it up",
+        "empty": "",  # No prompt - test default attention behavior
     }
     BASELINE_KEY = "pineapple"  # Ground truth object
 
@@ -433,7 +445,12 @@ def main():
         f.write("- **|Δ|**: Average absolute difference (sensitivity to prompt change)\n")
         f.write("- **L2 Distance**: Euclidean distance between attention maps\n")
         f.write("- **Correlation**: Spatial similarity (1.0 = identical, 0.0 = uncorrelated)\n\n")
-        f.write("**Expected**: Low correlation and high L2 distance indicate strong prompt control.\n")
+        f.write("**Expected**: Low correlation and high L2 distance indicate strong prompt control.\n\n")
+        f.write("### Special Case: Empty Prompt\n\n")
+        f.write("The empty prompt case tests the model's default attention behavior without text guidance.\n")
+        f.write("- If attention differs significantly from baseline → model relies on text for grounding\n")
+        f.write("- If attention is similar to baseline → model has visual priors independent of text\n")
+        f.write("- Comparison with counterfactual prompts reveals text vs visual feature dominance\n")
 
     print(f"\n{'=' * 60}")
     print("ANALYSIS COMPLETE")

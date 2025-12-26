@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 
 import cv2
+import h5py
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
@@ -19,6 +20,8 @@ from PIL import Image
 from openpi.policies import policy_config as _policy_config
 from openpi.shared import image_tools
 from openpi.training import config as _config
+
+from attn_map import select_best_gpu
 
 
 def load_pineapple_example(camera: str = "left", index: int = 0):
@@ -51,12 +54,32 @@ def load_pineapple_example(camera: str = "left", index: int = 0):
     ext_img = np.array(Image.open(ext_path))
     hand_img = np.array(Image.open(hand_path))
 
-    instruction = "find the pineapple toy and pick it up"
+    instruction_path = os.path.join(data_dir, "instruction.txt")
+    if os.path.exists(instruction_path):
+        with open(instruction_path) as f:
+            instruction = f.read().strip()
+    else:
+        print(f"Warning: Instruction file not found at {instruction_path}, using default.")
+        instruction = "find the pineapple toy and pick it up"
+
+    print(f"Instruction: {instruction}")
+
+    # Load joint and gripper positions from trajectory h5 file
+    traj_path = os.path.join("data/visualization/aawr_pineapple/", "trajectory.h5")
+    if os.path.exists(traj_path):
+        with h5py.File(traj_path, "r") as f:
+            joint_positions = np.array(f["observation/robot_state/joint_positions"][index])
+            gripper_position = np.array(f["observation/robot_state/gripper_position"][index])
+    else:
+        print(f"Warning: Trajectory file not found at {traj_path}, using random data.")
+        joint_positions = np.random.rand(7)
+        gripper_position = np.random.rand()
+
     return {
         "observation/exterior_image_1_left": ext_img,
         "observation/wrist_image_left": hand_img,
-        "observation/joint_position": np.random.rand(7),  # Placeholder # TODO read from real data
-        "observation/gripper_position": np.random.rand(1),  # Placeholder
+        "observation/joint_position": joint_positions,
+        "observation/gripper_position": gripper_position,
         "prompt": instruction,
     }
 
@@ -242,7 +265,8 @@ def run_object_detection(
     frame_dir.mkdir(parents=True, exist_ok=True)
 
     attn_mode = "prefix"
-    attn_base = Path("results")
+    device_id = str(select_best_gpu())
+    attn_base = Path(f"attn/{device_id}/layers_{attn_mode}")
     if not str(attn_base).endswith(f"layers_{attn_mode}"):
         attn_base = attn_base / f"layers_{attn_mode}"
 

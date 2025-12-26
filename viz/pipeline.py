@@ -9,7 +9,7 @@ import sys
 import time
 import numpy as np
 
-from attn_map import get_keyframes
+from attn_map import get_keyframes, select_best_gpu
 from PIL import Image
 
 import attn_map
@@ -105,24 +105,26 @@ def copy_instruction(data_dir: Path, output_dir: Path):
 
 @timer
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python viz/pipeline.py <DATA_ROOT>")
+    if len(sys.argv) < 3:
+        print("Usage: python viz/pipeline.py <DATA_ROOT> <RESULTS_ROOT>")
         sys.exit(1)
 
     DATA_ROOT = Path(sys.argv[1])
-    RESULTS_ROOT = Path("results_toy_right")
+    RESULTS_ROOT = Path(sys.argv[2])
 
     # Load Policy
     checkpoint_dir = "./checkpoints/viz/pi05_droid_pytorch"
     print(f"Loading policy from {checkpoint_dir}...")
-    policy = attn_map.get_policy(checkpoint_dir)
+    device_id = str(select_best_gpu())
+    device = f"cuda:{device_id}"
+    policy = attn_map.get_policy(checkpoint_dir, device=device)
     print("Policy loaded.")
 
     for outcome in ["success", "failure"]:
         outcome_dir = DATA_ROOT / outcome
         if not outcome_dir.exists():
             continue
-
+ 
         for date_dir in outcome_dir.iterdir():
             if not date_dir.is_dir():
                 continue
@@ -163,7 +165,7 @@ def main():
                         # Create subfolder for timestep: results_toy/.../episode/{index}
                         # This generates the attention maps in results/layers_prefix
                         result = attn_map.process_episode(
-                            policy, example, str(output_base_dir), f"{index:05d}", layers=LAYERS
+                            policy, example, str(output_base_dir), f"{index:05d}", layers=LAYERS, device_id=device_id
                         )
 
                         # Run Fidelity Test immediately after inference (while attn maps exist)
@@ -174,7 +176,7 @@ def main():
                             result["actions"],  # action_orig
                             output_dir=output_base_dir / f"{index:05d}" / "fidelity",
                             layers=LAYERS,
-                            attn_root_dir="results",
+                            attn_root_dir=f"attn/{device_id}/layers_prefix",
                             save_vis=True,
                         )
                         if fidelity_results:

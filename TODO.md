@@ -15,10 +15,14 @@
     - [ ] understand denoising effect 
     - [ ] 
 
-- [ ] cherry pick the gold episode 
-    - [ ] add instruction.txt
-    - [ ] add bbox 
+- [x] cherry pick the gold episode 
+    - [x] add instruction.txt
+    - [x] add bbox 
     - [ ] 
+
+- [x] rewrite attn saving logic by device id
+    - [x] allocate devide automatically by free memory
+    - [ ] unify the saving logic to clean the tech debt
 
 ### Q&A
 - [x] Ask Edward
@@ -31,7 +35,7 @@
 - [x] overleaf start
     - [ ] 
     - [ ] reference list 
-- [ ] literature review
+- [x] literature review
 - [ ]
 
 
