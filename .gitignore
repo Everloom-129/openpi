@@ -3,6 +3,12 @@ assets/
 checkpoints/
 data/
 wandb/
+results/
+results_*/
+attn/
+CIS700-Explaining-Attention-of-VLAs/
+viz/s
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
