@@ -1,5 +1,5 @@
 """
-Hypothesis 2.1: Text Prompt Controls Visual Attention (Cross-Modal Grounding)
+Hypothesis 2: Counterfactual Prompting
 
 Tests whether changing the object name in the text prompt shifts attention focus.
 Uses counterfactual prompts to verify semantic grounding capability.
