@@ -19,9 +19,9 @@ def main():
     print("Loading Pi05 model (this may take a while)...")
     config = _config.get_config("pi05_droid")
     checkpoint_dir = "./checkpoints/viz/pi05_droid_pytorch"
-
+    device = "cuda:1"
     # Create policy
-    policy = _policy_config.create_trained_policy(config, checkpoint_dir)
+    policy = _policy_config.create_trained_policy(config, checkpoint_dir, pytorch_device=device)
 
     # Verify PyTorch model
     if not policy._is_pytorch_model:

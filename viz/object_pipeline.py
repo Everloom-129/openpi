@@ -42,10 +42,11 @@ FPS_VIDEO = 5
 CAMERA = "right"
 
 # Counterfactual prompt configuration
-COUNTERFACTUAL_LAYERS = range(18)  # Key layers for counterfactual analysis
+COUNTERFACTUAL_LAYERS = [0,4, 7,10,17] # Key layers for counterfactual analysis
 COUNTERFACTUAL_PROMPTS = {
     "baseline": "find the {object} and pick it up",
-    "duck": "find the duck toy and pick it up",
+    # "duck": "find the duck toy and pick it up",
+    "cube": "find the cube and pick it up",
     "pen": "find the pen and pick it up",
     "bottle": "find the bottle and pick it up",
     "empty": "",  # No prompt - test default attention behavior
@@ -1462,9 +1463,9 @@ def main():
     #     print("Usage: python viz/object_pipeline.py <DATA_ROOT>")
     #     print("Example: python viz/object_pipeline.py /data3/tonyw/aawr_offline/dual/")
     #     sys.exit(1)
-    TEST_CASE = "/data3/tonyw/aawr_offline/gold/"
+    # TEST_CASE = "/data3/tonyw/aawr_offline/gold/"
     # TEST_CASE = "/data3/tonyw/aawr_offline/dual/"
-    # TEST_CASE = "/data3/tonyw/aawr_offline/bookshelf_d/"
+    TEST_CASE = "/data3/tonyw/aawr_offline/bookshelf_d/"
     DATA_ROOT = Path(TEST_CASE)
     RESULTS_ROOT = Path("/data3/tonyw/aawr_offline/pi05/") / DATA_ROOT.name / CAMERA
 

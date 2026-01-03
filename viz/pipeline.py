@@ -20,8 +20,8 @@ from h1_mask_effect import run_fidelity_test
 OPEN_LOOP_HORIZON = 8
 LAYERS = [1, 4, 5, 7, 10]
 FPS = 2
-CREATE_SUMMARY_VIDEO = False
-CREATE_HEAD_VIDEOS = False
+CREATE_SUMMARY_VIDEO = True
+CREATE_HEAD_VIDEOS = True
 
 
 logger = logging.getLogger(__name__)
@@ -75,7 +75,7 @@ def load_toy_example(data_dir: Path, index: int, camera: str = "right"):
         instruction = instruction_path.read_text().strip()
     else:
         print(f"Warning: Instruction file not found at {instruction_path}, using default.")
-        instruction = "find the pineapple toy and pick it up"
+        instruction = "find the yellow duck toy and pick it up"
 
     print(f"Instruction: {instruction}")
 
@@ -115,16 +115,16 @@ def main():
     # Load Policy
     checkpoint_dir = "./checkpoints/viz/pi05_droid_pytorch"
     print(f"Loading policy from {checkpoint_dir}...")
-    device_id = str(select_best_gpu())
+    device_id = select_best_gpu()  # Returns integer like 0 or 1
     device = f"cuda:{device_id}"
     policy = attn_map.get_policy(checkpoint_dir, device=device)
-    print("Policy loaded.")
+    print(f"Policy loaded on {device}.")
 
     for outcome in ["success", "failure"]:
         outcome_dir = DATA_ROOT / outcome
         if not outcome_dir.exists():
             continue
- 
+
         for date_dir in outcome_dir.iterdir():
             if not date_dir.is_dir():
                 continue
@@ -142,9 +142,9 @@ def main():
 
                 # Skip if already processed
                 marker_file = output_base_dir / "pi05.md"
-                if marker_file.exists():
-                    print(f"Skipping episode {episode_id} (already processed)")
-                    continue
+                # if marker_file.exists():
+                #     print(f"Skipping episode {episode_id} (already processed)")
+                #     continue
 
                 # Determine Frames
                 total_frames = get_video_length(data_dir)
@@ -165,7 +165,12 @@ def main():
                         # Create subfolder for timestep: results_toy/.../episode/{index}
                         # This generates the attention maps in results/layers_prefix
                         result = attn_map.process_episode(
-                            policy, example, str(output_base_dir), f"{index:05d}", layers=LAYERS, device_id=device_id
+                            policy,
+                            example,
+                            str(output_base_dir),
+                            f"{index:05d}",
+                            layers=LAYERS,
+                            device_id=str(device_id),
                         )
 
                         # Run Fidelity Test immediately after inference (while attn maps exist)
@@ -176,7 +181,7 @@ def main():
                             result["actions"],  # action_orig
                             output_dir=output_base_dir / f"{index:05d}" / "fidelity",
                             layers=LAYERS,
-                            attn_root_dir=f"attn/{device_id}/layers_prefix",
+                            attn_root_dir=f"attn/{device_id}",
                             save_vis=True,
                         )
                         if fidelity_results:

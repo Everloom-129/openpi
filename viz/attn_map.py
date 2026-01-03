@@ -94,7 +94,7 @@ def visualize_attention(
 ):
     """Visualizes the attention map overlaid on the images (Summary View)."""
 
-    attn_path = os.path.join(input_dir, "layers_" + attn_mode, f"attn_map_layer_{layer_idx}.npy")
+    attn_path = os.path.join(input_dir, f"attn_map_layer_{layer_idx}.npy")
     if not os.path.exists(attn_path):
         print(f"Warning: Attention file {attn_path} not found. Skipping visualization.")
         return
@@ -143,7 +143,7 @@ def visualize_attention(
         img_resized = np.array(img_resized).astype(np.uint8)
 
         heatmap_resized = cv2.resize(heatmap, (224, 224), interpolation=cv2.INTER_CUBIC)
-
+        # Check why orange is low?
         heatmap_norm = np.uint8(255 * heatmap_resized / (np.max(heatmap_resized) + 1e-8))
         heatmap_color = cv2.applyColorMap(heatmap_norm, cv2.COLORMAP_JET)
         heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
@@ -185,7 +185,7 @@ def visualize_heads(
     from openpi.shared import image_tools
     import jax.numpy as jnp
 
-    attn_path = os.path.join(input_dir, "layers_" + attn_mode, f"attn_map_layer_{layer_idx}.npy")
+    attn_path = os.path.join(input_dir, f"attn_map_layer_{layer_idx}.npy")
     if not os.path.exists(attn_path):
         return
 
@@ -474,6 +474,6 @@ if __name__ == "__main__":
         example = load_duck_example(camera=camera, index=index)
         # print out the joint post
         vis_example(example, f"duck_{camera}_{index}")
-        process_episode(policy, example, "results", f"duck_{camera}_{index}", device_id=device_id)
+        process_episode(policy, example, "results", f"duck_{camera}_{index}", device_id=str(device_id))
 
     del policy
