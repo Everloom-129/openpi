@@ -9,7 +9,7 @@ import tyro
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from set_jax_config import configure_jax_single_gpu
+# from set_jax_config import configure_jax_single_gpu
 
 from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
@@ -104,7 +104,7 @@ def create_policy(args: Args) -> _policy.Policy:
 
 def main(args: Args) -> None:
     # Configure JAX for single GPU usage
-    configure_jax_single_gpu()
+    # configure_jax_single_gpu()
     
     policy = create_policy(args)
     policy_metadata = policy.metadata
