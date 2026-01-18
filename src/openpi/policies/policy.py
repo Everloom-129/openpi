@@ -66,17 +66,38 @@ class Policy(BasePolicy):
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+        # Extract demodiffusion parameters from obs before applying transforms
+        # These are optional parameters for demo-guided diffusion
+        retargeted_actions = obs.pop("retargeted_actions", None)
+        diffusion_time = obs.pop("time", 1.0)
+        action_dim_used = obs.pop("action_dim_used", None)
+
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
+
+        # Normalize retargeted_actions if provided (for demo-guided diffusion)
+        # Note: this assumes the normalization transform is at index 2 in the input transforms
+        # This is specific to DROID configuration
+        if retargeted_actions is not None:
+            retargeted_actions_norm = self._input_transform.transforms[2]({"actions": retargeted_actions})["actions"]
+        else:
+            retargeted_actions_norm = None
+
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
             self._rng, sample_rng_or_pytorch_device = jax.random.split(self._rng)
+            # Convert retargeted_actions_norm to jax array with batch dimension
+            if retargeted_actions_norm is not None:
+                retargeted_actions_norm = jnp.asarray(retargeted_actions_norm)[np.newaxis, ...]
         else:
             # Convert inputs to PyTorch tensors and move to correct device
             inputs = jax.tree.map(lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs)
             sample_rng_or_pytorch_device = self._pytorch_device
+            # Convert retargeted_actions_norm to PyTorch tensor with batch dimension
+            if retargeted_actions_norm is not None:
+                retargeted_actions_norm = torch.from_numpy(np.array(retargeted_actions_norm)).to(self._pytorch_device)[None, ...]
 
         # Prepare kwargs for sample_actions
         sample_kwargs = dict(self._sample_kwargs)
@@ -86,6 +107,12 @@ class Policy(BasePolicy):
             if noise.ndim == 2:  # If noise is (action_horizon, action_dim), add batch dimension
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
+
+        # Add demodiffusion parameters to sample_kwargs
+        if retargeted_actions_norm is not None:
+            sample_kwargs["retargeted_actions_norm"] = retargeted_actions_norm
+            sample_kwargs["time"] = diffusion_time
+            sample_kwargs["action_dim_used"] = action_dim_used
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
