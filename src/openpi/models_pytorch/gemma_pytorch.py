@@ -225,7 +225,7 @@ class PaliGemmaWithExpertModel(nn.Module):
                 scaling = self.paligemma.language_model.layers[layer_idx].self_attn.scaling
 
                 # Attention computation
-                att_output, _ = modeling_gemma.eager_attention_forward(
+                att_output, attn_weights = modeling_gemma.eager_attention_forward(
                     self.paligemma.language_model.layers[layer_idx].self_attn,
                     query_states,
                     key_states,
@@ -233,6 +233,30 @@ class PaliGemmaWithExpertModel(nn.Module):
                     attention_mask,
                     scaling,
                 )
+
+                # --- HACK: Save Joint Attention (inference only) ---
+                if not self.training and attn_weights is not None:
+                    _prefix_len = inputs_embeds[0].shape[1]
+                    _save_dir = "results/layers_joint"
+                    os.makedirs(_save_dir, exist_ok=True)
+                    np.save(
+                        f"{_save_dir}/attn_map_layer_{layer_idx}.npy",
+                        attn_weights.detach().cpu().to(torch.float32).numpy(),
+                    )
+                    # Save prefix_len metadata once per forward pass
+                    if layer_idx == 0:
+                        np.save(f"{_save_dir}/prefix_len.npy", np.array([_prefix_len]))
+                    # Save pre-softmax logits for selected layers (limits disk usage)
+                    _SAVE_LOGIT_LAYERS = {1, 4, 5, 7, 10}
+                    if layer_idx in _SAVE_LOGIT_LAYERS:
+                        _module = self.paligemma.language_model.layers[layer_idx].self_attn
+                        _key_rep = modeling_gemma.repeat_kv(key_states, _module.num_key_value_groups)
+                        _attn_logits_raw = torch.matmul(query_states, _key_rep.transpose(2, 3)) * scaling
+                        np.save(
+                            f"{_save_dir}/attn_logits_layer_{layer_idx}.npy",
+                            _attn_logits_raw.detach().cpu().to(torch.float32).numpy(),
+                        )
+                # ------------------------------------------------
                 # Get head_dim from the current layer, not from the model
                 head_dim = self.paligemma.language_model.layers[layer_idx].self_attn.head_dim
                 att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)

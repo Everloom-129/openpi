@@ -403,6 +403,92 @@ results_toy_video_right/
 
 ---
 
+## 7. Hypothesis H7: Fine-Grained Token-Level Attention Analysis
+
+### 7.1 Motivation and Current Limitation
+
+The existing visualization (`viz/attn_map.py`) operates at a **coarse level**:
+- Aggregates ALL text tokens [512:] into a single scalar per image patch (via avg/max).
+- This destroys token-level specificity — every word's signal is blended together.
+- Only saves attention from **Path A** (prefix-only forward); the joint denoising forward (Path C) was discarded.
+
+### 7.2 Three Execution Paths in `gemma_pytorch.py`
+
+| Path | Condition | Saves attention? |
+|------|-----------|-----------------|
+| A: Prefix-only | `inputs_embeds[1] is None` | ✓ `results/layers_prefix/` |
+| B: Suffix-only | `inputs_embeds[0] is None` | Commented out |
+| C: Joint (real denoising) | Both not None | **Now ✓** `results/layers_joint/` |
+
+Path C is the **real denoising forward pass**.  During diffusion denoising, 8 action tokens (suffix) attend to image tokens via `eager_attention_forward(...)`.  Previously the weights were discarded with `att_output, _`; they are now captured and saved.
+
+### 7.3 Token Layout
+
+```
+[0:256]     Image 1 patches  (base_0_rgb / exterior camera,   16×16 = 256 tokens)
+[256:512]   Image 2 patches  (left_wrist_0_rgb / wrist camera, 16×16 = 256 tokens)
+[512:768]   Image 3 patches  (right_wrist_0_rgb / ZERO PADDING, image_mask=False)
+[768:N]     Text tokens      (instruction + state, BOS + ~200 tokens)
+[N:N+8]     Action tokens    (suffix, 8 tokens) — joint forward only
+```
+
+Pi05/DROID passes **3 image slots** (base, left wrist, right wrist) to the model.  For
+single-wrist episodes, the third slot is filled with `np.zeros_like(base_image)` and
+masked out.  **Text tokens therefore start at index 768, not 512.**
+
+`prefix_len = N` is saved as `results/layers_joint/prefix_len.npy`.
+
+### 7.4 Sub-Hypotheses
+
+**H7.1 — Word-Specific Attention** (`viz/h_word_attention.py`)
+- Noun tokens ("cube", "bowl") should activate spatially distinct image patches corresponding to their referent objects.
+- Verb tokens ("place") should activate trajectory/hand regions.
+- Prepositions ("into", "on") should show intermediate/relational patterns.
+
+**H7.2 — Suffix ≠ Prefix Attention** (`viz/h_suffix_attention.py`)
+- Action tokens during denoising focus on different image regions than text tokens do.
+- Suffix attention is expected to be more focused (lower entropy) in deep layers, concentrating on hand/gripper regions relevant to the next action step.
+
+**H7.3 — Pre-softmax Logits** (`viz/h_suffix_attention.py::visualize_logits_vs_softmax`)
+- Pre-softmax Q@K logits reveal stronger object-word binding than post-softmax weights (softmax normalization dilutes strong signals by elevating unrelated tokens).
+- Saved as `results/layers_joint/attn_logits_layer_{i}.npy` for layers {1, 4, 5, 7, 10}.
+
+### 7.5 Implementation
+
+**Modified file**: `src/openpi/models_pytorch/gemma_pytorch.py`
+
+Inside `compute_layer_complete` (Path C, inference branch only):
+```python
+att_output, attn_weights = modeling_gemma.eager_attention_forward(...)
+if not self.training and attn_weights is not None:
+    np.save(f"results/layers_joint/attn_map_layer_{layer_idx}.npy", ...)
+    if layer_idx == 0:
+        np.save("results/layers_joint/prefix_len.npy", np.array([prefix_len]))
+    if layer_idx in {1, 4, 5, 7, 10}:
+        # also save pre-softmax logits
+        np.save(f"results/layers_joint/attn_logits_layer_{layer_idx}.npy", ...)
+```
+
+**New scripts**:
+
+| Script | Function | Hypothesis |
+|--------|----------|------------|
+| `viz/h_word_attention.py` | Per-word prefix attention heatmap | H7.1 |
+| `viz/h_word_attention.py::compare_word_entropy` | Entropy vs layer per word | H7.1 |
+| `viz/h_suffix_attention.py::visualize_suffix_attention` | Per-action-step suffix grid | H7.2 |
+| `viz/h_suffix_attention.py::compare_prefix_suffix` | Prefix vs suffix overlay | H7.2 |
+| `viz/h_suffix_attention.py::entropy_prefix_vs_suffix` | Entropy comparison | H7.3 |
+| `viz/h_suffix_attention.py::visualize_logits_vs_softmax` | Pre- vs post-softmax | H7.3 |
+
+### 7.6 Verification Steps
+
+1. Run inference: `python viz/attn_map.py` — verify `results/layers_joint/` files are created.
+2. Run `python viz/h_word_attention.py` — inspect that "cube" and "bowl" maps differ spatially.
+3. Run `python viz/h_suffix_attention.py` — compare 8 action-step maps visually.
+4. Check entropy: suffix action tokens should have lower entropy than prefix text tokens in deep layers.
+
+---
+
 ## 6. Hypothesis 1.1: Attention-Object Correlation (2024-12-24)
 
 ### 6.1 研究问题

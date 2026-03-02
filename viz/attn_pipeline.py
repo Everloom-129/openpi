@@ -14,7 +14,7 @@ from PIL import Image
 
 import attn_map
 import combine_video
-from h1_mask_effect import run_fidelity_test
+from h3_casual_fidelity import run_fidelity_test
 
 
 OPEN_LOOP_HORIZON = 8

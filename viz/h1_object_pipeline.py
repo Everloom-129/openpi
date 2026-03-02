@@ -23,7 +23,7 @@ from h1_1_object_detection import (
     run_object_detection,
 )
 from openpi.shared import image_tools
-from pipeline import copy_instruction, get_video_length, load_toy_example, timer
+from attn_pipeline import copy_instruction, get_video_length, load_toy_example, timer
 from attn_map import select_best_gpu
 
 
@@ -1459,10 +1459,6 @@ def batch_generate_counterfactual_videos(results_root: Path, layers: list[int], 
 
 @timer
 def main():
-    # if len(sys.argv) < 2:
-    #     print("Usage: python viz/object_pipeline.py <DATA_ROOT>")
-    #     print("Example: python viz/object_pipeline.py /data3/tonyw/aawr_offline/dual/")
-    #     sys.exit(1)
     # TEST_CASE = "/data3/tonyw/aawr_offline/gold/"
     # TEST_CASE = "/data3/tonyw/aawr_offline/dual/"
     TEST_CASE = "/data3/tonyw/aawr_offline/bookshelf_d/"
