@@ -6,6 +6,7 @@ wandb/
 results/
 results_*/
 attn/
+attn_*/
 CIS700-Explaining-Attention-of-VLAs/
 viz/s
 
