@@ -43,6 +43,28 @@ def load_image_224(path: str | None) -> np.ndarray | None:
     return img.astype(np.uint8)
 
 
+def tokenize_instruction(instruction: str) -> tuple[list[int], list[str]]:
+    """Tokenize instruction with zero state to get real token texts."""
+    import sys
+    project_src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+    if project_src not in sys.path:
+        sys.path.insert(0, project_src)
+    try:
+        from openpi.models.tokenizer import PaligemmaTokenizer
+        tokenizer = PaligemmaTokenizer()
+        # Use zeros for state — instruction tokens will be exact, state labels approximate
+        state = np.zeros(8)
+        disc = np.digitize(state, bins=np.linspace(-1, 1, 257)[:-1]) - 1
+        state_str = " ".join(map(str, disc))
+        full_prompt = f"Task: {instruction}, State: {state_str};\nAction: "
+        ids = tokenizer._tokenizer.encode(full_prompt, add_bos=True)
+        texts = [tokenizer._tokenizer.id_to_piece(i) for i in ids]
+        return ids, texts
+    except Exception as e:
+        print(f"[convert] Tokenizer unavailable ({e}), using placeholder labels.")
+        return [], []
+
+
 def convert_episode(
     src_prefix_dir: str,
     dst_h5_path: str,
@@ -72,12 +94,18 @@ def convert_episode(
 
     n_text = seq_len - TEXT_START_IDX
 
-    # Build token metadata
+    # Build token metadata — tokenize if instruction given but texts not provided
+    if token_texts is None and instruction:
+        real_ids, real_texts = tokenize_instruction(instruction)
+        if real_texts:
+            token_ids = real_ids
+            token_texts = real_texts
     if token_texts is None:
         token_texts = [f"tok_{i}" for i in range(n_text)]
     if token_ids is None:
         token_ids = list(range(n_text))
 
+    n_real_tokens = min(len(token_texts), n_text)
     n_text_actual = min(n_text, len(token_texts))
 
     with h5py.File(dst_h5_path, "w") as f:
@@ -86,6 +114,7 @@ def convert_episode(
         meta.create_dataset("prefix_len", data=np.int32(TEXT_START_IDX))
         meta.create_dataset("frame_idx", data=np.int32(frame_idx))
         meta.create_dataset("seq_len", data=np.int32(seq_len))
+        meta.create_dataset("n_real_tokens", data=np.int32(n_real_tokens))
         dt = h5py.string_dtype(encoding="utf-8")
         meta.create_dataset("instruction", data=instruction)
         meta.create_dataset(

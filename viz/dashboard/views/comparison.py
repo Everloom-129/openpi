@@ -135,11 +135,13 @@ def _render_heatmap_compact(data: dict, available_layers: list[int], key_suffix:
         st.plotly_chart(
             _ih._make_overlay_figure(ext_img, ext_h, f"Ext — '{tok_name}'"),
             use_container_width=True,
+            key=f"cmp_ext_{key_suffix}_{tok_idx}_{layer}",
         )
     with c2:
         st.plotly_chart(
             _ih._make_overlay_figure(wrist_img, wrist_h, f"Wrist — '{tok_name}'"),
             use_container_width=True,
+            key=f"cmp_wrist_{key_suffix}_{tok_idx}_{layer}",
         )
 
 

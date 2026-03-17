@@ -86,7 +86,7 @@ def load_meta(path: str) -> dict[str, Any]:
     with h5py.File(path, "r") as f:
         meta = f.get("meta", {})
         result: dict[str, Any] = {}
-        for k in ("prefix_len", "frame_idx", "seq_len"):
+        for k in ("prefix_len", "frame_idx", "seq_len", "n_real_tokens"):
             if k in meta:
                 result[k] = int(meta[k][()])
         if "instruction" in meta:
@@ -148,6 +148,47 @@ def load_full_matrix_all_heads(path: str, layer: int) -> np.ndarray | None:
         if key not in f:
             return None
         return f[key][()].astype(np.float32)
+
+
+# ── Counterfactual helpers ─────────────────────────────────────────────────────
+
+def prompt_to_slug(prompt: str, max_len: int = 24) -> str:
+    """Convert a prompt string to a safe filename slug."""
+    import re
+    slug = prompt.lower().strip()
+    slug = re.sub(r"[^a-z0-9]+", "_", slug)
+    slug = slug.strip("_")[:max_len].rstrip("_")
+    return slug or "prompt"
+
+
+def h5_path_cf(
+    checkpoint: str,
+    episode: str,
+    frame: int,
+    prompt_slug: str,
+    attn_h5_root: str = "attn_h5",
+) -> str:
+    """Path for a counterfactual rollout HDF5 file."""
+    return str(Path(attn_h5_root) / checkpoint / episode / f"{frame:05d}_{prompt_slug}.h5")
+
+
+def list_cf_slugs(
+    checkpoint: str,
+    episode: str,
+    frame: int,
+    attn_h5_root: str = "attn_h5",
+) -> list[str]:
+    """List all prompt slugs saved for a given (checkpoint, episode, frame)."""
+    frame_dir = Path(attn_h5_root) / checkpoint / episode
+    if not frame_dir.exists():
+        return []
+    prefix = f"{frame:05d}_"
+    slugs = []
+    for f in sorted(frame_dir.glob(f"{prefix}*.h5")):
+        slug = f.stem[len(prefix):]
+        if slug:
+            slugs.append(slug)
+    return slugs
 
 
 # ── In-memory data from online inference ──────────────────────────────────────

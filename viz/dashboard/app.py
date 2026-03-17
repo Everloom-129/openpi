@@ -22,7 +22,7 @@ for _p in [_PROJECT_ROOT, os.path.join(_PROJECT_ROOT, "src")]:
         sys.path.insert(0, _p)
 
 from viz.dashboard import loader as _loader
-from viz.dashboard.views import action_view, attn_matrix, comparison, image_heatmap
+from viz.dashboard.views import action_view, attn_matrix, comparison, counterfactual, grid_heatmap, image_heatmap
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -88,14 +88,13 @@ with st.sidebar:
             key="online_instruction",
         )
 
-        use_duck = st.checkbox("Use duck dataset (frame 0)", value=True, key="use_duck")
-        if use_duck:
-            ext_path = os.path.join(_PROJECT_ROOT, "data/visualization/duck/frames/varied_camera_1/00000.jpg")
-            wrist_path = os.path.join(_PROJECT_ROOT, "data/visualization/duck/frames/hand_camera/00000.jpg")
-        else:
-            ext_file = st.file_uploader("Exterior image", type=["jpg", "png"], key="ext_upload")
-            wrist_file = st.file_uploader("Wrist image", type=["jpg", "png"], key="wrist_upload")
-            ext_path = wrist_path = None
+        dataset_choice = st.selectbox(
+            "Dataset", ["duck", "pineapple"], key="online_dataset"
+        )
+        max_frames = {"duck": 90, "pineapple": 90}
+        online_frame = st.slider(
+            "Frame", 0, max_frames.get(dataset_choice, 90), 0, key="online_frame"
+        )
 
         gpu_device = st.selectbox("GPU device", ["cuda:0", "cuda:1", "cpu"], key="gpu_device")
 
@@ -103,28 +102,21 @@ with st.sidebar:
 
         if run_btn:
             with st.spinner("Loading model and running inference…"):
-                from PIL import Image
-
-                def load_img(path):
-                    if path and os.path.exists(path):
-                        return np.array(Image.open(path).convert("RGB"))
-                    return np.zeros((224, 224, 3), dtype=np.uint8)
-
-                if use_duck:
-                    ext_img = load_img(ext_path)
-                    wrist_img = load_img(wrist_path)
+                import sys as _sys
+                _sys.path.insert(0, os.path.join(_PROJECT_ROOT, "viz"))
+                if dataset_choice == "duck":
+                    from attn_map import load_duck_example
+                    example = load_duck_example(camera="left", index=online_frame)
+                    example["prompt"] = instruction_text
                 else:
-                    from io import BytesIO
-                    ext_img = np.array(Image.open(BytesIO(ext_file.read())).convert("RGB")) if ext_file else np.zeros((224, 224, 3), dtype=np.uint8)
-                    wrist_img = np.array(Image.open(BytesIO(wrist_file.read())).convert("RGB")) if wrist_file else np.zeros((224, 224, 3), dtype=np.uint8)
-
-                example = {
-                    "observation/exterior_image_1_left": ext_img,
-                    "observation/wrist_image_left": wrist_img,
-                    "observation/joint_position": np.zeros(7),
-                    "observation/gripper_position": np.zeros(1),
-                    "prompt": instruction_text,
-                }
+                    from attn_pipeline import load_toy_example
+                    from pathlib import Path as _Path
+                    example = load_toy_example(
+                        data_dir=_Path(os.path.join(_PROJECT_ROOT, "data/visualization/aawr_pineapple")),
+                        index=online_frame,
+                        camera="right",
+                    )
+                    example["prompt"] = instruction_text
                 try:
                     policy = _inf.load_model(online_ckpt_path, device=gpu_device)
                     slice_dict = _inf.run_inference(policy, example)
@@ -169,12 +161,16 @@ if mode == "Offline (HDF5)":
     if meta.get("instruction"):
         st.caption(f"**Instruction:** {meta['instruction']}")
 
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab0, tab1, tab2, tab3, tab4 = st.tabs([
+        "🔲 Grid Heatmap",
         "🖼 Image Heatmap",
-        "🔲 Attention Matrix",
+        "📊 Attention Matrix",
         "🤖 Action View",
         "⚖ Compare",
     ])
+
+    with tab0:
+        grid_heatmap.render(data, available_layers)
 
     with tab1:
         image_heatmap.render(data, available_layers)
@@ -207,15 +203,26 @@ else:
         if k.startswith("layer_")
     )
 
-    tab1, tab2, tab3 = st.tabs([
+    tab0, tab1, tab2, tab3, tab4 = st.tabs([
+        "🔲 Grid Heatmap",
         "🖼 Image Heatmap",
-        "🔲 Attention Matrix",
+        "📊 Attention Matrix",
         "🤖 Action View",
+        "🔀 Counterfactual",
     ])
 
+    with tab0:
+        grid_heatmap.render(data, available_layers)
     with tab1:
         image_heatmap.render(data, available_layers)
     with tab2:
         attn_matrix.render(data, available_layers)
     with tab3:
         action_view.render(data, available_layers)
+    with tab4:
+        counterfactual.render(
+            attn_h5_root=ATTN_H5_ROOT,
+            checkpoints=_loader.list_checkpoints(ATTN_H5_ROOT),
+            default_checkpoint="",
+        )
+    
