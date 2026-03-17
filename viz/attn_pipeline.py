@@ -79,11 +79,18 @@ def load_toy_example(data_dir: Path, index: int, camera: str = "right"):
 
     print(f"Instruction: {instruction}")
 
+    # Load real joint/gripper state from trajectory
+    import h5py
+    traj_path = data_dir / "trajectory.h5"
+    with h5py.File(traj_path, "r") as f:
+        joint_position = f["observation/robot_state/joint_positions"][index].astype(np.float64)
+        gripper_position = f["observation/robot_state/gripper_position"][index : index + 1].astype(np.float64)
+
     return {
         "observation/exterior_image_1_left": ext_img,
         "observation/wrist_image_left": hand_img,
-        "observation/joint_position": np.random.rand(7),
-        "observation/gripper_position": np.random.rand(1),
+        "observation/joint_position": joint_position,
+        "observation/gripper_position": gripper_position,
         "prompt": instruction,
     }
 

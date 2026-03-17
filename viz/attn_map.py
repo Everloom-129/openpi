@@ -34,6 +34,7 @@ def load_duck_example(camera: str = "left", index: int = 0):
         raise ValueError("index must be between 0 and 90")
 
     data_dir = "data/visualization/duck/frames"
+    traj_path = "data/visualization/duck/trajectory.h5"
 
     # Load images
     ext_path = os.path.join(data_dir, camera, f"{index:05d}.jpg")
@@ -42,12 +43,18 @@ def load_duck_example(camera: str = "left", index: int = 0):
     ext_img = np.array(Image.open(ext_path))
     hand_img = np.array(Image.open(hand_path))
 
+    # Load real joint/gripper state from trajectory
+    import h5py
+    with h5py.File(traj_path, "r") as f:
+        joint_position = f["observation/robot_state/joint_positions"][index].astype(np.float64)
+        gripper_position = f["observation/robot_state/gripper_position"][index : index + 1].astype(np.float64)
+
     instruction = "place the duck toy into the pink bowl"
     return {
         "observation/exterior_image_1_left": ext_img,
         "observation/wrist_image_left": hand_img,
-        "observation/joint_position": np.random.rand(7),  # Placeholder # TODO read from real data
-        "observation/gripper_position": np.random.rand(1),  # Placeholder
+        "observation/joint_position": joint_position,
+        "observation/gripper_position": gripper_position,
         "prompt": instruction,
     }
 
