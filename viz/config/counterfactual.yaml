@@ -1,0 +1,53 @@
+# Counterfactual prompt configurations for attention analysis.
+#
+# Each inference frame will run once with the episode's original prompt, then
+# once per entry below.  Results are saved as:
+#   {frame:05d}/{frame:05d}_{key}.h5
+#
+# Fields:
+#   key     — filename suffix, must be a valid path component (no slashes/spaces)
+#   prompt  — text prompt sent to the model; empty string = no instruction
+#   method  — grouping label for downstream analysis:
+#               object_swap   : replace the target object with a different one
+#               style         : rephrase / change instruction style
+#               negation      : tell the model NOT to do something
+#               empty         : blank prompt (tests default attention behaviour)
+#               custom        : anything else
+
+prompts:
+
+  # ── Object swap ─────────────────────────────────────────────────────────────
+  - key: cube
+    prompt: "find the cube and pick it up"
+    method: object_swap
+
+  - key: pen
+    prompt: "find the pen and pick it up"
+    method: object_swap
+
+  - key: bottle
+    prompt: "find the bottle and pick it up"
+    method: object_swap
+
+  - key: duck
+    prompt: "find the pineapple and pick it up"
+    method: object_swap
+
+  # ── Style variation ──────────────────────────────────────────────────────────
+  - key: style_short
+    prompt: "pick it up"
+    method: style
+
+  - key: style_verbose
+    prompt: "please carefully locate the target object and grasp it"
+    method: style
+
+  # ── Negation ─────────────────────────────────────────────────────────────────
+  - key: negate
+    prompt: "do not pick up anything"
+    method: negation
+
+  # ── Empty (no instruction) ───────────────────────────────────────────────────
+  - key: empty
+    prompt: ""
+    method: empty

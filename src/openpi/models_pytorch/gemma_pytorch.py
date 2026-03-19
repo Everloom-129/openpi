@@ -10,6 +10,39 @@ from transformers import PaliGemmaForConditionalGeneration
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
 
+# ── In-RAM attention capture ───────────────────────────────────────────────────
+# Usage (pipeline.py):
+#   _gpt.enable_attn_buffer()   # arm before policy.infer()
+#   result = policy.infer(example)
+#   buf = _gpt.get_attn_buffer()
+#   _gpt.clear_attn_buffer()    # always disarm (put in finally block)
+#   write_attn_h5_from_buffer(buf, ...)
+#
+# NOTE: On the first call to enable_attn_buffer() a one-time notice is printed
+# so you know attention capture is active.
+_ATTN_BUFFER: dict[int, np.ndarray] | None = None
+_ATTN_BUFFER_NOTIFIED: bool = False
+
+
+def enable_attn_buffer() -> None:
+    """Arm the in-RAM attention buffer. Call once before each policy.infer()."""
+    global _ATTN_BUFFER, _ATTN_BUFFER_NOTIFIED
+    _ATTN_BUFFER = {}
+    if not _ATTN_BUFFER_NOTIFIED:
+        print("[attn] Attention capture enabled — prefix attention will be held in RAM.")
+        _ATTN_BUFFER_NOTIFIED = True
+
+
+def get_attn_buffer() -> dict[int, np.ndarray] | None:
+    """Return the current buffer dict {layer_idx: ndarray} or None if not armed."""
+    return _ATTN_BUFFER
+
+
+def clear_attn_buffer() -> None:
+    """Disarm and discard the buffer. Call in a finally block after infer()."""
+    global _ATTN_BUFFER
+    _ATTN_BUFFER = None
+
 
 class PaliGemmaWithExpertModel(nn.Module):
     def __init__(
@@ -112,16 +145,12 @@ class PaliGemmaWithExpertModel(nn.Module):
                 output_attentions=True,
             )
 
-            # --- HACK: Save Attention ---
-            if not self.training:
-                # prefix_output.attentions is a tuple of tensors, one per layer
+            # --- Capture attention into RAM buffer ---
+            if not self.training and _ATTN_BUFFER is not None:
                 if prefix_output.attentions is not None:
-                    os.makedirs("results/layers_prefix", exist_ok=True)
                     for i, layer_attn in enumerate(prefix_output.attentions):
-                        save_path = f"results/layers_prefix/attn_map_layer_{i}.npy"
-                        np.save(save_path, layer_attn.detach().cpu().to(torch.float32).numpy())
-                    print(f"Saved {len(prefix_output.attentions)} layers of Prefix Attention to results/layers_prefix/")
-            # ----------------------------
+                        _ATTN_BUFFER[i] = layer_attn.detach().cpu().to(torch.float32).numpy()
+            # ----------------------------------------
 
             prefix_past_key_values = prefix_output.past_key_values
             prefix_output = prefix_output.last_hidden_state

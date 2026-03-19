@@ -22,7 +22,8 @@ for _p in [_PROJECT_ROOT, os.path.join(_PROJECT_ROOT, "src")]:
         sys.path.insert(0, _p)
 
 from viz.dashboard import loader as _loader
-from viz.dashboard.views import action_view, attn_matrix, comparison, counterfactual, grid_heatmap, image_heatmap
+from viz.dashboard import loader_results as _rl
+from viz.dashboard.views import action_view, attn_matrix, comparison, counterfactual, grid_heatmap, image_heatmap, trajectory
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -34,13 +35,17 @@ st.set_page_config(
 
 ATTN_H5_ROOT = os.path.join(_PROJECT_ROOT, "attn_h5")
 CHECKPOINT_ROOT = os.path.join(_PROJECT_ROOT, "checkpoints/viz")
+RESULTS_ROOT = os.environ.get(
+    "RESULTS_ROOT",
+    "/data3/tonyw/toy_cube_benchmark/pi05_vis/cube_gold",
+)
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("🧠 Pi0.5 Attention")
     st.markdown("---")
 
-    mode = st.radio("Mode", ["Offline (HDF5)", "Online (Inference)"], index=0)
+    mode = st.radio("Mode", ["Offline (HDF5)", "Results (Benchmark)", "Online (Inference)"], index=0)
 
     if mode == "Offline (HDF5)":
         checkpoints = _loader.list_checkpoints(ATTN_H5_ROOT)
@@ -65,6 +70,47 @@ with st.sidebar:
 
         st.markdown("---")
         st.caption(f"HDF5 root: `{ATTN_H5_ROOT}`")
+
+    elif mode == "Results (Benchmark)":
+        outcomes = _rl.list_outcomes(RESULTS_ROOT)
+        if not outcomes:
+            st.error(f"No data found in `{RESULTS_ROOT}`.\n\nSet `RESULTS_ROOT` env var or run the pipeline first.")
+            st.stop()
+
+        res_outcome = st.selectbox("Outcome", outcomes, key="res_outcome")
+
+        res_dates = _rl.list_dates(RESULTS_ROOT, res_outcome)
+        if not res_dates:
+            st.error("No dates found.")
+            st.stop()
+        res_date = st.selectbox("Date", res_dates, key="res_date")
+
+        res_episodes = _rl.list_episodes(RESULTS_ROOT, res_outcome, res_date)
+        if not res_episodes:
+            st.error("No episodes found.")
+            st.stop()
+        ep_labels = [
+            f"{'✓ ' if _rl.is_complete(RESULTS_ROOT, res_outcome, res_date, ep) else '○ '}{ep}"
+            for ep in res_episodes
+        ]
+        res_ep_idx = st.selectbox(
+            "Episode", range(len(res_episodes)),
+            format_func=lambda i: ep_labels[i], key="res_ep_idx"
+        )
+        res_episode = res_episodes[res_ep_idx]
+
+        res_all_frames = _rl.list_frames(RESULTS_ROOT, res_outcome, res_date, res_episode)
+        if not res_all_frames:
+            st.error("No frames found.")
+            st.stop()
+
+        res_frame = st.selectbox("Frame (single-frame tabs)", res_all_frames, key="res_frame")
+        res_cf_slugs = _rl.list_cf_slugs(RESULTS_ROOT, res_outcome, res_date, res_episode, res_all_frames[0])
+
+        st.markdown("---")
+        st.caption(f"`{res_outcome}/{res_date}/{res_episode}`")
+        if res_cf_slugs:
+            st.caption(f"CF variants: {', '.join(f'`{s}`' for s in res_cf_slugs)}")
 
     else:
         # Online mode
@@ -186,6 +232,71 @@ if mode == "Offline (HDF5)":
             attn_h5_root=ATTN_H5_ROOT,
             default_checkpoint=checkpoint_a,
             checkpoints=checkpoints,
+        )
+
+elif mode == "Results (Benchmark)":
+    res_h5 = _rl.h5_path_results(RESULTS_ROOT, res_outcome, res_date, res_episode, res_frame)
+
+    meta = _loader.load_meta(res_h5)
+    images = _loader.load_images(res_h5)
+    available_layers = _loader.list_layers_in_h5(res_h5)
+
+    if not available_layers:
+        st.error(f"No attention data at `{res_h5}`.")
+        st.stop()
+
+    def _make_load_t2i_res(path):
+        def _fn(layer):
+            return _loader.load_text_to_img(path, layer)
+        return _fn
+
+    def _make_load_full_res(path):
+        def _fn(layer):
+            return _loader.load_full_matrix_all_heads(path, layer)
+        return _fn
+
+    data = {
+        "meta": meta,
+        "images": images,
+        "_load_t2i": _make_load_t2i_res(res_h5),
+        "_load_full_all": _make_load_full_res(res_h5),
+    }
+
+    st.header(f"{res_outcome} · `{res_episode}` · Frame `{res_frame}`")
+    if meta.get("instruction"):
+        st.caption(f"**Instruction:** {meta['instruction']}")
+
+    tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "🔲 Grid Heatmap",
+        "🖼 Image Heatmap",
+        "📊 Attention Matrix",
+        "🤖 Action View",
+        "⚖ Compare",
+        "📈 Trajectory",
+    ])
+
+    with tab0:
+        grid_heatmap.render(data, available_layers)
+    with tab1:
+        image_heatmap.render(data, available_layers)
+    with tab2:
+        attn_matrix.render(data, available_layers)
+    with tab3:
+        action_view.render(data, available_layers)
+    with tab4:
+        comparison.render(
+            attn_h5_root=ATTN_H5_ROOT,
+            default_checkpoint="",
+            checkpoints=_loader.list_checkpoints(ATTN_H5_ROOT),
+        )
+    with tab5:
+        trajectory.render(
+            root=RESULTS_ROOT,
+            outcome=res_outcome,
+            date=res_date,
+            episode=res_episode,
+            available_frames=res_all_frames,
+            cf_slugs=res_cf_slugs,
         )
 
 else:

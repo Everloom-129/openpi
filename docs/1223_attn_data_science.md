@@ -78,11 +78,13 @@ Output: Action predictions (6D pose + gripper)
     └── Aggregate statistics across episodes
 ```
 
-### 2.2 File Organization
+### 2.2 
+
+## File Organization
 
 #### Input Data Structure
 ```
-/data3/tonyw/toy_cube_benchmark/
+/data3/tonyw/toy_cube_benchmark/all/
 ├── success/
 │   └── 2025-12-10/
 │       └── 2025-12-10_12-34-56/
@@ -97,23 +99,21 @@ Output: Action predictions (6D pose + gripper)
 ```
 
 #### Output Data Structure
+# downsample every 8 frames
 ```
-results_toy_right/
+/data3/tonyw/toy_cube_benchmark/pi05_vis/
 ├── success/
 │   └── 2025-12-10/
 │       └── 2025-12-10_12-34-56/
 │           ├── pi05.md (completion marker)
 │           ├── 00000/ (keyframe 0)
-│           │   ├── prefix_L1_attn_vis_max.jpg
-│           │   ├── prefix_L4_attn_vis_max.jpg
-│           │   └── L1_prefix_heads/
-│           │       └── head_00.jpg - head_07.jpg
+│           │   ├── 00000.h5
+│           │   ├── 00000_{counterfactual}.h5
 │           ├── 00008/ (keyframe 8)
-│           └── object/ (H1.1 analysis)
-│               ├── 00000/
-│               │   ├── L00.jpg - L17.jpg
-│               │   └── metrics.json
-│               └── h1_1_obj_attn_results.json
+│           │   ├── 00008.h5
+│           │   ├── 00008_{counterfactual}.h5
+│           │   ├── 00016_{counterfactual}.h5
+
 └── failure/
     └── (same structure)
 ```
