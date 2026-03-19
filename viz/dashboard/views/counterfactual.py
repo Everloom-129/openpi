@@ -28,6 +28,14 @@ import numpy as np
 import streamlit as st
 
 from viz.dashboard import loader as _loader
+from viz.dashboard.views.grid_heatmap import (
+    _SIMPLE_AGGS,
+    _PARAM_AGGS,
+    _ALL_AGG_NAMES,
+    _AGG_DESCRIPTIONS,
+    _make_topk_fn,
+    _make_count_fn,
+)
 
 NUM_IMAGE_TOKENS = 256
 PATCH_GRID = 16
@@ -97,8 +105,6 @@ def _run_one_prompt(
     gpu_id: int = 0,
 ) -> dict:
     """Run inference for one prompt, return in-memory slice dict."""
-    # The model writes attn maps to attn/{gpu_id}/layers_prefix/
-    # We read them back immediately and return as dict (no long-term disk use).
     example = {
         "observation/exterior_image_1_left": ext_img,
         "observation/wrist_image_left": wrist_img,
@@ -108,9 +114,25 @@ def _run_one_prompt(
     }
     _ = policy.infer(example)
 
+    # Tokenize to get human-readable token labels (text + robot state only)
+    token_texts = None
+    try:
+        from openpi.models.tokenizer import PaligemmaTokenizer
+        tokenizer = PaligemmaTokenizer()
+        state = np.concatenate([joint_pos, gripper_pos])
+        instr = prompt.strip().replace("_", " ").replace("\n", " ")
+        discretized = np.digitize(state, bins=np.linspace(-1, 1, 257)[:-1]) - 1
+        state_str = " ".join(map(str, discretized))
+        full_prompt = f"Task: {instr}, State: {state_str};\nAction: "
+        token_ids = tokenizer._tokenizer.encode(full_prompt, add_bos=True)
+        token_texts = [tokenizer._tokenizer.id_to_piece(i) for i in token_ids]
+    except Exception:
+        pass
+
     layers_dir = os.path.join(_PROJECT_ROOT, f"attn/{gpu_id}/layers_prefix")
     return _loader.make_slice_dict_from_npy(
         layers_prefix_dir=layers_dir,
+        token_texts=token_texts,
         instruction=prompt,
         ext_img=ext_img,
         wrist_img=wrist_img,
@@ -188,130 +210,157 @@ def _save_cf_h5(
 
 # ── Visualisation ─────────────────────────────────────────────────────────────
 
+_IMG_SIZE = 224
+
+
 def _attn_to_hmap(attn_512: np.ndarray, camera: str) -> np.ndarray:
     if camera == "exterior":
         patches = attn_512[:NUM_IMAGE_TOKENS]
     else:
         patches = attn_512[NUM_IMAGE_TOKENS : 2 * NUM_IMAGE_TOKENS]
     grid = patches.reshape(PATCH_GRID, PATCH_GRID).astype(np.float32)
-    return cv2.resize(grid, (112, 112), interpolation=cv2.INTER_LINEAR)
+    return cv2.resize(grid, (_IMG_SIZE, _IMG_SIZE), interpolation=cv2.INTER_LINEAR)
 
 
 def _overlay(img: np.ndarray, hmap: np.ndarray, alpha: float = 0.45) -> np.ndarray:
-    img_s = cv2.resize(img, (112, 112), interpolation=cv2.INTER_LINEAR)
+    img_s = cv2.resize(img, (_IMG_SIZE, _IMG_SIZE), interpolation=cv2.INTER_LINEAR)
     hn = (hmap - hmap.min()) / (hmap.max() - hmap.min() + 1e-8)
     color = cv2.applyColorMap((hn * 255).astype(np.uint8), cv2.COLORMAP_JET)
     color = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
     return cv2.addWeighted(img_s, 1 - alpha, color, alpha, 0)
 
 
-def _diff_overlay(img: np.ndarray, diff_16x16: np.ndarray) -> np.ndarray:
-    """Red=more attention, Blue=less attention vs baseline."""
-    img_s = cv2.resize(img, (112, 112), interpolation=cv2.INTER_LINEAR)
-    d = cv2.resize(diff_16x16.astype(np.float32), (112, 112), interpolation=cv2.INTER_LINEAR)
-    vmax = max(abs(d.max()), abs(d.min()), 1e-8)
-    d_norm = (d / vmax + 1.0) / 2.0   # 0..1, 0.5 = no change
-    color = cv2.applyColorMap((d_norm * 255).astype(np.uint8), cv2.COLORMAP_RdBu)
-    color = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
+def _diff_overlay(img: np.ndarray, diff: np.ndarray) -> np.ndarray:
+    """diff is already _IMG_SIZE×_IMG_SIZE. Red=more, Blue=less attention vs baseline."""
+    img_s = cv2.resize(img, (_IMG_SIZE, _IMG_SIZE), interpolation=cv2.INTER_LINEAR)
+    vmax = max(abs(diff.max()), abs(diff.min()), 1e-8)
+    d_norm = np.clip((diff / vmax + 1.0) / 2.0, 0.0, 1.0)
+    cmap = plt.get_cmap("RdBu_r")
+    color = (cmap(d_norm)[..., :3] * 255).astype(np.uint8)
     return cv2.addWeighted(img_s, 0.55, color, 0.45, 0)
 
 
-def _build_cf_grid(
-    results: list[dict],       # [{prompt, slug, slice_dict}]
-    baseline_idx: int,
-    layer: int,
-    head_agg: str,             # "max" | "mean" | int
-    camera: str,
-    tok_idx: int,
-    show_diff: bool,
+def _resolve_attn_vec(t2i: np.ndarray, agg_fn, attn_mode: str, tok_idx: int) -> np.ndarray:
+    """Reduce (8, n_text, 512) → (512,) using head agg + token mode."""
+    head_agg = agg_fn(t2i) if agg_fn is not None else t2i.mean(axis=0)
+    if attn_mode == "whole":
+        return head_agg.mean(axis=0)
+    else:
+        return head_agg[tok_idx]
+
+
+def _build_row_png(
+    items: list[tuple[str, np.ndarray, bool]],   # (label, img_224, is_baseline)
 ) -> bytes:
-    """Render rows=prompts × cols=(raw | diff) matplotlib grid → PNG bytes."""
-    n_prompts = len(results)
-    n_cols = 2 if show_diff else 1   # col 0 = attention, col 1 = diff vs baseline
-    cell = 1.5
-    fig = plt.figure(figsize=(n_cols * cell * 2, n_prompts * cell), dpi=110)
+    """Render a single-row figure: one cell per prompt."""
+    n = len(items)
+    cell_w, cell_h = 2.6, 3.0
+    fig, axes = plt.subplots(1, n, figsize=(n * cell_w, cell_h), dpi=100)
     fig.patch.set_facecolor("#0e1117")
-
-    gs = gridspec.GridSpec(n_prompts, n_cols * 2, figure=fig,
-                           wspace=0.05, hspace=0.12,
-                           left=0.12, right=1.0, top=0.95, bottom=0.02)
-
-    # Precompute baseline heatmap for diff
-    base_hmap = None
-    if show_diff:
-        base_t2i = results[baseline_idx]["slice_dict"].get("prefix", {}).get(f"layer_{layer}", {}).get("text_to_img")
-        if base_t2i is not None:
-            if head_agg == "max":
-                base_agg = base_t2i.max(axis=0)
-            elif head_agg == "mean":
-                base_agg = base_t2i.mean(axis=0)
-            else:
-                base_agg = base_t2i[int(head_agg)]
-            base_hmap = _attn_to_hmap(base_agg[tok_idx], camera)
-
-    for row_i, res in enumerate(results):
-        t2i = res["slice_dict"].get("prefix", {}).get(f"layer_{layer}", {}).get("text_to_img")
-        cam_img = res["slice_dict"].get("images", {}).get(camera)
-        if cam_img is None:
-            cam_img = np.full((224, 224, 3), 30, dtype=np.uint8)
-
-        label = res["prompt"][:28] + ("…" if len(res["prompt"]) > 28 else "")
-        is_base = row_i == baseline_idx
-
-        # Col 0+1: attention overlay (spans 2 sub-cols)
-        ax0 = fig.add_subplot(gs[row_i, 0:2])
-        ax0.set_xticks([]); ax0.set_yticks([])
-        for sp in ax0.spines.values():
-            sp.set_edgecolor("#00bfff" if is_base else "#444")
+    if n == 1:
+        axes = [axes]
+    for ax, (label, img, is_base) in zip(axes, items):
+        ax.imshow(img, aspect="equal")
+        ax.set_xticks([]); ax.set_yticks([])
+        for sp in ax.spines.values():
+            sp.set_edgecolor("#00bfff" if is_base else "#333")
             sp.set_linewidth(2 if is_base else 0.5)
-
-        if t2i is not None:
-            if head_agg == "max":
-                agg = t2i.max(axis=0)
-            elif head_agg == "mean":
-                agg = t2i.mean(axis=0)
-            else:
-                agg = t2i[int(head_agg)]
-            hmap = _attn_to_hmap(agg[tok_idx], camera)
-            cell_img = _overlay(cam_img, hmap)
-            ax0.imshow(cell_img, aspect="auto")
-        else:
-            ax0.set_facecolor("#1a1a2e")
-            ax0.text(0.5, 0.5, "N/A", ha="center", va="center",
-                     transform=ax0.transAxes, color="gray", fontsize=8)
-
-        ax0.set_ylabel(
-            ("★ " if is_base else "") + label,
-            color="#00bfff" if is_base else "white",
-            fontsize=7, rotation=0, labelpad=4, va="center", ha="right",
-        )
-
-        # Col 2+3: difference map
-        if show_diff:
-            ax1 = fig.add_subplot(gs[row_i, 2:4])
-            ax1.set_xticks([]); ax1.set_yticks([])
-            for sp in ax1.spines.values():
-                sp.set_visible(False)
-
-            if is_base or base_hmap is None or t2i is None:
-                ax1.set_facecolor("#1a1a2e")
-                ax1.text(0.5, 0.5, "baseline" if is_base else "N/A",
-                         ha="center", va="center", transform=ax1.transAxes,
-                         color="#555", fontsize=8)
-            else:
-                diff = hmap - base_hmap
-                diff_img = _diff_overlay(cam_img, diff)
-                ax1.imshow(diff_img, aspect="auto")
-
-            if row_i == 0:
-                ax0.set_title("Attention", color="white", fontsize=8, pad=3)
-                ax1.set_title("Δ vs baseline", color="white", fontsize=8, pad=3)
-
+        short = ("★ " if is_base else "") + label[:26] + ("…" if len(label) > 26 else "")
+        ax.set_title(short, color="#00bfff" if is_base else "white", fontsize=7, pad=3)
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
     buf.seek(0)
     return buf.read()
+
+
+def _build_delta_png(
+    ext_deltas: list[tuple[str, np.ndarray]],    # (label, diff_img_224) per non-baseline prompt
+    wrist_deltas: list[tuple[str, np.ndarray]],
+) -> bytes:
+    """Render 2-row delta figure: row 0 = exterior Δ, row 1 = wrist Δ."""
+    n = len(ext_deltas)
+    if n == 0:
+        return b""
+    cell_w, cell_h = 2.6, 3.0
+    fig, axes = plt.subplots(2, n, figsize=(n * cell_w, 2 * cell_h), dpi=100)
+    fig.patch.set_facecolor("#0e1117")
+    if n == 1:
+        axes = axes.reshape(2, 1)
+    row_labels = ["Ext Δ", "Wrist Δ"]
+    for row, (deltas, rl) in enumerate(zip([ext_deltas, wrist_deltas], row_labels)):
+        for col, (label, img) in enumerate(deltas):
+            ax = axes[row, col]
+            ax.imshow(img, aspect="equal")
+            ax.set_xticks([]); ax.set_yticks([])
+            for sp in ax.spines.values():
+                sp.set_visible(False)
+            if row == 0:
+                short = label[:26] + ("…" if len(label) > 26 else "")
+                ax.set_title(short, color="white", fontsize=7, pad=3)
+            if col == 0:
+                ax.set_ylabel(rl, color="#aaa", fontsize=8, rotation=0, labelpad=32, va="center")
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+def _build_cf_panels(
+    results: list[dict],
+    baseline_idx: int,
+    layer: int,
+    agg_fn,
+    tok_idx: int,
+    attn_mode: str,
+) -> tuple[bytes, bytes, bytes]:
+    """Returns (ext_png, wrist_png, delta_png) — three separate section images."""
+    _ph = np.full((_IMG_SIZE, _IMG_SIZE, 3), 30, dtype=np.uint8)
+
+    def get_vec(t2i):
+        return _resolve_attn_vec(t2i, agg_fn, attn_mode, tok_idx)
+
+    # Baseline hmaps for delta
+    base_t2i = results[baseline_idx]["slice_dict"].get("prefix", {}).get(f"layer_{layer}", {}).get("text_to_img")
+    base_ext_h = base_wrist_h = None
+    if base_t2i is not None:
+        vec = get_vec(base_t2i)
+        base_ext_h = _attn_to_hmap(vec, "exterior")
+        base_wrist_h = _attn_to_hmap(vec, "wrist")
+
+    ext_items: list[tuple[str, np.ndarray, bool]] = []
+    wrist_items: list[tuple[str, np.ndarray, bool]] = []
+    ext_deltas: list[tuple[str, np.ndarray]] = []
+    wrist_deltas: list[tuple[str, np.ndarray]] = []
+
+    for i, res in enumerate(results):
+        t2i = res["slice_dict"].get("prefix", {}).get(f"layer_{layer}", {}).get("text_to_img")
+        ext_img_raw = res["slice_dict"].get("images", {}).get("exterior")
+        ext_img = _ph if ext_img_raw is None else ext_img_raw
+        wrist_img_raw = res["slice_dict"].get("images", {}).get("wrist")
+        wrist_img = _ph if wrist_img_raw is None else wrist_img_raw
+        label = res["prompt"]
+        is_base = i == baseline_idx
+
+        if t2i is not None:
+            vec = get_vec(t2i)
+            ext_h = _attn_to_hmap(vec, "exterior")
+            wrist_h = _attn_to_hmap(vec, "wrist")
+            ext_items.append((label, _overlay(ext_img, ext_h), is_base))
+            wrist_items.append((label, _overlay(wrist_img, wrist_h), is_base))
+            if not is_base and base_ext_h is not None:
+                ext_deltas.append((label, _diff_overlay(ext_img, ext_h - base_ext_h)))
+                wrist_deltas.append((label, _diff_overlay(wrist_img, wrist_h - base_wrist_h)))
+        else:
+            ext_items.append((label, _ph, is_base))
+            wrist_items.append((label, _ph, is_base))
+
+    return (
+        _build_row_png(ext_items),
+        _build_row_png(wrist_items),
+        _build_delta_png(ext_deltas, wrist_deltas),
+    )
 
 
 # ── Main render ───────────────────────────────────────────────────────────────
@@ -390,7 +439,8 @@ def render(
 
     # ── Step 3: Inference settings ────────────────────────────────────────────
     with st.expander("③ Inference settings"):
-        checkpoint_id = st.selectbox("Checkpoint", checkpoints or ["0"], key="cf_ckpt")
+        checkpoint_id = "pi05_droid_pytorch"
+        st.info(f"Checkpoint: `{checkpoint_id}`")
         episode_id = st.text_input(
             "Episode ID (folder name)",
             value=f"{dataset_name}_f{frame_idx}",
@@ -458,45 +508,98 @@ def render(
         st.warning("No attention data found in results.")
         return
 
-    # Get n_real_tokens from first result
+    # Get token metadata from first result
     meta0 = results[0]["slice_dict"].get("meta", {})
     n_real = meta0.get("n_real_tokens", len(meta0.get("token_texts", [])) or 50)
     real_texts = meta0.get("token_texts", [])[:n_real]
 
-    ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([2, 2, 2, 2])
+    # ── Row 1: layer / attn-mode ──────────────────────────────────────────────
+    ctrl1, ctrl2 = st.columns([2, 2])
     with ctrl1:
         layer = st.select_slider("Layer", options=avail_layers,
                                  value=avail_layers[min(2, len(avail_layers)-1)],
                                  key="cf_vis_layer")
     with ctrl2:
-        head_opts = ["max", "mean"] + list(range(8))
-        head_labels = ["Max", "Mean"] + [f"H{i}" for i in range(8)]
-        hl = st.radio("Head", head_labels, index=0, horizontal=True, key="cf_vis_head")
-        head_sel = head_opts[head_labels.index(hl)]
-    with ctrl3:
-        camera = st.radio("Camera", ["Exterior", "Wrist"], horizontal=True, key="cf_vis_cam")
-        cam_key = "exterior" if camera == "Exterior" else "wrist"
-    with ctrl4:
-        show_diff = st.checkbox("Show Δ diff column", value=True, key="cf_show_diff")
-
-    # Token selector
-    if real_texts:
-        tok_idx = st.slider("Token", 0, n_real - 1, min(3, n_real-1), key="cf_tok")
-        tok_label = real_texts[tok_idx].replace("▁", " ").strip() or f"[{tok_idx}]"
-        st.caption(f"Token: **{tok_label}** (idx {tok_idx})")
-    else:
-        tok_idx = 0
-        tok_label = "?"
-
-    # Render grid
-    with st.spinner("Rendering…"):
-        png = _build_cf_grid(
-            results, baseline_idx=0,
-            layer=layer, head_agg=head_sel, camera=cam_key,
-            tok_idx=tok_idx, show_diff=show_diff,
+        attn_mode_label = st.radio(
+            "Attention mode",
+            ["Per token", "Whole text→image"],
+            horizontal=True,
+            key="cf_attn_mode",
         )
-    st.image(png, caption=f"CF comparison — token '{tok_label}' — layer {layer} — {camera}",
-             use_container_width=True)
+        attn_mode = "token" if attn_mode_label == "Per token" else "whole"
+
+    # ── Row 2: head aggregation ────────────────────────────────────────────────
+    # Exclude "All heads" — CF comparison needs a single map per row
+    agg_opts = [a for a in _ALL_AGG_NAMES if a != "All heads"]
+    agg = st.radio("Head aggregation", agg_opts, index=0, horizontal=True, key="cf_vis_agg")
+    topk_k = count_pct = None
+    if agg == "Top-K Focused":
+        topk_k = st.slider("K (focused heads)", 1, 8, 4, key="cf_topk")
+    elif agg == "Count Above Threshold":
+        count_pct = st.slider("Top % threshold", 1, 50, 10, key="cf_pct")
+    st.caption(_AGG_DESCRIPTIONS[agg])
+
+    # Resolve agg_fn
+    if agg in _SIMPLE_AGGS:
+        agg_fn = _SIMPLE_AGGS[agg]  # may be None → _resolve_attn_vec falls back to mean
+    elif agg == "Top-K Focused":
+        agg_fn = _make_topk_fn(topk_k)
+    else:
+        agg_fn = _make_count_fn(count_pct)
+
+    # ── Token selector (per-token mode only) ──────────────────────────────────
+    tok_idx = 0
+    tok_label = "all tokens"
+    if attn_mode == "token":
+        if real_texts:
+            raw_labels = [t.replace("▁", " ").strip() or f"[{i}]" for i, t in enumerate(real_texts)]
+            seen: dict[str, int] = {}
+            token_labels: list[str] = []
+            for i, lbl in enumerate(raw_labels):
+                if raw_labels.count(lbl) > 1:
+                    seen[lbl] = seen.get(lbl, 0) + 1
+                    token_labels.append(f"{lbl}#{seen[lbl]}")
+                else:
+                    token_labels.append(lbl)
+
+            default_tok = token_labels[min(3, n_real - 1)]
+            has_dupes = any(raw_labels.count(r) > 1 for r in raw_labels)
+            pill_label = (
+                "Click a token to visualize its attention: (duplicate tokens are suffixed #1, #2, …)"
+                if has_dupes
+                else "Click a token to visualize its attention:"
+            )
+            selected_label = st.pills(
+                pill_label, options=token_labels, default=default_tok,
+                selection_mode="single", key="cf_tok_pill",
+            )
+            if selected_label is None:
+                st.info("Click a token above to visualize its attention.")
+                return
+            tok_idx = token_labels.index(selected_label)
+            tok_label = selected_label
+        else:
+            st.warning("No token texts available.")
+            return
+
+    # ── Render three subsections ──────────────────────────────────────────────
+    caption_suffix = f"layer {layer} — {attn_mode_label} '{tok_label}' — {agg}"
+    with st.spinner("Rendering…"):
+        ext_png, wrist_png, delta_png = _build_cf_panels(
+            results, baseline_idx=0,
+            layer=layer, agg_fn=agg_fn,
+            tok_idx=tok_idx, attn_mode=attn_mode,
+        )
+
+    st.markdown("#### Exterior Camera")
+    st.image(ext_png, caption=f"Exterior — {caption_suffix}", use_container_width=True)
+
+    st.markdown("#### Wrist Camera")
+    st.image(wrist_png, caption=f"Wrist — {caption_suffix}", use_container_width=True)
+
+    if delta_png:
+        st.markdown("#### Δ vs Baseline")
+        st.image(delta_png, caption=f"Δ (red=more, blue=less) — {caption_suffix}", use_container_width=True)
 
     # Saved slugs reference
     if save_to_disk:

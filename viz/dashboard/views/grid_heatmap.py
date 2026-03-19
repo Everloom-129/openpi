@@ -45,12 +45,50 @@ def _overlay(img: np.ndarray, hmap: np.ndarray, alpha: float = 0.45) -> np.ndarr
     return blended
 
 
-_AGG_FNS = {
+_SIMPLE_AGGS = {
     "All heads": None,
     "Average":   lambda x: x.mean(axis=0),
+    "Median":    lambda x: np.median(x, axis=0),
     "Max":       lambda x: x.max(axis=0),
     "Min":       lambda x: x.min(axis=0),
+    "Max - Min": lambda x: x.max(axis=0) - x.min(axis=0),
+    "Std Dev":   lambda x: x.std(axis=0),
+    "Entropy":   lambda x: -np.sum(
+                     (x / (x.sum(axis=0, keepdims=True) + 1e-10))
+                     * np.log(x / (x.sum(axis=0, keepdims=True) + 1e-10) + 1e-10),
+                     axis=0),
 }
+_PARAM_AGGS = ["Top-K Focused", "Count Above Threshold"]
+_ALL_AGG_NAMES = list(_SIMPLE_AGGS.keys()) + _PARAM_AGGS
+
+_AGG_DESCRIPTIONS = {
+    "All heads":             "Shows each head's attention map independently as a grid of 8 columns.",
+    "Average":               "Mean attention across all 8 heads. Good general-purpose summary.",
+    "Median":                "Median attention across heads. More robust than average — ignores outlier heads that fire on everything.",
+    "Max":                   "Maximum attention value across heads per patch. Highlights any patch that at least one head attends to strongly.",
+    "Min":                   "Minimum attention across heads. Shows only patches that all heads agree on attending to.",
+    "Max - Min":             "Range (max − min) across heads per patch. High values reveal patches where heads strongly disagree — useful for spotting head specialization.",
+    "Std Dev":               "Standard deviation across heads per patch. High = heads diverge in attention; low = heads are in consensus.",
+    "Entropy":               "Per-patch entropy of attention values across heads (normalized). High entropy = heads attend here roughly equally; low entropy = one head dominates this patch.",
+    "Top-K Focused":         "Average of the K least-entropic (most spatially focused) heads only. Filters out diffuse heads to reduce noise.",
+    "Count Above Threshold": "Number of heads (out of 8) that rank a patch in their top N% of attention. Intuitive '5/8 heads agree here' reading.",
+}
+
+
+def _make_topk_fn(k: int):
+    def fn(x):  # x: (8, 512) or (8, n_text, 512)
+        x_flat = x.reshape(x.shape[0], -1)  # (8, *)
+        ent = -np.sum(x_flat * np.log(x_flat + 1e-10), axis=-1)  # (8,)
+        idx = np.argsort(ent)[:k]
+        return x[idx].mean(axis=0)
+    return fn
+
+
+def _make_count_fn(pct: int):
+    def fn(x):  # x: (8, 512)
+        thresh = np.percentile(x, 100 - pct, axis=-1, keepdims=True)
+        return (x >= thresh).sum(axis=0).astype(np.float32)
+    return fn
 
 
 def _build_grid(
@@ -59,10 +97,10 @@ def _build_grid(
     camera_img: np.ndarray,                 # (H, W, 3) uint8
     camera: str,
     layers: list[int],
-    agg: str = "All heads",
+    agg_fn=None,
+    agg_label: str = "All heads",
 ) -> plt.Figure:
-    """Render rows=layers × cols=heads (or single aggregated col) matplotlib figure."""
-    agg_fn = _AGG_FNS[agg]
+    """Render rows=layers × cols=heads (or aggregated grid) matplotlib figure."""
     cell_size = 1.4  # inches per cell
 
     if agg_fn is not None:
@@ -184,11 +222,16 @@ def render(data: dict, available_layers: list[int]) -> None:
         camera_img = ext_img if camera_key == "exterior" else wrist_img
         agg = st.radio(
             "Head aggregation",
-            list(_AGG_FNS.keys()),
+            _ALL_AGG_NAMES,
             index=0,
             horizontal=True,
             key="gh_agg",
         )
+        if agg == "Top-K Focused":
+            topk_k = st.slider("K (focused heads)", 1, 8, 4, key="gh_topk")
+        elif agg == "Count Above Threshold":
+            count_pct = st.slider("Top % threshold", 1, 50, 10, key="gh_pct")
+        st.caption(_AGG_DESCRIPTIONS[agg])
 
     with ctrl_col2:
         default_layers = [l for l in DEFAULT_LAYERS if l in available_layers]
@@ -247,12 +290,24 @@ def render(data: dict, available_layers: list[int]) -> None:
         if arr is not None:
             t2i_by_layer[layer] = arr
 
+    # ── Resolve aggregation function ──────────────────────────────────────────
+    if agg in _SIMPLE_AGGS:
+        agg_fn = _SIMPLE_AGGS[agg]
+        agg_label = agg
+    elif agg == "Top-K Focused":
+        agg_fn = _make_topk_fn(topk_k)
+        agg_label = f"Top-{topk_k} Focused"
+    else:  # Count Above Threshold
+        agg_fn = _make_count_fn(count_pct)
+        agg_label = f"Count ≥ Top {count_pct}%"
+
     # ── Build and display grid ────────────────────────────────────────────────
     with st.spinner("Rendering grid…"):
-        fig = _build_grid(t2i_by_layer, tok_idx, camera_img, camera_key, selected_layers, agg)
+        fig = _build_grid(t2i_by_layer, tok_idx, camera_img, camera_key, selected_layers,
+                          agg_fn=agg_fn, agg_label=agg_label)
         img_bytes = _fig_to_bytes(fig)
 
-    st.image(img_bytes, caption=f'Layer × Head grid — token "{selected_label}" — {camera} — {agg}',
+    st.image(img_bytes, caption=f'Layer × Head grid — token "{selected_label}" — {camera} — {agg_label}',
              use_container_width=True)
 
     # ── Per-layer entropy row ─────────────────────────────────────────────────

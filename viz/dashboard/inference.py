@@ -25,7 +25,7 @@ def load_model(checkpoint_dir: str, device: str = "cuda:0"):
     from openpi.training import config as _config
     from openpi.policies import policy_config as _policy_config
 
-    config = _config.get_config("pi05_droid")
+    config = _config.get_config("pi05_droid") # must be this, not pi05_droid_pytorch
     policy = _policy_config.create_trained_policy(config, checkpoint_dir, pytorch_device=device)
     return policy
 
