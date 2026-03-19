@@ -1,4 +1,8 @@
-# openpi
+# openpi-attention-visualization
+
+> Fork by @JieWang, research project at GRASP Lab, please do not redistribute without permission. 
+
+> For attention visualization, please fetch ckpt by running `bash scripts/get_pi05_droid_torch.sh`
 
 openpi holds open-source models and packages for robotics, published by the [Physical Intelligence team](https://www.physicalintelligence.company/).
 
@@ -57,6 +61,8 @@ NOTE: `GIT_LFS_SKIP_SMUDGE=1` is needed to pull LeRobot as a dependency.
 
 
 ## Model Checkpoints
+
+
 
 ### Base Models
 We provide multiple base VLA model checkpoints. These checkpoints have been pre-trained on 10k+ hours of robot data, and can be used for fine-tuning.
