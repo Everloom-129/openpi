@@ -1,12 +1,12 @@
 #!/bin/bash
 set -e
 
-CAMERA="right"
-DATA_ROOT="/data3/tonyw/toy_cube_benchmark/cube_gold"
-RESULTS_ROOT="/data3/tonyw/toy_cube_benchmark/pi05_vis/cube_gold/${CAMERA}"
+CAMERA="left"
+DATA_ROOT="/mnt/sda/edward/projects/toy_cube_benchmark/all"
+RESULTS_ROOT="/mnt/sda/edward/projects/pi05_vis/all/${CAMERA}"
 
 # Producer-consumer knobs
-IO_WORKERS=2
+IO_WORKERS=6
 MAX_INFLIGHT_LOADS=32
 
 echo "=========================================="

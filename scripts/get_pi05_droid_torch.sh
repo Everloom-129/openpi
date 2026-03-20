@@ -15,4 +15,6 @@ uv run examples/convert_jax_model_to_pytorch.py \
     --checkpoint_dir ~/.cache/openpi/openpi-assets/checkpoints/pi05_droid \
     --config_name pi05_droid \
     --output_path ./checkpoints/viz/pi05_droid_pytorch
+cp -r ~/.cache/openpi/openpi-assets/checkpoints/pi05_droid/assets \
+    ./checkpoints/viz/pi05_droid_pytorch/assets
 echo "Done: ./checkpoints/viz/pi05_droid_pytorch"

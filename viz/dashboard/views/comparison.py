@@ -152,6 +152,10 @@ def render(
 ) -> None:
     """Render Tab 4: Comparison view."""
 
+    if not checkpoints:
+        st.info("No checkpoints found in the attention HDF5 directory.")
+        return
+
     mode = st.radio(
         "Comparison mode",
         ["Checkpoint A vs B", "Episode A vs B", "Frame A vs B"],
@@ -159,7 +163,7 @@ def render(
         key="cmp_mode",
     )
 
-    episodes = _loader.list_episodes(default_checkpoint, attn_h5_root)
+    episodes = _loader.list_episodes(default_checkpoint or checkpoints[0], attn_h5_root)
     default_episode = episodes[0] if episodes else "episode_0"
     frames = _loader.list_frames(default_checkpoint, default_episode, attn_h5_root)
     default_frame = frames[0] if frames else 0

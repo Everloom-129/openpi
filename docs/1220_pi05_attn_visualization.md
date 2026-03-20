@@ -1,6 +1,9 @@
 # Pi0.5 PaliGemma Attention Visualization 实践记录
 2024-12-20
 
+
+> For CLAUDE: the info here is outdated, please do not use it
+
 ## 1. 目标
 对 Pi0.5 (Droid) 模型中的 VLM Backbone (PaliGemma) 进行注意力机制可视化，以理解：
 1. **Prefix Phase**: 模型在处理图像和文本 Prompt 时，文本 Token 关注图像的哪些区域。

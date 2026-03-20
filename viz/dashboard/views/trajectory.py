@@ -30,9 +30,10 @@ from viz.dashboard.views.grid_heatmap import (
     _overlay,
 )
 
-DEFAULT_LAYERS = [1, 4, 5, 10]
+DEFAULT_LAYERS = [1, 4, 5, 7, 10]
 THUMB_SIZE = 72   # px for thumbnail strip
 MAX_FRAMES_WARN = 16  # warn if more frames selected
+CHUNK_SIZE = 8   # frames per row in thumbnail strip and trajectory figures
 
 
 # ── Figure builder ─────────────────────────────────────────────────────────────
@@ -135,7 +136,7 @@ def render(
 
         # Exclude "All heads" — trajectory needs a single map per cell
         agg_names = [n for n in _ALL_AGG_NAMES if n != "All heads"]
-        agg = st.selectbox("Head aggregation", agg_names, index=1, key="traj_agg")  # default: Average
+        agg = st.selectbox("Head aggregation", agg_names, index=agg_names.index("Max"), key="traj_agg")
         if agg == "Top-K Focused":
             topk_k = st.slider("K heads", 1, 8, 4, key="traj_topk")
         elif agg == "Count Above Threshold":
@@ -161,28 +162,26 @@ def render(
     # ── Frame selection ───────────────────────────────────────────────────────
     default_sel = available_frames[::stride] or available_frames[:1]
 
-    # Quick-select buttons write to a staging key, then the multiselect reads it.
+    # Quick-select buttons write directly to the multiselect's session state key.
+    # This is the only reliable way to programmatically update a multiselect in Streamlit,
+    # since `default` is ignored once the widget key already exists in session state.
+    ms_key = f"traj_frames_{stride}"
     btn_c1, btn_c2, btn_c3, _ = st.columns([1, 1, 2, 8])
     with btn_c1:
         if st.button("All", key="traj_btn_all"):
-            st.session_state["_traj_frames_stage"] = available_frames
+            st.session_state[ms_key] = available_frames
     with btn_c2:
         if st.button("None", key="traj_btn_none"):
-            st.session_state["_traj_frames_stage"] = []
+            st.session_state[ms_key] = []
     with btn_c3:
         if st.button(f"Every {stride}", key="traj_btn_stride"):
-            st.session_state["_traj_frames_stage"] = available_frames[::stride]
-
-    # Compute default: use staged value if present, else stride-based default.
-    # Use a key suffix that changes with stride so the widget resets on stride change.
-    staged = st.session_state.pop("_traj_frames_stage", None)
-    ms_default = staged if staged is not None else default_sel
+            st.session_state[ms_key] = available_frames[::stride]
 
     selected_frames: list[int] = st.multiselect(
         "Select frames to compare:",
         options=available_frames,
-        default=ms_default,
-        key=f"traj_frames_{stride}",
+        default=default_sel,
+        key=ms_key,
     )
 
     if not selected_frames:
@@ -231,18 +230,19 @@ def render(
 
     # ── Frame thumbnail strip ─────────────────────────────────────────────────
     with st.expander("Frame thumbnails", expanded=True):
-        n_thumb_cols = min(len(selected_frames), 12)
-        thumb_cols = st.columns(n_thumb_cols)
-        for i, frame in enumerate(selected_frames):
-            path = _rl.h5_path_results(root, outcome, date, episode, frame)
-            imgs = load_images(path)
-            thumb = imgs.get(camera_key)
-            if thumb is not None:
-                thumb_small = cv2.resize(thumb, (THUMB_SIZE, THUMB_SIZE))
-            else:
-                thumb_small = np.full((THUMB_SIZE, THUMB_SIZE, 3), 40, dtype=np.uint8)
-            with thumb_cols[i % n_thumb_cols]:
-                st.image(thumb_small, caption=f"F{frame}", use_container_width=True)
+        for chunk_start in range(0, len(selected_frames), CHUNK_SIZE):
+            chunk = selected_frames[chunk_start : chunk_start + CHUNK_SIZE]
+            thumb_cols = st.columns(len(chunk))
+            for i, frame in enumerate(chunk):
+                path = _rl.h5_path_results(root, outcome, date, episode, frame)
+                imgs = load_images(path)
+                thumb = imgs.get(camera_key)
+                if thumb is not None:
+                    thumb_small = cv2.resize(thumb, (THUMB_SIZE, THUMB_SIZE))
+                else:
+                    thumb_small = np.full((THUMB_SIZE, THUMB_SIZE, 3), 40, dtype=np.uint8)
+                with thumb_cols[i]:
+                    st.image(thumb_small, caption=f"F{frame}", use_container_width=True)
 
     # ── Resolve aggregation function ──────────────────────────────────────────
     if agg in _SIMPLE_AGGS:
@@ -266,22 +266,19 @@ def render(
 
     # ── Main trajectory figure ────────────────────────────────────────────────
     with st.spinner("Rendering trajectory grid…"):
-        fig = _build_trajectory_figure(
-            frames=selected_frames,
-            layers=selected_layers,
-            t2i_data=t2i_data,
-            imgs=imgs_by_frame,
-            tok_idx=tok_idx,
-            camera=camera_key,
-            agg_fn=agg_fn,
-        )
-        img_bytes = _fig_to_bytes(fig)
-
-    st.image(
-        img_bytes,
-        caption=f'Trajectory — "{selected_label}" — {camera} — {agg}',
-        use_container_width=True,
-    )
+        for chunk_idx, chunk_start in enumerate(range(0, len(selected_frames), CHUNK_SIZE)):
+            chunk = selected_frames[chunk_start : chunk_start + CHUNK_SIZE]
+            fig = _build_trajectory_figure(
+                frames=chunk,
+                layers=selected_layers,
+                t2i_data=t2i_data,
+                imgs=imgs_by_frame,
+                tok_idx=tok_idx,
+                camera=camera_key,
+                agg_fn=agg_fn,
+            )
+            caption = f'Trajectory — "{selected_label}" — {camera} — {agg}' if chunk_idx == 0 else None
+            st.image(_fig_to_bytes(fig), caption=caption, use_container_width=True)
 
     # ── Counterfactual section ────────────────────────────────────────────────
     if not cf_slugs:
@@ -320,17 +317,19 @@ def render(
                     cf_imgs[frame] = imgs_by_frame.get(frame)
                     cf_t2i[(frame, cf_layer)] = None
 
-            fig_cf = _build_trajectory_figure(
-                frames=selected_frames,
-                layers=[cf_layer],
-                t2i_data=cf_t2i,
-                imgs=cf_imgs,
-                tok_idx=tok_idx,
-                camera=camera_key,
-                agg_fn=agg_fn,
-                row_label_prefix=slug,
-            )
-            st.image(_fig_to_bytes(fig_cf), use_container_width=True)
+            for chunk_start in range(0, len(selected_frames), CHUNK_SIZE):
+                chunk = selected_frames[chunk_start : chunk_start + CHUNK_SIZE]
+                fig_cf = _build_trajectory_figure(
+                    frames=chunk,
+                    layers=[cf_layer],
+                    t2i_data=cf_t2i,
+                    imgs=cf_imgs,
+                    tok_idx=tok_idx,
+                    camera=camera_key,
+                    agg_fn=agg_fn,
+                    row_label_prefix=slug,
+                )
+                st.image(_fig_to_bytes(fig_cf), use_container_width=True)
 
         # Δ (main − first slug) heatmap
         st.markdown(f"**Δ main − `{cf_slugs[0]}`**")
@@ -352,14 +351,17 @@ def render(
             default=tok_idx,
         ))
 
-        fig_delta = _build_trajectory_figure(
-            frames=selected_frames,
-            layers=[cf_layer],
-            t2i_data=delta_t2i,
-            imgs=imgs_by_frame,
-            tok_idx=delta_tok,
-            camera=camera_key,
-            agg_fn=agg_fn,
-            row_label_prefix="Δ",
-        )
-        st.image(_fig_to_bytes(fig_delta), caption="Red = more attention in main, Blue = less", use_container_width=True)
+        for chunk_idx, chunk_start in enumerate(range(0, len(selected_frames), CHUNK_SIZE)):
+            chunk = selected_frames[chunk_start : chunk_start + CHUNK_SIZE]
+            fig_delta = _build_trajectory_figure(
+                frames=chunk,
+                layers=[cf_layer],
+                t2i_data=delta_t2i,
+                imgs=imgs_by_frame,
+                tok_idx=delta_tok,
+                camera=camera_key,
+                agg_fn=agg_fn,
+                row_label_prefix="Δ",
+            )
+            caption = "Red = more attention in main, Blue = less" if chunk_idx == 0 else None
+            st.image(_fig_to_bytes(fig_delta), caption=caption, use_container_width=True)
