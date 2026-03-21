@@ -17,6 +17,11 @@ Produces the schema expected by viz/dashboard/loader.py:
         layer_{i}/
             text_to_img float32[8, n_text, 512]   gzip-4   (every layer)
             full        float32[8, seq_len, seq_len] gzip-4  (every layer)
+    /gt_action          float32[8, action_dim]   gzip-4
+        rows = OPEN_LOOP_HORIZON action steps (NaN-padded at end of episode)
+        cols = [joint_velocity×7, gripper_position×1]  (action_dim=8)
+    /pred_action        float32[8, action_dim]   gzip-4
+        Pi0.5 predicted actions for the same horizon (DroidOutputs[:, :8])
 
 Primary entry point (pipeline.py):
     from attn_h5_writer import write_attn_h5_from_buffer
@@ -87,6 +92,9 @@ def _write_h5_core(
     wrist_img: np.ndarray | None,
     instruction: str,
     frame_idx: int,
+    suffix_arrays: dict[int, np.ndarray] | None = None,
+    gt_action: np.ndarray | None = None,
+    pred_action: np.ndarray | None = None,
 ) -> bool:
     """Write a single HDF5 from an in-memory layer dict.
 
@@ -177,6 +185,46 @@ def _write_h5_core(
                 chunks=(1, min(64, max(1, n_text_actual)), TOTAL_IMAGE_TOKENS),
             )
 
+        # /gt_action  — ground-truth actions from trajectory.h5
+        # shape: (OPEN_LOOP_HORIZON, action_dim)  e.g. (8, 8) = [joint_vel×7, gripper×1]
+        # NaN-padded if the frame is within OPEN_LOOP_HORIZON of episode end.
+        if gt_action is not None:
+            f.create_dataset(
+                "gt_action",
+                data=gt_action.astype(np.float32),
+                compression="gzip",
+                compression_opts=4,
+            )
+
+        # /pred_action  — Pi0.5 predicted actions for this frame
+        if pred_action is not None:
+            f.create_dataset(
+                "pred_action",
+                data=np.asarray(pred_action, dtype=np.float32),
+                compression="gzip",
+                compression_opts=4,
+            )
+
+        # /suffix  — action-token → image attention (one slice per layer)
+        # suffix_arrays[layer] shape: (1, n_heads, 8_steps, prefix_seq+8) or (n_heads, 8_steps, k)
+        if suffix_arrays:
+            suffix_grp = f.create_group("suffix")
+            for layer_idx in sorted(suffix_arrays):
+                sa = suffix_arrays[layer_idx]
+                if sa.ndim == 4:
+                    sa = sa[0]                          # drop batch dim → (n_heads, 8, k)
+                sa = sa.astype(np.float32)
+                # Columns 0:TOTAL_IMAGE_TOKENS are image-patch positions (ext 0:256, wrist 256:512)
+                a2i = sa[:, :, :TOTAL_IMAGE_TOKENS]     # (n_heads, 8_steps, 512)
+                sg = suffix_grp.create_group(f"layer_{layer_idx}")
+                sg.create_dataset(
+                    "action_to_img",
+                    data=a2i,
+                    compression="gzip",
+                    compression_opts=4,
+                    chunks=(1, 8, TOTAL_IMAGE_TOKENS),
+                )
+
     return True
 
 
@@ -189,13 +237,25 @@ def write_attn_h5_from_buffer(
     wrist_img: np.ndarray | None = None,
     instruction: str = "",
     frame_idx: int = 0,
+    suffix_attn_buffer: dict[int, np.ndarray] | None = None,
+    gt_action: np.ndarray | None = None,
+    pred_action: np.ndarray | None = None,
 ) -> bool:
-    """Write HDF5 directly from an in-RAM attention buffer (primary API).
+    """Write HDF5 directly from in-RAM attention buffers (primary API).
 
-    *attn_buffer* is the dict returned by ``gemma_pytorch.get_attn_buffer()``.
+    *attn_buffer* is the dict returned by ``gemma_pytorch.get_attn_buffer()`` (prefix).
+    *suffix_attn_buffer* is the dict from ``gemma_pytorch.get_suffix_attn_buffer()``
+    (action-token attention); writes ``/suffix/layer_{i}/action_to_img``.
+    *gt_action* is a float32 array of shape (OPEN_LOOP_HORIZON, action_dim) loaded from
+    trajectory.h5; writes ``/gt_action``. Pass None to omit.
+    *pred_action* is the ``result["actions"]`` array from ``policy.infer()``; writes
+    ``/pred_action``. Pass None to omit.
     """
     return _write_h5_core(
-        attn_buffer, Path(h5_path), ext_img, wrist_img, instruction, frame_idx
+        attn_buffer, Path(h5_path), ext_img, wrist_img, instruction, frame_idx,
+        suffix_arrays=suffix_attn_buffer or {},
+        gt_action=gt_action,
+        pred_action=pred_action,
     )
 
 

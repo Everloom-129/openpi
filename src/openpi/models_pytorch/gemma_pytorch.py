@@ -12,36 +12,65 @@ from transformers.models.gemma import modeling_gemma
 
 # ── In-RAM attention capture ───────────────────────────────────────────────────
 # Usage (pipeline.py):
-#   _gpt.enable_attn_buffer()   # arm before policy.infer()
+#   _gpt.enable_attn_buffer()         # arm prefix capture
+#   _gpt.enable_suffix_attn_buffer()  # arm suffix capture
 #   result = policy.infer(example)
-#   buf = _gpt.get_attn_buffer()
-#   _gpt.clear_attn_buffer()    # always disarm (put in finally block)
-#   write_attn_h5_from_buffer(buf, ...)
+#   buf        = _gpt.get_attn_buffer()
+#   suffix_buf = _gpt.get_suffix_attn_buffer()
+#   _gpt.clear_attn_buffer()          # always in finally block
+#   _gpt.clear_suffix_attn_buffer()   # always in finally block
+#   write_attn_h5_from_buffer(buf, suffix_attn_buffer=suffix_buf, ...)
 #
-# NOTE: On the first call to enable_attn_buffer() a one-time notice is printed
-# so you know attention capture is active.
+# Prefix buffer: captures PaliGemma (prefix-only forward, Case 1).
+# Suffix buffer: captures gemma_expert action-token forward (Case 2).
+#   Shape per layer: (1, n_heads, 8_action_steps, prefix_seq_len+8)
+#   The first 512 columns are image-patch positions (ext 0:256, wrist 256:512).
+
 _ATTN_BUFFER: dict[int, np.ndarray] | None = None
 _ATTN_BUFFER_NOTIFIED: bool = False
 
+_SUFFIX_ATTN_BUFFER: dict[int, np.ndarray] | None = None
+_SUFFIX_ATTN_BUFFER_NOTIFIED: bool = False
+
 
 def enable_attn_buffer() -> None:
-    """Arm the in-RAM attention buffer. Call once before each policy.infer()."""
+    """Arm the in-RAM prefix attention buffer. Call once before each policy.infer()."""
     global _ATTN_BUFFER, _ATTN_BUFFER_NOTIFIED
     _ATTN_BUFFER = {}
     if not _ATTN_BUFFER_NOTIFIED:
-        print("[attn] Attention capture enabled — prefix attention will be held in RAM.")
+        print("[attn] Prefix attention capture enabled — prefix attention will be held in RAM.")
         _ATTN_BUFFER_NOTIFIED = True
 
 
 def get_attn_buffer() -> dict[int, np.ndarray] | None:
-    """Return the current buffer dict {layer_idx: ndarray} or None if not armed."""
+    """Return the prefix buffer dict {layer_idx: ndarray} or None if not armed."""
     return _ATTN_BUFFER
 
 
 def clear_attn_buffer() -> None:
-    """Disarm and discard the buffer. Call in a finally block after infer()."""
+    """Disarm and discard the prefix buffer. Call in a finally block after infer()."""
     global _ATTN_BUFFER
     _ATTN_BUFFER = None
+
+
+def enable_suffix_attn_buffer() -> None:
+    """Arm the in-RAM suffix (action-token) attention buffer."""
+    global _SUFFIX_ATTN_BUFFER, _SUFFIX_ATTN_BUFFER_NOTIFIED
+    _SUFFIX_ATTN_BUFFER = {}
+    if not _SUFFIX_ATTN_BUFFER_NOTIFIED:
+        print("[attn] Suffix attention capture enabled — action-token attention will be held in RAM.")
+        _SUFFIX_ATTN_BUFFER_NOTIFIED = True
+
+
+def get_suffix_attn_buffer() -> dict[int, np.ndarray] | None:
+    """Return the suffix buffer dict {layer_idx: ndarray} or None if not armed."""
+    return _SUFFIX_ATTN_BUFFER
+
+
+def clear_suffix_attn_buffer() -> None:
+    """Disarm and discard the suffix buffer. Call in a finally block after infer()."""
+    global _SUFFIX_ATTN_BUFFER
+    _SUFFIX_ATTN_BUFFER = None
 
 
 class PaliGemmaWithExpertModel(nn.Module):
@@ -166,15 +195,12 @@ class PaliGemmaWithExpertModel(nn.Module):
                 output_attentions=True,
             )
 
-            # # --- HACK: Save Attention ---
-            # if not self.training:
-            #     if suffix_output.attentions is not None:
-            #         os.makedirs("results/layers_suffix", exist_ok=True)
-            #         for i, layer_attn in enumerate(suffix_output.attentions):
-            #             save_path = f"results/layers_suffix/attn_map_layer_{i}.npy"
-            #             np.save(save_path, layer_attn.detach().cpu().to(torch.float32).numpy())
-            #         # print(f"Saved {len(suffix_output.attentions)} layers of Suffix Attention to results/layers_suffix/")
-            # # ----------------------------
+            # --- Capture suffix attention into RAM buffer ---
+            if not self.training and _SUFFIX_ATTN_BUFFER is not None:
+                if suffix_output.attentions is not None:
+                    for i, layer_attn in enumerate(suffix_output.attentions):
+                        _SUFFIX_ATTN_BUFFER[i] = layer_attn.detach().cpu().to(torch.float32).numpy()
+            # ------------------------------------------------
 
             suffix_output = suffix_output.last_hidden_state
             prefix_output = None
@@ -263,29 +289,6 @@ class PaliGemmaWithExpertModel(nn.Module):
                     scaling,
                 )
 
-                # --- HACK: Save Joint Attention (inference only) ---
-                if not self.training and attn_weights is not None:
-                    _prefix_len = inputs_embeds[0].shape[1]
-                    _save_dir = "results/layers_joint"
-                    os.makedirs(_save_dir, exist_ok=True)
-                    np.save(
-                        f"{_save_dir}/attn_map_layer_{layer_idx}.npy",
-                        attn_weights.detach().cpu().to(torch.float32).numpy(),
-                    )
-                    # Save prefix_len metadata once per forward pass
-                    if layer_idx == 0:
-                        np.save(f"{_save_dir}/prefix_len.npy", np.array([_prefix_len]))
-                    # Save pre-softmax logits for selected layers (limits disk usage)
-                    _SAVE_LOGIT_LAYERS = {1, 4, 5, 7, 10}
-                    if layer_idx in _SAVE_LOGIT_LAYERS:
-                        _module = self.paligemma.language_model.layers[layer_idx].self_attn
-                        _key_rep = modeling_gemma.repeat_kv(key_states, _module.num_key_value_groups)
-                        _attn_logits_raw = torch.matmul(query_states, _key_rep.transpose(2, 3)) * scaling
-                        np.save(
-                            f"{_save_dir}/attn_logits_layer_{layer_idx}.npy",
-                            _attn_logits_raw.detach().cpu().to(torch.float32).numpy(),
-                        )
-                # ------------------------------------------------
                 # Get head_dim from the current layer, not from the model
                 head_dim = self.paligemma.language_model.layers[layer_idx].self_attn.head_dim
                 att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)
@@ -358,8 +361,4 @@ class PaliGemmaWithExpertModel(nn.Module):
             suffix_output = outputs_embeds[1]
             prefix_past_key_values = None
 
-        # print("prefix_output", prefix_output)
-        # print("suffix_output", suffix_output) # None
-        # print("prefix_past_key_values", prefix_past_key_values)
-        # import pdb; pdb.set_trace()
         return [prefix_output, suffix_output], prefix_past_key_values

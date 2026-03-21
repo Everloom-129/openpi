@@ -33,8 +33,10 @@ def load_duck_example(camera: str = "left", index: int = 0):
     if not 0 <= index <= 90:
         raise ValueError("index must be between 0 and 90")
 
-    data_dir = "data/visualization/duck/frames"
-    traj_path = "data/visualization/duck/trajectory.h5"
+    _attn_map_dir = os.path.dirname(os.path.abspath(__file__))
+    _project_root = os.path.abspath(os.path.join(_attn_map_dir, ".."))
+    data_dir = os.path.join(_project_root, "data/example/duck/frames")
+    traj_path = os.path.join(_project_root, "data/example/duck/trajectory.h5")
 
     # Load images
     ext_path = os.path.join(data_dir, camera, f"{index:05d}.jpg")

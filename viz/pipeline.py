@@ -104,12 +104,28 @@ def load_example(data_dir: Path, index: int, camera: str = "right") -> dict:
             f["observation/robot_state/gripper_position"][index : index + 1].astype(np.float64)
         )
 
+        # GT actions for the next OPEN_LOOP_HORIZON steps: (8, action_dim) float32
+        gt_action: np.ndarray | None = None
+        if "action/joint_velocity" in f:
+            traj_len = f["action/joint_velocity"].shape[0]
+            end = min(index + OPEN_LOOP_HORIZON, traj_len)
+            n = end - index
+            jv = f["action/joint_velocity"][index:end].astype(np.float32)   # (n, 7)
+            gp = f["action/gripper_position"][index:end].astype(np.float32) # (n,) or (n,1)
+            if gp.ndim == 1:
+                gp = gp[:, None]
+            gt_action = np.concatenate([jv, gp], axis=1)                    # (n, 8)
+            if n < OPEN_LOOP_HORIZON:
+                pad = np.full((OPEN_LOOP_HORIZON - n, gt_action.shape[1]), np.nan, dtype=np.float32)
+                gt_action = np.concatenate([gt_action, pad], axis=0)        # (8, 8)
+
     return {
         "observation/exterior_image_1_left": ext_img,
         "observation/wrist_image_left": hand_img,
         "observation/joint_position": joint_position,
         "observation/gripper_position": gripper_position,
         "prompt": instruction,
+        "gt_action": gt_action,
     }
 
 
@@ -133,11 +149,14 @@ def infer_and_save(
     from openpi.models_pytorch import gemma_pytorch as _gpt
 
     _gpt.enable_attn_buffer()
+    _gpt.enable_suffix_attn_buffer()
     try:
         result = policy.infer(example)
-        buf = _gpt.get_attn_buffer()
+        buf        = _gpt.get_attn_buffer()
+        suffix_buf = _gpt.get_suffix_attn_buffer()
     finally:
         _gpt.clear_attn_buffer()
+        _gpt.clear_suffix_attn_buffer()
 
     write_attn_h5_from_buffer(
         attn_buffer=buf or {},
@@ -146,6 +165,9 @@ def infer_and_save(
         wrist_img=example["observation/wrist_image_left"],
         instruction=example["prompt"],
         frame_idx=frame_idx,
+        suffix_attn_buffer=suffix_buf or {},
+        gt_action=example.get("gt_action"),
+        pred_action=result.get("actions"),
     )
     return result
 
