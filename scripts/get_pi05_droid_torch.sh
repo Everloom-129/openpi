@@ -1,13 +1,9 @@
 #!/bin/bash
 set -e
 if [ ! -d ~/.cache/openpi/openpi-assets/checkpoints/pi05_droid ]; then
-    bash scripts/download_ckpt.sh
+    uv run python -c "from openpi.shared import download; download.maybe_download('gs://openpi-assets/checkpoints/pi05_droid')"
     echo "Downloaded ckpt to ~/.cache/openpi/openpi-assets/checkpoints/pi05_droid"
 fi
-# Install and patch transformers
-uv pip install transformers==4.53.2
-cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/
-echo "transformers patched"
 
 # Convert JAX checkpoint to PyTorch
 echo "Converting JAX model to PyTorch..."

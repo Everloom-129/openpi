@@ -431,7 +431,7 @@ def render(
 
     cat = _catalogue()
     if not cat:
-        st.error("No local datasets found in `data/visualization/`.")
+        st.error("No local datasets found in `data/example/`.")
         return
 
     # ── Step 1: Image source ──────────────────────────────────────────────────
@@ -441,12 +441,13 @@ def render(
 
         max_frame = dataset["n_frames"] - 1
         frame_idx = st.slider("Frame", 0, max_frame, 0, key="cf_frame")
+        cf_camera = st.radio("Ext camera", ["right", "left"], horizontal=True, key="cf_camera")
 
         col_ext, col_wrist = st.columns(2)
         try:
             from PIL import Image
-            ext_img, wrist_img, joint_pos, gripper_pos = _load_frame(dataset, frame_idx)
-            col_ext.image(ext_img, caption="Exterior", use_container_width=True)
+            ext_img, wrist_img, joint_pos, gripper_pos = _load_frame(dataset, frame_idx, camera=cf_camera)
+            col_ext.image(ext_img, caption=f"Exterior ({cf_camera})", use_container_width=True)
             col_wrist.image(wrist_img, caption="Wrist", use_container_width=True)
         except Exception as e:
             st.error(f"Failed to load frame: {e}")
@@ -497,7 +498,17 @@ def render(
             value=f"{dataset_name}_f{frame_idx}",
             key="cf_episode_id",
         )
-        gpu_device = st.selectbox("GPU", ["cuda:0", "cuda:1", "cpu"], key="cf_gpu")
+        def _cf_gpu_devices() -> list[str]:
+            try:
+                import pynvml
+                pynvml.nvmlInit()
+                n = pynvml.nvmlDeviceGetCount()
+                pynvml.nvmlShutdown()
+                return [f"cuda:{i}" for i in range(n)] + ["cpu"]
+            except Exception:
+                return ["cuda:0", "cpu"]
+
+        gpu_device = st.selectbox("GPU", _cf_gpu_devices(), key="cf_gpu")
         gpu_id = int(gpu_device.split(":")[-1]) if "cuda" in gpu_device else 0
         save_to_disk = st.checkbox("Save results to HDF5", value=True, key="cf_save")
 
