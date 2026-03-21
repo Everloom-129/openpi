@@ -72,25 +72,28 @@ with st.sidebar:
         st.caption(f"HDF5 root: `{ATTN_H5_ROOT}`")
 
     elif mode == "Results (Benchmark)":
-        outcomes = _rl.list_outcomes(RESULTS_ROOT)
+        res_camera = st.radio("Camera", ["right", "left"], horizontal=True, key="res_camera")
+        _res_root = os.path.join(RESULTS_ROOT, res_camera)
+
+        outcomes = _rl.list_outcomes(_res_root)
         if not outcomes:
-            st.error(f"No data found in `{RESULTS_ROOT}`.\n\nSet `RESULTS_ROOT` env var or run the pipeline first.")
+            st.error(f"No data found in `{_res_root}`.\n\nSet `RESULTS_ROOT` env var or run the pipeline first.")
             st.stop()
 
         res_outcome = st.selectbox("Outcome", outcomes, key="res_outcome")
 
-        res_dates = _rl.list_dates(RESULTS_ROOT, res_outcome)
+        res_dates = _rl.list_dates(_res_root, res_outcome)
         if not res_dates:
             st.error("No dates found.")
             st.stop()
         res_date = st.selectbox("Date", res_dates, key="res_date")
 
-        res_episodes = _rl.list_episodes(RESULTS_ROOT, res_outcome, res_date)
+        res_episodes = _rl.list_episodes(_res_root, res_outcome, res_date)
         if not res_episodes:
             st.error("No episodes found.")
             st.stop()
         ep_labels = [
-            f"{'✓ ' if _rl.is_complete(RESULTS_ROOT, res_outcome, res_date, ep) else '○ '}{ep}"
+            f"{'✓ ' if _rl.is_complete(_res_root, res_outcome, res_date, ep) else '○ '}{ep}"
             for ep in res_episodes
         ]
         res_ep_idx = st.selectbox(
@@ -99,16 +102,16 @@ with st.sidebar:
         )
         res_episode = res_episodes[res_ep_idx]
 
-        res_all_frames = _rl.list_frames(RESULTS_ROOT, res_outcome, res_date, res_episode)
+        res_all_frames = _rl.list_frames(_res_root, res_outcome, res_date, res_episode)
         if not res_all_frames:
             st.error("No frames found.")
             st.stop()
 
         res_frame = st.selectbox("Frame (single-frame tabs)", res_all_frames, key="res_frame")
-        res_cf_slugs = _rl.list_cf_slugs(RESULTS_ROOT, res_outcome, res_date, res_episode, res_all_frames[0])
+        res_cf_slugs = _rl.list_cf_slugs(_res_root, res_outcome, res_date, res_episode, res_all_frames[0])
 
         st.markdown("---")
-        st.caption(f"`{res_outcome}/{res_date}/{res_episode}`")
+        st.caption(f"Camera: **{res_camera}** · `{res_outcome}/{res_date}/{res_episode}`")
         if res_cf_slugs:
             st.caption(f"CF variants: {', '.join(f'`{s}`' for s in res_cf_slugs)}")
 
@@ -128,21 +131,45 @@ with st.sidebar:
         online_ckpt_path = os.path.join(CHECKPOINT_ROOT, online_ckpt)
 
         st.markdown("**Input**")
+        _EXAMPLE_DIR = os.path.join(_PROJECT_ROOT, "data/example")
+
+        # List all episode subdirectories under data/example/
+        _example_episodes = sorted(
+            d for d in os.listdir(_EXAMPLE_DIR)
+            if os.path.isdir(os.path.join(_EXAMPLE_DIR, d))
+        ) if os.path.isdir(_EXAMPLE_DIR) else []
+
+        online_episode = st.selectbox("Episode", _example_episodes or ["(none)"], key="online_episode")
+        online_camera = st.radio(
+            "Ext camera", ["right", "left"], horizontal=True, key="online_camera"
+        )
+
+        # Auto-detect episode structure and metadata
+        _ep_dir = os.path.join(_EXAMPLE_DIR, online_episode)
+        _has_recordings = os.path.isdir(os.path.join(_ep_dir, "recordings", "frames"))
+        _frames_root = os.path.join(_ep_dir, "recordings", "frames") if _has_recordings else os.path.join(_ep_dir, "frames")
+        _hand_dir = os.path.join(_frames_root, "hand_camera")
+        _n_frames = len([f for f in os.listdir(_hand_dir) if f.endswith(".jpg")]) if os.path.isdir(_hand_dir) else 1
+        _max_frame = max(0, _n_frames - 1)
+        _instr_path = os.path.join(_ep_dir, "instruction.txt")
+        _default_instr = open(_instr_path).read().strip() if os.path.exists(_instr_path) else ""
+
         instruction_text = st.text_input(
-            "Instruction",
-            value="place the duck toy into the pink bowl",
-            key="online_instruction",
+            "Instruction", value=_default_instr, key="online_instruction",
         )
+        online_frame = st.slider("Frame", 0, _max_frame, 0, key="online_frame")
 
-        dataset_choice = st.selectbox(
-            "Dataset", ["duck", "pineapple"], key="online_dataset"
-        )
-        max_frames = {"duck": 90, "pineapple": 90}
-        online_frame = st.slider(
-            "Frame", 0, max_frames.get(dataset_choice, 90), 0, key="online_frame"
-        )
+        def _available_gpu_devices() -> list[str]:
+            try:
+                import pynvml
+                pynvml.nvmlInit()
+                n = pynvml.nvmlDeviceGetCount()
+                pynvml.nvmlShutdown()
+                return ["Auto"] + [f"cuda:{i}" for i in range(n)] + ["cpu"]
+            except Exception:
+                return ["Auto", "cpu"]
 
-        gpu_device = st.selectbox("GPU device", ["cuda:0", "cuda:1", "cpu"], key="gpu_device")
+        gpu_device_sel = st.selectbox("GPU device", _available_gpu_devices(), key="gpu_device")
 
         run_btn = st.button("▶ Run Inference", type="primary")
 
@@ -150,20 +177,27 @@ with st.sidebar:
             with st.spinner("Loading model and running inference…"):
                 import sys as _sys
                 _sys.path.insert(0, os.path.join(_PROJECT_ROOT, "viz"))
-                if dataset_choice == "duck":
-                    from attn_map import load_duck_example
-                    example = load_duck_example(camera="left", index=online_frame)
-                    example["prompt"] = instruction_text
-                else:
-                    from attn_pipeline import load_toy_example
-                    from pathlib import Path as _Path
-                    example = load_toy_example(
-                        data_dir=_Path(os.path.join(_PROJECT_ROOT, "data/visualization/aawr_pineapple")),
+                from pathlib import Path as _Path
+                if _has_recordings:
+                    # DROID format: recordings/frames/{camera}/
+                    from pipeline import load_example as _load_example
+                    example = _load_example(
+                        data_dir=_Path(_ep_dir),
                         index=online_frame,
-                        camera="right",
+                        camera=online_camera,
                     )
-                    example["prompt"] = instruction_text
+                else:
+                    # Duck format: frames/{camera}/ directly
+                    from attn_map import load_duck_example
+                    example = load_duck_example(camera=online_camera, index=online_frame)
+                example["prompt"] = instruction_text
                 try:
+                    if gpu_device_sel == "Auto":
+                        from attn_map import select_best_gpu as _sbg
+                        _dev_id = _sbg()
+                        gpu_device = f"cuda:{_dev_id}" if isinstance(_dev_id, int) else str(_dev_id)
+                    else:
+                        gpu_device = gpu_device_sel
                     policy = _inf.load_model(online_ckpt_path, device=gpu_device)
                     slice_dict = _inf.run_inference(policy, example)
                     st.session_state["online_data"] = slice_dict
@@ -235,7 +269,7 @@ if mode == "Offline (HDF5)":
         )
 
 elif mode == "Results (Benchmark)":
-    res_h5 = _rl.h5_path_results(RESULTS_ROOT, res_outcome, res_date, res_episode, res_frame)
+    res_h5 = _rl.h5_path_results(_res_root, res_outcome, res_date, res_episode, res_frame)
 
     meta = _loader.load_meta(res_h5)
     images = _loader.load_images(res_h5)
@@ -260,9 +294,11 @@ elif mode == "Results (Benchmark)":
         "images": images,
         "_load_t2i": _make_load_t2i_res(res_h5),
         "_load_full_all": _make_load_full_res(res_h5),
+        "pred_action": _loader.load_pred_action(res_h5),
+        "gt_action": _loader.load_gt_action(res_h5),
     }
 
-    st.header(f"{res_outcome} · `{res_episode}` · Frame `{res_frame}`")
+    st.header(f"{res_outcome} · `{res_episode}` · Frame `{res_frame}` · {res_camera} cam")
     if meta.get("instruction"):
         st.caption(f"**Instruction:** {meta['instruction']}")
 
@@ -291,7 +327,7 @@ elif mode == "Results (Benchmark)":
         )
     with tab5:
         trajectory.render(
-            root=RESULTS_ROOT,
+            root=_res_root,
             outcome=res_outcome,
             date=res_date,
             episode=res_episode,

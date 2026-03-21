@@ -16,7 +16,6 @@ import streamlit as st
 @st.cache_resource
 def load_model(checkpoint_dir: str, device: str = "cuda:0"):
     """Load Pi0.5 policy once, cache across reruns."""
-    # Add project root to path so openpi imports work
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
@@ -25,67 +24,98 @@ def load_model(checkpoint_dir: str, device: str = "cuda:0"):
     from openpi.training import config as _config
     from openpi.policies import policy_config as _policy_config
 
-    config = _config.get_config("pi05_droid") # must be this, not pi05_droid_pytorch
+    config = _config.get_config("pi05_droid")  # must be this, not pi05_droid_pytorch
     policy = _policy_config.create_trained_policy(config, checkpoint_dir, pytorch_device=device)
     return policy
 
 
-def run_inference(
-    policy,
-    example: dict,
-    layers_prefix_output_dir: str = "results/layers_prefix",
-) -> dict:
-    """Run one forward pass and return attention slice dict.
+def run_inference(policy, example: dict) -> dict:
+    """Run one forward pass with in-RAM attention capture and return a slice dict.
 
-    The model writes attention maps to `layers_prefix_output_dir` as side effects.
-    We then read them back and build an in-memory slice dict.
-
-    Returns a slice dict with keys: meta, images, prefix (same schema as HDF5).
+    Uses the gemma_pytorch attention buffer (same mechanism as pipeline.py) so no
+    files are written to disk. Returns a dict with schema meta/images/prefix for
+    direct use by the views. Full attention matrix is stored for all 18 layers.
     """
-    import os
-
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
-    sys.path.insert(0, project_root)
-    sys.path.insert(0, os.path.join(project_root, "src"))
+    for p in [project_root, os.path.join(project_root, "src"), os.path.join(project_root, "viz")]:
+        if p not in sys.path:
+            sys.path.insert(0, p)
 
-    from viz.dashboard.loader import make_slice_dict_from_npy
+    from openpi.models_pytorch import gemma_pytorch as _gpt
+    from viz.dashboard.loader import TEXT_START_IDX, TOTAL_IMAGE_TOKENS
 
-    # Run inference — side-effect: writes attn_map_layer_*.npy
-    _ = policy.infer(example)
+    # ── Capture attention into RAM buffer ────────────────────────────────────
+    _gpt.enable_attn_buffer()
+    try:
+        _ = policy.infer(example)
+        buf = _gpt.get_attn_buffer()
+    finally:
+        _gpt.clear_attn_buffer()
 
-    # Tokenize to get token texts
-    token_texts = None
+    if not buf:
+        st.warning("Attention buffer is empty — model may not have run the prefix forward pass.")
+        return {}
+
+    # ── Detect dimensions ────────────────────────────────────────────────────
+    first = next(iter(buf.values()))
+    seq_len = int(first.shape[-1])
+    n_text = seq_len - TEXT_START_IDX
+
+    # ── Tokenize instruction for token labels ────────────────────────────────
+    token_texts: list[str] = [f"tok_{i}" for i in range(n_text)]
     try:
         from openpi.models.tokenizer import PaligemmaTokenizer
-        import numpy as _np
-
         tokenizer = PaligemmaTokenizer()
-        joint_pos = example.get("observation/joint_position", _np.zeros(7))
-        gripper_pos = example.get("observation/gripper_position", _np.zeros(1))
-        state = _np.concatenate([joint_pos, gripper_pos])
-        instruction = example.get("prompt", "").strip().replace("_", " ").replace("\n", " ")
-        discretized_state = _np.digitize(state, bins=_np.linspace(-1, 1, 256 + 1)[:-1]) - 1
-        state_str = " ".join(map(str, discretized_state))
+        joint_pos = example.get("observation/joint_position", np.zeros(7))
+        gripper_pos = np.atleast_1d(example.get("observation/gripper_position", np.zeros(1)))
+        state = np.concatenate([np.atleast_1d(joint_pos), gripper_pos])
+        instruction = example.get("prompt", "").strip()
+        disc = np.digitize(state, bins=np.linspace(-1, 1, 257)[:-1]) - 1
+        state_str = " ".join(map(str, disc))
         full_prompt = f"Task: {instruction}, State: {state_str};\nAction: "
-        token_ids = tokenizer._tokenizer.encode(full_prompt, add_bos=True)
-        token_texts = [tokenizer._tokenizer.id_to_piece(i) for i in token_ids]
+        ids = tokenizer._tokenizer.encode(full_prompt, add_bos=True)
+        token_texts = [tokenizer._tokenizer.id_to_piece(i) for i in ids]
     except Exception as e:
-        st.warning(f"Tokenizer failed: {e}. Token labels will be generic.")
+        st.warning(f"Tokenizer failed: {e}. Using generic token labels.")
 
-    # Resize images to 224×224
-    ext_img = example.get("observation/exterior_image_1_left")
-    wrist_img = example.get("observation/wrist_image_left")
+    n_text_actual = min(n_text, len(token_texts))
 
-    instruction = example.get("prompt", "")
+    # ── Resize images to 224×224 ─────────────────────────────────────────────
+    def _to_224(img: np.ndarray | None) -> np.ndarray | None:
+        if img is None:
+            return None
+        from PIL import Image as _PIL
+        return np.array(
+            _PIL.fromarray(img.astype(np.uint8)).resize((224, 224), _PIL.BILINEAR),
+            dtype=np.uint8,
+        )
 
-    slice_dict = make_slice_dict_from_npy(
-        layers_prefix_dir=layers_prefix_output_dir,
-        token_texts=token_texts,
-        instruction=instruction,
-        ext_img=ext_img,
-        wrist_img=wrist_img,
-    )
-    return slice_dict
+    # ── Build prefix dict from buffer ────────────────────────────────────────
+    prefix: dict[str, Any] = {}
+    for layer_idx, attn in buf.items():
+        if attn.ndim == 4:
+            attn = attn[0]          # drop batch dim → (n_heads, seq, seq)
+        attn = attn.astype(np.float32)
+
+        t2i = attn[:, TEXT_START_IDX : TEXT_START_IDX + n_text_actual, :TOTAL_IMAGE_TOKENS]
+        layer_data: dict[str, np.ndarray] = {"text_to_img": t2i, "full": attn}
+
+        prefix[f"layer_{layer_idx}"] = layer_data
+
+    return {
+        "meta": {
+            "prefix_len": TEXT_START_IDX,
+            "seq_len": seq_len,
+            "n_real_tokens": n_text_actual,
+            "instruction": example.get("prompt", ""),
+            "token_texts": token_texts[:n_text_actual],
+        },
+        "images": {
+            "exterior": _to_224(example.get("observation/exterior_image_1_left")),
+            "wrist":    _to_224(example.get("observation/wrist_image_left")),
+        },
+        "prefix": prefix,
+    }
 
 
 def list_online_checkpoints(checkpoint_root: str = "checkpoints/viz") -> list[str]:

@@ -16,10 +16,20 @@ import cv2
 import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
 import numpy as np
+import plotly.graph_objects as go
 import streamlit as st
+from plotly.subplots import make_subplots
 
 from viz.dashboard import loader_results as _rl
-from viz.dashboard.loader import list_layers_in_h5, load_images, load_meta, load_text_to_img
+from viz.dashboard.loader import (
+    list_layers_in_h5,
+    load_action_to_img,
+    load_gt_action,
+    load_images,
+    load_meta,
+    load_pred_action,
+    load_text_to_img,
+)
 from viz.dashboard.views.grid_heatmap import (
     _ALL_AGG_NAMES,
     _SIMPLE_AGGS,
@@ -109,6 +119,320 @@ def _build_trajectory_figure(
                 )
 
     return fig
+
+
+# ── Action temporal analysis ───────────────────────────────────────────────────
+
+def _action_attn_512(a2i: np.ndarray, head_agg: str) -> np.ndarray:
+    """Aggregate action→image attention to a single (512,) vector.
+
+    a2i: (n_heads, 8_steps, 512_patches) from load_action_to_img().
+    Returns mean over action steps after head aggregation.
+    """
+    if head_agg == "Max":
+        by_head = a2i.max(axis=0)   # (8_steps, 512)
+    else:
+        by_head = a2i.mean(axis=0)  # (8_steps, 512)
+    return by_head.mean(axis=0)     # (512,)
+
+
+def _concentration(attn_256: np.ndarray) -> float:
+    """Focus concentration: 1 − normalized entropy. Range [0, 1]."""
+    p = attn_256 / (attn_256.sum() + 1e-10)
+    h = -float(np.sum(p * np.log(p + 1e-10)))
+    return float(1.0 - h / np.log(256))
+
+
+def _render_action_temporal(
+    root: str,
+    outcome: str,
+    date: str,
+    episode: str,
+    selected_frames: list[int],
+    all_layers: list[int],
+) -> None:
+    """Render the Action Token Temporal Analysis expander."""
+    with st.expander("Action Token Attention — Temporal Analysis", expanded=True):
+        st.caption(
+            "Where do **action tokens** attend across the episode? "
+            "Each point = one episode frame; attention is averaged over all 8 decode steps. "
+            "Hypothesis: early frames attend to the goal, mid-episode to the object, "
+            "late frames to both."
+        )
+
+        # ── Controls ──────────────────────────────────────────────────────────
+        act_c1, act_c2 = st.columns([3, 2])
+        with act_c1:
+            act_layer = st.selectbox(
+                "Layer", options=all_layers,
+                index=min(4, len(all_layers) - 1),
+                key="traj_act_layer",
+            )
+        with act_c2:
+            act_head_agg = st.radio(
+                "Head aggregation", ["Max", "Mean"],
+                horizontal=True, key="traj_act_head_agg",
+            )
+
+        # ── Load data for every selected frame ────────────────────────────────
+        wrist_conc: list[float | None] = []
+        ext_conc: list[float | None] = []
+        balance: list[float | None] = []
+        act_t2i: dict[tuple[int, int], np.ndarray | None] = {}  # for heatmap strip
+
+        wrist_imgs: dict[int, np.ndarray | None] = {}
+        with st.spinner("Loading action attention across frames…"):
+            for frame in selected_frames:
+                path = _rl.h5_path_results(root, outcome, date, episode, frame)
+                wrist_imgs[frame] = load_images(path).get("wrist")
+                a2i = load_action_to_img(path, act_layer)   # (n_heads, 8, 512) or None
+                if a2i is None:
+                    wrist_conc.append(None)
+                    ext_conc.append(None)
+                    balance.append(None)
+                    act_t2i[(frame, act_layer)] = None
+                    continue
+
+                attn_512 = _action_attn_512(a2i, act_head_agg)
+                wrist_conc.append(_concentration(attn_512[256:512]))
+                ext_conc.append(_concentration(attn_512[0:256]))
+                wrist_sum = float(attn_512[256:512].sum())
+                ext_sum   = float(attn_512[0:256].sum())
+                balance.append(ext_sum / (wrist_sum + 1e-8))
+
+                # Fake single-token t2i shape (n_heads, 1, 512) so
+                # _build_trajectory_figure can render the wrist heatmap strip
+                act_t2i[(frame, act_layer)] = a2i.mean(axis=1)[:, np.newaxis, :]  # (n_heads, 1, 512)
+
+        # ── Metrics chart ─────────────────────────────────────────────────────
+        valid = [(f, w, e, b) for f, w, e, b in
+                 zip(selected_frames, wrist_conc, ext_conc, balance)
+                 if w is not None]
+        if not valid:
+            st.warning("No full-matrix data available for this layer.")
+            return
+
+        frames_v, wrist_v, ext_v, balance_v = zip(*valid)
+
+        fig_metrics = make_subplots(
+            rows=2, cols=1, shared_xaxes=True,
+            subplot_titles=("Focus Concentration (higher = more localised)",
+                            "Ext / Wrist Attention Balance (>1 = scene-dominant)"),
+            vertical_spacing=0.12,
+        )
+        fig_metrics.add_trace(
+            go.Scatter(x=list(frames_v), y=list(wrist_v), mode="lines+markers",
+                       name="Wrist conc.", line=dict(color="#f0a500")),
+            row=1, col=1,
+        )
+        fig_metrics.add_trace(
+            go.Scatter(x=list(frames_v), y=list(ext_v), mode="lines+markers",
+                       name="Ext conc.", line=dict(color="#4c9be8"), opacity=0.6),
+            row=1, col=1,
+        )
+        fig_metrics.add_trace(
+            go.Scatter(x=list(frames_v), y=list(balance_v), mode="lines+markers",
+                       name="Ext/Wrist ratio", line=dict(color="#9b59b6")),
+            row=2, col=1,
+        )
+        fig_metrics.add_hline(y=1.0, line_dash="dash", line_color="gray",
+                              annotation_text="balanced", row=2, col=1)
+        fig_metrics.update_layout(
+            height=420,
+            margin=dict(l=50, r=20, t=50, b=40),
+            legend=dict(orientation="h", y=1.06),
+            xaxis2=dict(title="Episode frame"),
+        )
+        st.plotly_chart(fig_metrics, use_container_width=True, key="traj_act_metrics")
+
+        # ── Wrist heatmap strip (action→wrist attention) ──────────────────────
+        st.markdown("**Action attention → Wrist camera** (mean over 8 decode steps)")
+
+        # agg_fn: max or mean over heads dim (already collapsed into single-token t2i)
+        _agg = (lambda x: x.max(axis=0)) if act_head_agg == "Max" else (lambda x: x.mean(axis=0))
+
+        for chunk_idx, chunk_start in enumerate(range(0, len(selected_frames), CHUNK_SIZE)):
+            chunk = selected_frames[chunk_start : chunk_start + CHUNK_SIZE]
+            fig_strip = _build_trajectory_figure(
+                frames=chunk,
+                layers=[act_layer],
+                t2i_data=act_t2i,
+                imgs=wrist_imgs,
+                tok_idx=0,
+                camera="wrist",
+                agg_fn=_agg,
+                row_label_prefix="act",
+            )
+            caption = f"Action→Wrist — layer {act_layer} — {act_head_agg}" if chunk_idx == 0 else None
+            st.image(_fig_to_bytes(fig_strip), caption=caption, use_container_width=True)
+
+
+# ── Action benchmark (pred vs GT) ─────────────────────────────────────────────
+
+_ACTION_DIM_LABELS = [f"j{i}" for i in range(7)] + ["grip"]
+
+
+def _render_action_benchmark(
+    root: str,
+    outcome: str,
+    date: str,
+    episode: str,
+    selected_frames: list[int],
+) -> None:
+    """Render Predicted vs Ground-Truth action comparison across frames."""
+    with st.expander("Action Benchmark — Pred vs GT", expanded=True):
+        st.caption(
+            "Pi0.5 predicted actions vs ground-truth trajectory actions. "
+            "Useful for checking inference determinism and measuring action error."
+        )
+
+        # ── Load data ─────────────────────────────────────────────────────────
+        pred_data: dict[int, np.ndarray | None] = {}
+        gt_data:   dict[int, np.ndarray | None] = {}
+        with st.spinner("Loading pred/GT actions…"):
+            for frame in selected_frames:
+                path = _rl.h5_path_results(root, outcome, date, episode, frame)
+                pred_data[frame] = load_pred_action(path)
+                gt_data[frame]   = load_gt_action(path)
+
+        has_pred = any(v is not None for v in pred_data.values())
+        has_gt   = any(v is not None for v in gt_data.values())
+
+        if not has_pred and not has_gt:
+            st.info("No pred/GT action data found — re-run the pipeline to generate it.")
+            return
+
+        # ── Per-frame mean L2 error ────────────────────────────────────────
+        if has_pred and has_gt:
+            frames_v, l2_mean, l2_by_step = [], [], []
+            for frame in selected_frames:
+                p = pred_data[frame]
+                g = gt_data[frame]
+                if p is None or g is None:
+                    continue
+                # Mask NaN GT rows (near episode end)
+                valid = ~np.isnan(g).any(axis=1)
+                if not valid.any():
+                    continue
+                diff = (p[valid] - g[valid]) ** 2          # (n_valid, 8)
+                l2_step = np.sqrt(diff.mean(axis=1))       # (n_valid,) — one per action step
+                frames_v.append(frame)
+                l2_mean.append(float(l2_step.mean()))
+                l2_by_step.append(l2_step)                 # (n_valid,)
+
+            if frames_v:
+                # Top chart: mean L2 over episode frames
+                fig_l2 = go.Figure()
+                fig_l2.add_trace(go.Scatter(
+                    x=frames_v, y=l2_mean, mode="lines+markers",
+                    name="Mean L2 (all steps)", line=dict(color="#4c9be8"),
+                ))
+                # Individual action steps as faint lines
+                n_steps = max(len(s) for s in l2_by_step)
+                step_colors = plt.cm.plasma(np.linspace(0.1, 0.9, n_steps))
+                for step_i in range(n_steps):
+                    y_step = [
+                        float(s[step_i]) if step_i < len(s) else None
+                        for s in l2_by_step
+                    ]
+                    r, g_c, b, _ = step_colors[step_i]
+                    fig_l2.add_trace(go.Scatter(
+                        x=frames_v, y=y_step, mode="lines",
+                        name=f"step {step_i}",
+                        line=dict(color=f"rgba({int(r*255)},{int(g_c*255)},{int(b*255)},0.45)", width=1),
+                        showlegend=(step_i < 4),
+                    ))
+                fig_l2.update_layout(
+                    title="L2 error per episode frame",
+                    xaxis_title="Episode frame",
+                    yaxis_title="L2 error",
+                    height=300,
+                    margin=dict(l=50, r=20, t=40, b=40),
+                    legend=dict(orientation="h", y=1.12),
+                )
+                st.plotly_chart(fig_l2, use_container_width=True, key="bench_l2")
+
+                # Per-dim error heatmap: rows = action dims, cols = frames
+                err_matrix = np.full((8, len(frames_v)), np.nan)
+                for fi, frame in enumerate(frames_v):
+                    p = pred_data[frame]
+                    g_arr = gt_data[frame]
+                    if p is None or g_arr is None:
+                        continue
+                    valid = ~np.isnan(g_arr).any(axis=1)
+                    if valid.any():
+                        err_matrix[:, fi] = np.sqrt(
+                            ((p[valid] - g_arr[valid]) ** 2).mean(axis=0)
+                        )
+
+                fig_hm = go.Figure(go.Heatmap(
+                    z=err_matrix,
+                    x=[str(f) for f in frames_v],
+                    y=_ACTION_DIM_LABELS,
+                    colorscale="Plasma",
+                    colorbar=dict(title="L2 err"),
+                ))
+                fig_hm.update_layout(
+                    title="Per-dimension L2 error (rows = action dims, cols = frames)",
+                    xaxis_title="Episode frame",
+                    yaxis_title="Action dim",
+                    height=280,
+                    margin=dict(l=60, r=20, t=40, b=40),
+                )
+                st.plotly_chart(fig_hm, use_container_width=True, key="bench_heatmap")
+
+        # ── Single-frame detail: pred vs GT per dim ────────────────────────
+        valid_frames = [f for f in selected_frames
+                        if pred_data.get(f) is not None or gt_data.get(f) is not None]
+        if not valid_frames:
+            return
+
+        detail_frame = st.select_slider(
+            "Frame for detail view",
+            options=valid_frames,
+            value=valid_frames[len(valid_frames) // 2],
+            key="bench_detail_frame",
+        )
+        p_det = pred_data.get(detail_frame)
+        g_det = gt_data.get(detail_frame)
+
+        n_steps = (p_det.shape[0] if p_det is not None else
+                   g_det.shape[0] if g_det is not None else 8)
+
+        fig_det = make_subplots(
+            rows=2, cols=4,
+            subplot_titles=_ACTION_DIM_LABELS,
+            shared_xaxes=True,
+            vertical_spacing=0.18,
+            horizontal_spacing=0.08,
+        )
+        for dim_i, label in enumerate(_ACTION_DIM_LABELS):
+            row, col = dim_i // 4 + 1, dim_i % 4 + 1
+            steps = list(range(n_steps))
+            if g_det is not None:
+                gt_vals = g_det[:, dim_i].tolist()
+                fig_det.add_trace(go.Scatter(
+                    x=steps, y=gt_vals, mode="lines+markers",
+                    name="GT" if dim_i == 0 else None,
+                    showlegend=(dim_i == 0),
+                    line=dict(color="#f0a500"),
+                ), row=row, col=col)
+            if p_det is not None:
+                pred_vals = p_det[:, dim_i].tolist()
+                fig_det.add_trace(go.Scatter(
+                    x=steps, y=pred_vals, mode="lines+markers",
+                    name="Pred" if dim_i == 0 else None,
+                    showlegend=(dim_i == 0),
+                    line=dict(color="#4c9be8", dash="dash"),
+                ), row=row, col=col)
+
+        fig_det.update_layout(
+            title=f"Frame {detail_frame} — Pred (blue dashed) vs GT (orange) per action dim",
+            height=400,
+            margin=dict(l=40, r=20, t=60, b=40),
+            legend=dict(orientation="h", y=1.08),
+        )
+        st.plotly_chart(fig_det, use_container_width=True, key="bench_detail")
 
 
 # ── Main render ────────────────────────────────────────────────────────────────
@@ -279,6 +603,19 @@ def render(
             )
             caption = f'Trajectory — "{selected_label}" — {camera} — {agg}' if chunk_idx == 0 else None
             st.image(_fig_to_bytes(fig), caption=caption, use_container_width=True)
+
+    # ── Action Token Temporal Analysis ───────────────────────────────────────
+    _render_action_temporal(
+        root=root, outcome=outcome, date=date, episode=episode,
+        selected_frames=selected_frames,
+        all_layers=all_layers,
+    )
+
+    # ── Action Benchmark (pred vs GT) ─────────────────────────────────────────
+    _render_action_benchmark(
+        root=root, outcome=outcome, date=date, episode=episode,
+        selected_frames=selected_frames,
+    )
 
     # ── Counterfactual section ────────────────────────────────────────────────
     if not cf_slugs:

@@ -18,7 +18,6 @@ import io
 import os
 import re
 import sys
-import tempfile
 from pathlib import Path
 
 import cv2
@@ -45,44 +44,91 @@ _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 # ── Dataset catalogue ─────────────────────────────────────────────────────────
 
 def _catalogue() -> dict[str, dict]:
-    """Built-in image datasets available for CF experiments."""
-    data_root = os.path.join(_PROJECT_ROOT, "data/visualization")
+    """Discover all episode datasets under data/example/.
+
+    Returns a dict keyed by episode name. Each entry has:
+      frames_root — directory containing hand_camera/, varied_camera_1/, varied_camera_2/
+      traj_h5     — path to trajectory.h5
+      default_prompt — from instruction.txt or ""
+      n_frames    — number of frames in hand_camera/
+    Camera (ext_dir) is NOT fixed here — resolved at render time from user selection.
+    """
+    example_dir = os.path.join(_PROJECT_ROOT, "data/example")
     cat: dict[str, dict] = {}
+    if not os.path.isdir(example_dir):
+        return cat
 
-    # Duck dataset
-    duck_dir = os.path.join(data_root, "duck/frames")
-    if os.path.isdir(duck_dir):
-        n = len(list(Path(duck_dir + "/varied_camera_1").glob("*.jpg")))
-        cat["duck"] = {
-            "ext_dir": duck_dir + "/varied_camera_1",
-            "wrist_dir": duck_dir + "/hand_camera",
-            "traj_h5": os.path.join(data_root, "duck/trajectory.h5"),
-            "default_prompt": "place the duck toy into the pink bowl",
-            "n_frames": n,
-        }
+    for ep_name in sorted(os.listdir(example_dir)):
+        ep_dir = os.path.join(example_dir, ep_name)
+        if not os.path.isdir(ep_dir):
+            continue
 
-    # Pineapple dataset
-    pine_dir = os.path.join(data_root, "aawr_pineapple/recordings/frames")
-    if os.path.isdir(pine_dir):
-        n = len(list(Path(pine_dir + "/varied_camera_2").glob("*.jpg")))
-        cat["pineapple"] = {
-            "ext_dir": pine_dir + "/varied_camera_2",
-            "wrist_dir": pine_dir + "/hand_camera",
-            "traj_h5": os.path.join(data_root, "aawr_pineapple/trajectory.h5"),
-            "default_prompt": "find the pineapple toy and pick it up",
+        # Auto-detect frame structure
+        if os.path.isdir(os.path.join(ep_dir, "recordings", "frames")):
+            frames_root = os.path.join(ep_dir, "recordings", "frames")
+        elif os.path.isdir(os.path.join(ep_dir, "frames")):
+            frames_root = os.path.join(ep_dir, "frames")
+        else:
+            continue
+
+        hand_dir = os.path.join(frames_root, "hand_camera")
+        if not os.path.isdir(hand_dir):
+            continue
+
+        n = len([f for f in os.listdir(hand_dir) if f.endswith(".jpg")])
+        if n == 0:
+            continue
+
+        traj_h5 = os.path.join(ep_dir, "trajectory.h5")
+        instr_path = os.path.join(ep_dir, "instruction.txt")
+        default_prompt = open(instr_path).read().strip() if os.path.exists(instr_path) else ""
+
+        cat[ep_name] = {
+            "frames_root": frames_root,
+            "traj_h5": traj_h5,
+            "default_prompt": default_prompt,
             "n_frames": n,
         }
 
     return cat
 
 
-def _load_frame(dataset: dict, frame_idx: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Return (ext_img, wrist_img, joint_pos, gripper_pos)."""
+_CAMERA_DIR_MAP = {"right": "varied_camera_2", "left": "varied_camera_1"}
+
+
+def _resolve_ext_camera_dir(frames_root: str, camera: str) -> str:
+    """Return the subdirectory name for the requested exterior camera.
+
+    Falls back gracefully: if varied_camera_2/1 don't exist, use any dir
+    that isn't hand_camera.
+    """
+    preferred = _CAMERA_DIR_MAP.get(camera, "varied_camera_2")
+    if os.path.isdir(os.path.join(frames_root, preferred)):
+        return preferred
+    # Fallback: first non-hand_camera dir
+    for name in sorted(os.listdir(frames_root)):
+        if name != "hand_camera" and os.path.isdir(os.path.join(frames_root, name)):
+            return name
+    return preferred  # let caller raise a clear error
+
+
+def _load_frame(
+    dataset: dict, frame_idx: int, camera: str = "right"
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return (ext_img, wrist_img, joint_pos, gripper_pos).
+
+    Args:
+        dataset: catalogue entry with keys frames_root, traj_h5
+        frame_idx: frame index
+        camera: "right" or "left" exterior camera selection
+    """
     from PIL import Image
     import h5py
 
-    ext_path = os.path.join(dataset["ext_dir"], f"{frame_idx:05d}.jpg")
-    wrist_path = os.path.join(dataset["wrist_dir"], f"{frame_idx:05d}.jpg")
+    frames_root = dataset["frames_root"]
+    ext_cam_dir = _resolve_ext_camera_dir(frames_root, camera)
+    ext_path = os.path.join(frames_root, ext_cam_dir, f"{frame_idx:05d}.jpg")
+    wrist_path = os.path.join(frames_root, "hand_camera", f"{frame_idx:05d}.jpg")
     ext_img = np.array(Image.open(ext_path).convert("RGB"))
     wrist_img = np.array(Image.open(wrist_path).convert("RGB"))
 
@@ -104,7 +150,16 @@ def _run_one_prompt(
     prompt: str,
     gpu_id: int = 0,
 ) -> dict:
-    """Run inference for one prompt, return in-memory slice dict."""
+    """Run inference for one prompt, return in-memory slice dict.
+
+    Uses the gemma_pytorch RAM buffer — no npy files written to disk.
+    The raw attention buffer is stashed in slice_dict["_attn_buffer"] so
+    _save_cf_h5 can write it directly via write_attn_h5_from_buffer.
+    """
+    from openpi.models_pytorch import gemma_pytorch as _gpt
+    from viz.dashboard.loader import TEXT_START_IDX, TOTAL_IMAGE_TOKENS
+    from PIL import Image as _PIL
+
     example = {
         "observation/exterior_image_1_left": ext_img,
         "observation/wrist_image_left": wrist_img,
@@ -112,10 +167,22 @@ def _run_one_prompt(
         "observation/gripper_position": gripper_pos,
         "prompt": prompt,
     }
-    _ = policy.infer(example)
 
-    # Tokenize to get human-readable token labels (text + robot state only)
-    token_texts = None
+    _gpt.enable_attn_buffer()
+    try:
+        _ = policy.infer(example)
+        buf = _gpt.get_attn_buffer()
+    finally:
+        _gpt.clear_attn_buffer()
+
+    if not buf:
+        return {}
+
+    first = next(iter(buf.values()))
+    seq_len = int(first.shape[-1])
+    n_text = seq_len - TEXT_START_IDX
+
+    token_texts = [f"tok_{i}" for i in range(n_text)]
     try:
         from openpi.models.tokenizer import PaligemmaTokenizer
         tokenizer = PaligemmaTokenizer()
@@ -129,14 +196,39 @@ def _run_one_prompt(
     except Exception:
         pass
 
-    layers_dir = os.path.join(_PROJECT_ROOT, f"attn/{gpu_id}/layers_prefix")
-    return _loader.make_slice_dict_from_npy(
-        layers_prefix_dir=layers_dir,
-        token_texts=token_texts,
-        instruction=prompt,
-        ext_img=ext_img,
-        wrist_img=wrist_img,
-    )
+    n_text_actual = min(n_text, len(token_texts))
+
+    def _to_224(img):
+        if img is None:
+            return None
+        return np.array(
+            _PIL.fromarray(img.astype(np.uint8)).resize((224, 224), _PIL.BILINEAR),
+            dtype=np.uint8,
+        )
+
+    prefix = {}
+    for layer_idx, attn in buf.items():
+        if attn.ndim == 4:
+            attn = attn[0]
+        attn = attn.astype(np.float32)
+        t2i = attn[:, TEXT_START_IDX : TEXT_START_IDX + n_text_actual, :TOTAL_IMAGE_TOKENS]
+        prefix[f"layer_{layer_idx}"] = {"text_to_img": t2i, "full": attn}
+
+    return {
+        "meta": {
+            "prefix_len": TEXT_START_IDX,
+            "seq_len": seq_len,
+            "n_real_tokens": n_text_actual,
+            "instruction": prompt,
+            "token_texts": token_texts[:n_text_actual],
+        },
+        "images": {
+            "exterior": _to_224(ext_img),
+            "wrist":    _to_224(wrist_img),
+        },
+        "prefix": prefix,
+        "_attn_buffer": buf,  # kept for _save_cf_h5
+    }
 
 
 def _save_cf_h5(
@@ -148,63 +240,22 @@ def _save_cf_h5(
     attn_h5_root: str,
 ) -> str:
     """Persist one counterfactual rollout to disk as HDF5."""
-    # Import lazily — only needed when saving
-    sys.path.insert(0, os.path.join(_PROJECT_ROOT, "src"))
     sys.path.insert(0, os.path.join(_PROJECT_ROOT, "viz"))
-    from convert_npy_to_h5 import convert_episode  # noqa: PLC0415
+    from attn_h5_writer import write_attn_h5_from_buffer  # noqa: PLC0415
 
-    # Write .npy files to a temp dir so convert_episode can read them
-    with tempfile.TemporaryDirectory() as tmp:
-        prefix_dir = os.path.join(tmp, "layers_prefix")
-        os.makedirs(prefix_dir)
+    buf = slice_dict.get("_attn_buffer", {})
+    images = slice_dict.get("images", {})
+    instruction = slice_dict.get("meta", {}).get("instruction", "")
+    dst = _loader.h5_path_cf(checkpoint_id, episode_id, frame_idx, prompt_slug, attn_h5_root)
 
-        for layer_key, layer_data in slice_dict.get("prefix", {}).items():
-            layer_idx = int(layer_key.split("_")[1])
-            t2i = layer_data.get("text_to_img")
-            full = layer_data.get("full")
-            # Reconstruct full (seq, seq) from text_to_img + zeros for completeness
-            # For CF, we only need text_to_img, so build a minimal full attn tensor
-            if full is not None:
-                arr = full  # (8, seq, seq)
-            else:
-                # Build a padded placeholder so convert_episode gets seq_len right
-                seq = slice_dict["meta"]["seq_len"]
-                arr = np.zeros((1, 8, seq, seq), dtype=np.float32)
-                # Splice text_to_img back in
-                from viz.dashboard.loader import TEXT_START_IDX, TOTAL_IMAGE_TOKENS
-                n_text = t2i.shape[1]
-                arr[0, :, TEXT_START_IDX : TEXT_START_IDX + n_text, :TOTAL_IMAGE_TOKENS] = t2i
-            # Add batch dim if missing
-            if arr.ndim == 3:
-                arr = arr[np.newaxis]
-            npy_path = os.path.join(prefix_dir, f"attn_map_layer_{layer_idx}.npy")
-            np.save(npy_path, arr.astype(np.float32))
-
-        dst = _loader.h5_path_cf(checkpoint_id, episode_id, frame_idx, prompt_slug, attn_h5_root)
-        images = slice_dict.get("images", {})
-        instruction = slice_dict.get("meta", {}).get("instruction", "")
-
-        # Save images temporarily
-        ext_tmp = wrist_tmp = None
-        from PIL import Image as PILImage
-        _ext = images.get("exterior")
-        _wrist = images.get("wrist")
-        if _ext is not None:
-            ext_tmp = os.path.join(tmp, "ext.jpg")
-            PILImage.fromarray(_ext).save(ext_tmp)
-        if _wrist is not None:
-            wrist_tmp = os.path.join(tmp, "wrist.jpg")
-            PILImage.fromarray(_wrist).save(wrist_tmp)
-
-        convert_episode(
-            src_prefix_dir=prefix_dir,
-            dst_h5_path=dst,
-            ext_img_path=ext_tmp,
-            wrist_img_path=wrist_tmp,
-            instruction=instruction,
-            frame_idx=frame_idx,
-        )
-
+    write_attn_h5_from_buffer(
+        attn_buffer=buf,
+        h5_path=dst,
+        ext_img=images.get("exterior"),
+        wrist_img=images.get("wrist"),
+        instruction=instruction,
+        frame_idx=frame_idx,
+    )
     return dst
 
 

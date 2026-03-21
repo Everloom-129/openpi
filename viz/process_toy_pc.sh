@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-CAMERA="left"
+CAMERA="right"
 DATA_ROOT="/mnt/sda/edward/projects/toy_cube_benchmark/all"
 RESULTS_ROOT="/mnt/sda/edward/projects/pi05_vis/all/${CAMERA}"
 

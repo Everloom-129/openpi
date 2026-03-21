@@ -19,6 +19,8 @@ TOTAL_IMAGE_TOKENS = 512
 TEXT_START_IDX = 768
 PATCH_GRID = 16
 
+_ACTION_DIM_LABELS = [f"j{i}" for i in range(7)] + ["grip"]
+
 
 def _upsample_16(attn_256: np.ndarray) -> np.ndarray:
     """Upsample 16×16 patch grid to 224×224 via kron."""
@@ -52,6 +54,7 @@ def render(
             "Showing text-row attention distribution as a proxy."
         )
         _render_text_distribution(data, available_layers, token_texts, ext_img, wrist_img)
+        _render_pred_gt_benchmark(data)
         return
 
     # ── Joint attention rendering ─────────────────────────────────────────────
@@ -153,6 +156,90 @@ def render(
             yaxis=dict(title="%"),
         )
         st.plotly_chart(fig3, use_container_width=True)
+
+    _render_pred_gt_benchmark(data)
+
+
+def _render_pred_gt_benchmark(data: dict) -> None:
+    """Render Predicted vs Ground-Truth action benchmark for a single frame."""
+    pred = data.get("pred_action")   # (8, 8) float32 or None
+    gt   = data.get("gt_action")     # (8, 8) float32, NaN-padded, or None
+
+    if pred is None and gt is None:
+        return
+
+    with st.expander("Action Benchmark — Pred vs GT", expanded=True):
+        st.caption(
+            "Pi0.5 predicted actions vs ground-truth trajectory actions for this frame. "
+            "Each subplot = one action dimension; "
+            "x-axis = decode step (0–7)."
+        )
+
+        steps = list(range(8))
+
+        # ── Per-step L2 bar chart ──────────────────────────────────────────
+        if pred is not None and gt is not None:
+            valid = ~np.isnan(gt).any(axis=1)   # mask padded rows near episode end
+            if valid.any():
+                diff = pred[valid] - gt[valid]                  # (n, 8)
+                l2_per_step_valid = np.sqrt((diff ** 2).mean(axis=1))  # (n,)
+                # pad back to 8 steps with NaN
+                l2_per_step = np.full(8, np.nan)
+                l2_per_step[np.where(valid)[0]] = l2_per_step_valid
+
+                fig_l2 = go.Figure(go.Bar(
+                    x=[f"Step {i}" for i in range(8)],
+                    y=l2_per_step.tolist(),
+                    marker_color=[
+                        f"rgba(76,155,232,{0.4 + 0.6 * (v / (np.nanmax(l2_per_step) + 1e-8))})"
+                        if not np.isnan(v) else "rgba(80,80,80,0.3)"
+                        for v in l2_per_step
+                    ],
+                    hovertemplate="Step %{x}: L2=%{y:.4f}<extra></extra>",
+                ))
+                fig_l2.update_layout(
+                    title="L2 error per action step (mean over dims)",
+                    height=220,
+                    margin=dict(l=40, r=20, t=40, b=30),
+                    yaxis_title="L2 error",
+                )
+                st.plotly_chart(fig_l2, use_container_width=True, key="av_bench_l2")
+
+        # ── Per-dim subplot: pred vs GT ────────────────────────────────────
+        fig = make_subplots(
+            rows=2, cols=4,
+            subplot_titles=_ACTION_DIM_LABELS,
+            shared_xaxes=True,
+            vertical_spacing=0.22,
+            horizontal_spacing=0.08,
+        )
+        for dim_i, label in enumerate(_ACTION_DIM_LABELS):
+            row, col = dim_i // 4 + 1, dim_i % 4 + 1
+            if gt is not None:
+                gt_vals = [float(v) if not np.isnan(v) else None for v in gt[:, dim_i]]
+                fig.add_trace(go.Scatter(
+                    x=steps, y=gt_vals, mode="lines+markers",
+                    name="GT" if dim_i == 0 else None,
+                    showlegend=(dim_i == 0),
+                    line=dict(color="#f0a500"),
+                    marker=dict(size=5),
+                ), row=row, col=col)
+            if pred is not None:
+                fig.add_trace(go.Scatter(
+                    x=steps, y=pred[:, dim_i].tolist(), mode="lines+markers",
+                    name="Pred" if dim_i == 0 else None,
+                    showlegend=(dim_i == 0),
+                    line=dict(color="#4c9be8", dash="dash"),
+                    marker=dict(size=5),
+                ), row=row, col=col)
+
+        fig.update_layout(
+            title="Pred (blue dashed) vs GT (orange) — all action dims",
+            height=380,
+            margin=dict(l=40, r=20, t=60, b=30),
+            legend=dict(orientation="h", y=1.1),
+        )
+        st.plotly_chart(fig, use_container_width=True, key="av_bench_detail")
 
 
 def _render_text_distribution(

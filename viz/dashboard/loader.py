@@ -69,6 +69,53 @@ def list_layers_in_h5(path: str) -> list[int]:
     return sorted(layers)
 
 
+@st.cache_data(ttl=300)
+def load_gt_action(path: str) -> np.ndarray | None:
+    """Load ground-truth actions: float32[OPEN_LOOP_HORIZON, action_dim].
+
+    action_dim = 8: [joint_velocity×7, gripper_position×1].
+    Last rows may be NaN if the frame is within OPEN_LOOP_HORIZON of episode end.
+    Returns None if the file predates GT action capture.
+    """
+    if not os.path.exists(path):
+        return None
+    with h5py.File(path, "r") as f:
+        if "gt_action" not in f:
+            return None
+        return f["gt_action"][()].astype(np.float32)
+
+
+@st.cache_data(ttl=300)
+def load_pred_action(path: str) -> np.ndarray | None:
+    """Load Pi0.5 predicted actions: float32[OPEN_LOOP_HORIZON, action_dim].
+
+    action_dim = 8: [joint_velocity×7, gripper_position×1].
+    Returns None if the file predates predicted action capture.
+    """
+    if not os.path.exists(path):
+        return None
+    with h5py.File(path, "r") as f:
+        if "pred_action" not in f:
+            return None
+        return f["pred_action"][()].astype(np.float32)
+
+
+@st.cache_data(ttl=300)
+def load_action_to_img(path: str, layer: int) -> np.ndarray | None:
+    """Load action-token → image attention: (n_heads, 8_steps, 512_patches) float32.
+
+    Written by pipeline.py via the suffix attention buffer.
+    Returns None if the file predates suffix capture or the layer is absent.
+    """
+    if not os.path.exists(path):
+        return None
+    with h5py.File(path, "r") as f:
+        key = f"suffix/layer_{layer}/action_to_img"
+        if key not in f:
+            return None
+        return f[key][()].astype(np.float32)
+
+
 def has_full_matrix(path: str, layer: int) -> bool:
     if not os.path.exists(path):
         return False
