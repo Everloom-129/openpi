@@ -27,27 +27,21 @@ uv run streamlit run viz/dashboard/app.py
 # Run the attention visualization dashboard
 uv run streamlit run viz/dashboard/app.py
 
-# Convert raw .npy attention maps to HDF5 format
-uv run python viz/convert_npy_to_h5.py --src attn/ --dst attn_h5/
+# Or use the launch script (sets RESULTS_ROOT per user)
+bash viz/start_app.sh
+
+# Run batch attention pipeline (single GPU)
+uv run python viz/pipeline.py <DATA_ROOT> <RESULTS_ROOT>
+
+# Run batch attention pipeline (multi-GPU)
+uv run python viz/pipeline_mp.py <DATA_ROOT> <RESULTS_ROOT> --gpus 0,1
 
 # Run tests
 uv run pytest src/
 
-# Run a single test file
-uv run pytest src/openpi/models/pi0_test.py
-
 # Lint / format
 uv run ruff check .
 uv run ruff format .
-
-# JAX training
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_libero --exp-name=my_experiment
-
-# PyTorch training
-uv run scripts/train_pytorch.py <config_name> --exp_name <run_name>
-
-# Serve policy (for online inference mode)
-uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi05_droid --policy.dir=checkpoints/...
 ```
 
 ## Architecture
@@ -56,30 +50,41 @@ uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi05_droid --po
 
 The `viz/` directory is the primary area of active development. It has a three-layer architecture:
 
-**1. Data Layer** — `attn_h5/`
-Pre-computed attention maps stored in compressed HDF5 files, organized as:
-`attn_h5/{checkpoint_id}/{episode_name}/{frame_idx:05d}.h5`
+**1. Data Layer** — Results HDF5 files
+Batch pipeline writes one HDF5 per inference under `RESULTS_ROOT`:
+```
+RESULTS_ROOT/{left,right}/{success,failure}/{date}/{episode}/{frame:05d}/{frame:05d}.h5
+                                                                         {frame:05d}_{cf_key}.h5
+```
 
 Each HDF5 file contains:
-- `/meta` — prefix_len, seq_len, instruction, token_texts/ids
-- `/images` — exterior + wrist RGB images (224×224, gzip compressed)
-- `/prefix/layer_{i}/` — text→image attention slices for all layers; full matrix only for key layers `{1, 4, 5, 7, 10}`
+- `/meta` — prefix_len, seq_len, instruction, token_texts/ids, n_real_tokens
+- `/images` — exterior + wrist RGB images (224×224, gzip-4)
+- `/prefix/layer_{i}/` — `text_to_img` float32(8, n_text, 512) + `full` float32(8, seq, seq) for all 18 layers
+- `/suffix/layer_{i}/` — `action_to_img` float32(n_heads, 8, 512) — action-token → image attention
+- `/gt_action` — float32(8, 8): ground-truth [joint_velocity×7, gripper×1] from trajectory.h5, NaN-padded near episode end
+- `/pred_action` — float32(8, 8): Pi0.5 predicted actions from policy.infer()
 
 **2. Loader Layer** — `viz/dashboard/loader.py`
 Streamlit-cached functions for efficient data access. Key constants:
 ```python
 NUM_IMAGE_TOKENS = 256      # 16×16 patches per camera
-TOTAL_IMAGE_TOKENS = 512    # ext + wrist
+TOTAL_IMAGE_TOKENS = 512    # ext (0:256) + wrist (256:512)
 TEXT_START_IDX = 768        # where text tokens begin in sequence
 NUM_LAYERS = 18
 ```
+Key loaders: `load_meta`, `load_images`, `load_text_to_img`, `load_full_matrix_all_heads`,
+`load_action_to_img`, `load_gt_action`, `load_pred_action`.
+
+Results-specific path helpers live in `viz/dashboard/loader_results.py`.
 
 **3. Visualization Layer** — `viz/dashboard/views/`
 Modular tabs, each independently customizable:
 - `grid_heatmap.py` — text→image attention as 16×16 grids per camera
 - `image_heatmap.py` — attention overlaid on RGB images
 - `attn_matrix.py` — full sequence-level attention matrix
-- `action_view.py` — where action tokens attend
+- `action_view.py` — where action tokens attend + pred vs GT action benchmark
+- `trajectory.py` — multi-frame attention grid + action benchmark across episode
 - `comparison.py` / `counterfactual.py` — multi-checkpoint or counterfactual prompt comparisons
 
 ### Token Layout (Pi0.5 / DROID)
@@ -94,27 +99,76 @@ This layout is critical for all slicing/indexing in the visualization code.
 
 ### Dashboard Modes
 
-- **Offline (HDF5)**: Browse pre-computed attention from `attn_h5/`
-- **Online (Inference)**: Live inference using a running policy server, then visualize attention in real time
+`viz/dashboard/app.py` wires sidebar controls to loader and views.
 
-The dashboard entry point `viz/dashboard/app.py` wires the sidebar controls (checkpoint, episode, frame selectors) to the loader and then to each view.
+- **Offline (HDF5)**: Browse pre-computed attention from `attn_h5/` (legacy format)
+- **Results (Benchmark)**: Browse batch pipeline output from `RESULTS_ROOT`. Camera (left/right) is selected in the sidebar — resolves to `RESULTS_ROOT/{camera}/`. Includes Trajectory tab with action benchmark.
+- **Online (Inference)**: Live inference on example episodes from `data/example/`. Episodes are auto-discovered; structure (DROID `recordings/frames/` vs duck `frames/`) is detected automatically. GPU list is detected via `pynvml`; "Auto" selects the GPU with most free memory.
+
+`RESULTS_ROOT` is set via environment variable in `viz/start_app.sh` (per-user). Default layout:
+```
+/path/to/results/cube_gold/
+├── right/   ← RESULTS_ROOT/right
+└── left/    ← RESULTS_ROOT/left
+```
+
+### Attention Capture — RAM Buffer
+
+**Do not write npy files.** All attention capture uses the in-RAM buffer in `src/openpi/models_pytorch/gemma_pytorch.py`:
+
+```python
+# Prefix attention (PaliGemma forward, Case 1)
+_gpt.enable_attn_buffer()
+try:
+    result = policy.infer(example)
+    buf = _gpt.get_attn_buffer()          # dict[layer_idx, ndarray(1,8,seq,seq)]
+finally:
+    _gpt.clear_attn_buffer()
+
+# Suffix attention (action-token forward, Case 2)
+_gpt.enable_suffix_attn_buffer()
+try:
+    result = policy.infer(example)
+    suffix_buf = _gpt.get_suffix_attn_buffer()  # dict[layer_idx, ndarray(1,n_heads,8,k)]
+finally:
+    _gpt.clear_suffix_attn_buffer()
+```
+
+`viz/attn_h5_writer.write_attn_h5_from_buffer(attn_buffer, h5_path, ..., suffix_attn_buffer, gt_action, pred_action)` converts the buffer directly to HDF5.
+
+This same pattern is used in:
+- `viz/pipeline.py` / `viz/pipeline_mp.py` — batch offline inference
+- `viz/dashboard/inference.py` — online inference
+- `viz/dashboard/views/counterfactual.py` — counterfactual prompt inference
+
+### Batch Pipeline
+
+`viz/pipeline.py` (single-process) and `viz/pipeline_mp.py` (multi-GPU, episode-level parallelism) run offline inference. Both use `load_example` from `pipeline.py` which loads DROID-format episodes (trajectory.h5 + recordings/frames/). Completed episodes are marked with `pi05.md`. Counterfactual prompts are configured via `viz/config/counterfactual.yaml`.
+
+`viz/convert_npy_to_h5.py` exists only for converting legacy npy captures — do not use for new work.
+
+### Example Data
+
+Local example episodes live in `data/example/`:
+- `duck/` — uses `frames/{camera}/` directly; no instruction.txt
+- `aawr_pineapple/` — DROID format (`recordings/frames/`); no instruction.txt
+- `place-pattern/` — DROID format; has `instruction.txt`
+
+The dashboard auto-detects the format by checking for `recordings/frames/`.
 
 ### Source Model Code
 
 `src/openpi/` contains the upstream model implementations:
 - `models/` — JAX implementations (PaliGemma backbone + action expert)
-- `models_pytorch/` — PyTorch equivalents
-- `policies/` — Pi0, Pi0-FAST, Pi0.5 policy definitions
+- `models_pytorch/` — PyTorch equivalents; `gemma_pytorch.py` owns the attention buffer
+- `policies/` — Pi0, Pi0-FAST, Pi0.5 policy definitions; DROID output is `actions[:, :8]` (float32, shape 8×8)
 - `training/` — training configs and data loaders
 - `serving/` — policy server for remote inference
-
-### NPY → HDF5 Conversion
-
-Raw attention captures land in `attn/{checkpoint_id}/layers_prefix/attn_map_layer_{i}.npy` (shape: `1, 8, seq, seq`). Run `viz/convert_npy_to_h5.py` to convert these to the dashboard-compatible HDF5 format. The converter also runs PaliGemmaTokenizer to embed token text labels.
 
 ## GPU Requirements
 
 - Inference only: >8 GB (RTX 4090 sufficient)
+- Batch pipeline: ~16 GB per worker; pipeline_mp.py limits to 2 workers/GPU
 - LoRA fine-tuning: >22.5 GB
 - Full fine-tuning: >70 GB (A100/H100)
 

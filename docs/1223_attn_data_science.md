@@ -1661,8 +1661,168 @@ assert writer.isOpened(), "VideoWriter failed to open"
 
 ---
 
-**Document Version**: 1.0  
-**Last Updated**: 2024-12-24  
-**Authors**: Research Team  
+## 9. Frontend Temporal Shift Implementation Plan
+
+**Date added**: 2025-03-19
+**Status**: PLANNING — awaiting scientific answers before implementation
+
+---
+
+### 9.1 Motivation & Research Context
+
+`h5_temporal_shift.py` is broken because it reads from the old `.npy` suffix format (`results/layers_suffix/`) and requires live YOLO detection — neither exists in the current HDF5 pipeline.
+
+Recent research (TTF-VLA 2508.19257, AVA-VLA 2511.18960, VLA-Pruner 2511.16449) establishes a clear pattern in VLA attention:
+
+- **Prefill attention** (text→image, stored as `text_to_img`): Broad, semantic — where does the instruction word look?
+- **Decode/suffix attention** (action token→image): Sharp, spatially localized — where does each action step look when predicting motor commands?
+
+Key finding: action tokens show **2-3× more concentrated** attention than prefill tokens. The temporal shift hypothesis is that action step 0 may attend globally while later steps converge on the manipulation target or goal location.
+
+---
+
+### 9.2 Data Available for Action→Image Attention
+
+The full attention matrix `(8_heads, seq_len, seq_len)` is stored for key layers `{1, 4, 5, 7, 10}` in HDF5. Since the token layout is:
+
+```
+[0:256] ext_camera  [256:512] wrist_camera  [512:768] zero_pad  [768:N] text  [N:N+8] action_tokens
+```
+
+Action→image attention is extractable as:
+
+```python
+full_matrix[:, seq_len-8 : seq_len, 0:512]
+# → shape: (8_heads, 8_action_steps, 512_image_patches)
+```
+
+This replaces the broken `load_suffix_attention()` in `h5_temporal_shift.py`.
+
+---
+
+### 9.3 Planned Metrics (research-grounded)
+
+#### Metric 1 — Camera Balance Ratio (per action step)
+```
+ext_mass[step]   = sum(action_attn[step, 0:256])    # exterior camera
+wrist_mass[step] = sum(action_attn[step, 256:512])  # wrist camera
+balance_ratio    = ext_mass / (wrist_mass + 1e-8)
+```
+Interpretation: ratio > 2 = scene-dominant; ratio < 0.5 = manipulation-dominant.
+Expected pattern for pick-and-place: ratio decreases as action steps progress (shifts from scene to wrist).
+
+#### Metric 2 — Focus Concentration Score (per action step, per camera)
+```
+p = normalize(attn_patches)  # probability over 256 patches
+entropy_score = -sum(p * log(p + 1e-10))
+concentration = 1 - entropy_score / log(256)
+```
+Range: 0 (uniform) to 1 (single patch). Based on AVA-VLA and VLA-Pruner methodology.
+
+#### Metric 3 — Temporal Shift Magnitude (between consecutive steps)
+```
+shift[t] = MSE(attn_step_t, attn_step_{t+1})
+```
+High = attention changes sharply between steps (adaptive). Low = fixation behavior.
+
+#### Metric 4 — ROI Overlap Ratio (optional, requires ROI definition)
+```
+roi_mask = patches within user-defined bounding box on 16×16 grid
+overlap[step] = sum(attn[step][roi_mask]) / sum(attn[step])
+```
+
+---
+
+### 9.4 Planned Visualizations
+
+**Section A — Per-step camera attention curves** (always available from full matrix):
+- Line chart: x = action step (0–7), y = integrated attention mass
+- Two lines: exterior camera (blue), wrist camera (orange)
+- Derived: camera balance ratio line on secondary axis
+
+**Section B — Concentration over decode steps**:
+- Bar chart: x = action step, y = concentration score
+- Separate bars for ext and wrist cameras
+- Interpretation: does the model sharpen attention as it decodes?
+
+**Section C — Action step attention heatmaps**:
+- Side-by-side 16×16 patch grids for step 0, step 3, step 7
+- Overlaid on RGB image
+- Shows spatial shift across the action sequence
+
+**Section D — ROI analysis (user-defined)**:
+- Two sliders for row range (0–15) and column range (0–15) on the 16×16 grid
+- Visual box drawn on the image showing selected ROI
+- Curve: how much attention falls in that ROI at each action step
+- Enables testing the "object→goal shift" hypothesis without YOLO
+
+**Section E — Cross-frame summary (trajectory tab)**:
+- For each selected frame in the episode, compute mean ext/wrist mass averaged across 8 steps
+- Heatmap: rows = action steps (0–7), columns = episode frames; color = ext attention fraction
+- Shows how the model's camera preference evolves over the full episode
+
+---
+
+### 9.5 Implementation Location
+
+- **Within-frame analysis (Sections A–D)**: Extend `viz/dashboard/views/action_view.py`
+  - Replaces the current `st.info("No joint/suffix attention data found...")` fallback
+  - Uses `data["_load_full_all"](layer)` to get the full matrix
+  - Extracts action rows using `meta["seq_len"]`
+- **Cross-frame analysis (Section E)**: Add to `viz/dashboard/views/trajectory.py`
+  - New expander "Action Step Camera Analysis" below the main trajectory figure
+
+---
+
+### 9.6 Open Scientific Questions (answers needed before implementation)
+
+**Q1 — Expected direction of temporal shift?**
+What is the hypothesis for pick-and-place:
+- Option A: Early steps attend to object (for grasping), later steps attend to goal/bowl (for placing) → shift within exterior camera
+- Option B: Early steps use exterior (global), later steps use wrist (fine manipulation) → shift across cameras
+- Option C: Attention is stable across 8 steps (all steps look at the same thing)
+
+**Q2 — ROI definition method?**
+- Option A: Pure camera aggregate (no spatial ROI) — always works, lowest noise
+- Option B: Patch sliders (user draws box on 16×16) — manual but flexible
+- Option C: Pre-defined semantic quadrants (top-left = background, bottom-center = manipuland, etc.)
+
+**Q3 — Full matrix data availability?**
+Are the full matrices actually populated in current HDF5 files, or only `text_to_img` slices?
+Can provide a test path to check: `h5py.File(path)["prefix/layer_1/full"]`.
+
+**Q4 — Cross-frame or within-frame as primary output?**
+Is the primary visualization:
+- One frame at a time (deep dive: how 8 action steps differ in that moment)
+- Or episode-level trajectory (lighter: ext vs wrist balance per frame, averaged over steps)
+
+---
+
+### 9.7 Counterfactual Statistics Panel (already implementable)
+
+For the counterfactual tab, add below the delta images:
+
+```
+| Prompt           | L2 dist | Pearson r | Entropy | Δ Camera Balance |
+|------------------|---------|-----------|---------|------------------|
+| ★ baseline       | 0.00    | 1.000     | 4.21    | 0.00             |
+| pick up banana   | 0.84    | 0.312     | 4.67    | +0.43            |
+| pick up duck     | 0.76    | 0.401     | 4.55    | +0.31            |
+| (empty prompt)   | 1.12    | 0.104     | 5.12    | +0.89            |
+```
+
+Metrics per row (all computable from existing `slice_dict`):
+- **L2 distance**: `||attn_cf - attn_baseline||_2` over the 512-patch vector, per selected token
+- **Pearson r**: spatial correlation between the two attention maps
+- **Entropy**: `H(attn_cf)` — higher = more diffuse attention (less grounded)
+- **Δ Camera Balance**: change in `ext_mass / (ext_mass + wrist_mass)` vs baseline
+
+These come from `h2_cf_prompt.py`'s `compute_attention_statistics()` adapted to HDF5 slices.
+
+---
+
+**Document Version**: 1.1
+**Last Updated**: 2025-03-19
+**Authors**: Research Team
 **Contact**: See project README for contact information
 

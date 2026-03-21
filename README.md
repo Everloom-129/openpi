@@ -1,8 +1,6 @@
 # openpi-attention-visualization
 
-> Fork by @JieWang, research project at GRASP Lab, please do not redistribute without permission. 
-
-> For attention visualization, please fetch ckpt by running `bash scripts/get_pi05_droid_torch.sh`
+> Fork by @JieWang, research project at GRASP Lab, please do not redistribute without permission.
 
 openpi holds open-source models and packages for robotics, published by the [Physical Intelligence team](https://www.physicalintelligence.company/).
 
@@ -14,6 +12,74 @@ Currently, this repo contains three types of models:
 For all models, we provide _base model_ checkpoints, pre-trained on 10k+ hours of robot data, and examples for using them out of the box or fine-tuning them to your own datasets.
 
 This is an experiment: $\pi_0$ was developed for our own robots, which differ from the widely used platforms such as [ALOHA](https://tonyzhaozh.github.io/aloha/) and [DROID](https://droid-dataset.github.io/), and though we are optimistic that researchers and practitioners will be able to run creative new experiments adapting $\pi_0$ to their own platforms, we do not expect every such attempt to be successful. All this is to say: $\pi_0$ may or may not work for you, but you are welcome to try it and see!
+
+## Explainability Research
+
+This fork extends openpi with **attention visualization tools** to study the internal representations of VLA models (π₀ and π₀.₅). The goal is to understand *what* these models attend to when generating robot actions — bridging interpretability research and robot learning.
+
+### What this adds
+
+**Attention capture** — a RAM-buffered hook in `src/openpi/models_pytorch/gemma_pytorch.py` records per-layer, per-head attention maps during inference without writing intermediate files to disk.
+
+**Batch pipeline** — `viz/pipeline.py` (single GPU) and `viz/pipeline_mp.py` (multi-GPU) run offline inference over entire DROID episodes and write results to compressed HDF5 files under `RESULTS_ROOT`. Each HDF5 stores images, attention maps for all 18 layers, predicted actions, and ground-truth actions.
+
+**Streamlit dashboard** — `viz/dashboard/app.py` provides an interactive browser for the computed attention. Key views:
+- **Grid heatmap** — text-token → image-patch attention as 16×16 grids per camera
+- **Image heatmap** — attention overlaid on the RGB frame
+- **Attention matrix** — full sequence-level attention (text, image, action tokens)
+- **Action view** — where action tokens attend + predicted vs. ground-truth action benchmark
+- **Trajectory** — multi-frame attention grid across an episode
+- **Counterfactual** — compare attention under different text prompts
+
+**Token layout** used throughout:
+```
+[0:256]       [256:512]    [512:768]     [768:N]      [N:N+8]
+ext_camera    wrist_cam    zero_pad      text_tokens  action_tokens
+```
+
+### Quick start
+
+
+```bash
+# 1. Replace the specific transformer into system
+bash scripts/get_transformer.sh
+```
+
+```bash
+# 1. Download and convert a checkpoint (see below)
+bash scripts/get_pi05_droid_torch.sh
+
+# 2. Run the batch pipeline on a DROID episode directory
+uv run python viz/pipeline.py <DATA_ROOT> <RESULTS_ROOT>
+
+# 3. Launch the dashboard
+bash viz/start_app.sh
+```
+
+---
+
+## Downloading Checkpoints for Visualization
+
+The visualization pipeline requires a PyTorch checkpoint. Before downloading any checkpoint, install and patch `transformers` once:
+
+```bash
+bash scripts/get_transformer.sh
+```
+
+Then use the scripts below to download the JAX checkpoint from GCS and convert it:
+
+| Model | Script | PyTorch support |
+|-------|--------|-----------------|
+| π₀.₅-DROID | `bash scripts/get_pi05_droid_torch.sh` | yes |
+| π₀-DROID | `bash scripts/get_pi0_droid_torch.sh` | yes |
+| π₀-FAST-DROID | `bash scripts/get_pi0_fast_droid_torch.sh` | JAX only (no PyTorch impl for FAST) |
+| π₀-ALOHA-towel | `bash scripts/get_pi0_aloha_towel_torch.sh` | yes |
+
+Converted checkpoints land in `./checkpoints/viz/<name>_pytorch/`. There are no public `pi0_aloha` or `pi05_aloha` standalone checkpoints; the task-specific ALOHA variants above are the available options.
+
+> **Note:** All scripts install and patch `transformers==4.53.2`. See the PyTorch Support section for details on what is patched and how to undo it.
+
+---
 
 ## Updates
 
