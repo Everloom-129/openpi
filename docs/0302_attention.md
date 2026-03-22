@@ -50,25 +50,10 @@
            shape: [seq_len, d_head]
            — softmax(QKᵀ/√d) · V  is the attended representation
 
-    What we read from the saved .npy file:
-           attn_map[head, query_row, key_col]
-           = softmax( Q[query_row] · K[key_col]ᵀ / √d )
-           = scalar attention weight  (already post-softmax)
-
-    What the code extracts:
-           word_attn = attn[heads, global_indices, :512]
-                            ↑          ↑              ↑
-                       all heads   "cube" rows    image key cols only
-
-           → mean over subword tokens  →  [heads, 512]
-           → max/mean over heads        →  [512]
-           → reshape                   →  ext:[16×16]  wrist:[16×16]
-           → overlay on image           →  heatmap
-
   Key insight: the attention weight attn[h, word_row, patch_col] tells you "head h decided that token word_row (e.g. 'cube') should draw X% of its information from image patch patch_col". High
    weight on a patch = the word is "looking at" that spatial region to contextualize its meaning.
 
-✻ Baked for 34s
+
 
 ❯ in VLA, does it contain self attention, or should we think how the attention work from text, image to action pair?                                                                            
                                                                                                                      
@@ -156,7 +141,6 @@
   The key insight for VLA analysis: text→image attention (Path A) tells you about language grounding; action→image attention (Path C) tells you about visuomotor binding — these can be very
   different layers and heads.
 
-✻ Worked for 41s                  
 
 ❯ then based on above, how should we analyze the attention and visualize it, give me a plan                                                                                                     
                                                                                             
@@ -315,10 +299,3 @@
 
   ---
   Want me to start implementing h8_action_image_attention.py (Phase 2)?
-
-✻ Crunched for 42s
-
-────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-❯  
-────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  ⏵⏵ accept edits on (shift+tab to cycle)

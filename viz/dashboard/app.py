@@ -23,7 +23,52 @@ for _p in [_PROJECT_ROOT, os.path.join(_PROJECT_ROOT, "src")]:
 
 from viz.dashboard import loader as _loader
 from viz.dashboard import loader_results as _rl
-from viz.dashboard.views import action_view, attn_matrix, comparison, counterfactual, grid_heatmap, image_heatmap, trajectory
+from viz.dashboard.views import action_view, attn_matrix, comparison, counterfactual, grid_heatmap, image_heatmap, image_saliency, trajectory
+
+
+def _save_online_h5(slice_dict: dict, h5_path: str) -> None:
+    """Write an online-inference slice_dict to HDF5.
+
+    Works purely from the already-processed slice_dict — no raw buffer needed.
+    Schema mirrors attn_h5_writer so the file is loadable by loader.py.
+    """
+    import h5py
+    import numpy as np
+
+    os.makedirs(os.path.dirname(h5_path), exist_ok=True)
+    meta = slice_dict.get("meta", {})
+    images = slice_dict.get("images", {})
+    prefix = slice_dict.get("prefix", {})
+
+    with h5py.File(h5_path, "w") as f:
+        # /meta
+        mg = f.create_group("meta")
+        for k, v in meta.items():
+            if isinstance(v, list):
+                mg.attrs[k] = [s.encode() if isinstance(s, str) else s for s in v]
+            elif isinstance(v, str):
+                mg.attrs[k] = v
+            else:
+                mg.attrs[k] = v
+
+        # /images
+        ig = f.create_group("images")
+        for cam, img in images.items():
+            if img is not None:
+                ig.create_dataset(cam, data=img, compression="gzip", compression_opts=4)
+
+        # /prefix/layer_{i}/text_to_img + full
+        pg = f.create_group("prefix")
+        for layer_key, layer_data in prefix.items():
+            lg = pg.create_group(layer_key)
+            for arr_key, arr in layer_data.items():
+                if arr is not None:
+                    lg.create_dataset(
+                        arr_key,
+                        data=np.asarray(arr, dtype=np.float32),
+                        compression="gzip",
+                        compression_opts=4,
+                    )
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -52,8 +97,9 @@ with st.sidebar:
         if not checkpoints:
             st.error(
                 f"No HDF5 data found in `{ATTN_H5_ROOT}`.\n\n"
-                "Run conversion first:\n"
-                "```\npython viz/convert_npy_to_h5.py\n```"
+                "Run the batch pipeline first:\n"
+                "```\npython viz/pipeline.py <DATA_ROOT> <RESULTS_ROOT>\n```\n"
+                "Or use **Online (Inference)** mode and click **💾 Save to HDF5**."
             )
             st.stop()
 
@@ -350,12 +396,28 @@ else:
         if k.startswith("layer_")
     )
 
-    tab0, tab1, tab2, tab3, tab4 = st.tabs([
+    # ── Save to HDF5 ──────────────────────────────────────────────────────────
+    _h5_save_path = os.path.join(
+        ATTN_H5_ROOT, "online",
+        st.session_state.get("online_episode", "episode"),
+        f"{st.session_state.get('online_frame', 0):05d}.h5",
+    )
+    _col_info, _col_btn = st.columns([6, 2])
+    _col_info.caption(f"Save path: `{_h5_save_path}`")
+    if _col_btn.button("💾 Save to HDF5", key="online_save_h5"):
+        try:
+            _save_online_h5(data, _h5_save_path)
+            st.success(f"Saved to `{_h5_save_path}`")
+        except Exception as _e:
+            st.error(f"Save failed: {_e}")
+
+    tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "🔲 Grid Heatmap",
         "🖼 Image Heatmap",
         "📊 Attention Matrix",
         "🤖 Action View",
         "🔀 Counterfactual",
+        "🧩 Occlusion Saliency",
     ])
 
     with tab0:
@@ -372,4 +434,5 @@ else:
             checkpoints=_loader.list_checkpoints(ATTN_H5_ROOT),
             default_checkpoint="",
         )
-    
+    with tab5:
+        image_saliency.render()

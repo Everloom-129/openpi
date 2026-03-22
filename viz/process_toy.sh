@@ -1,6 +1,6 @@
 
 
-CAMERA="right"
+CAMERA="left"
 DATASET="cube_gold" # all, cube_gold
 DATA_ROOT="/mnt/sda/edward/projects/toy_cube_benchmark/${DATASET}"
 RESULTS_ROOT="/mnt/sda/edward/projects/pi05_vis/${DATASET}/${CAMERA}"
