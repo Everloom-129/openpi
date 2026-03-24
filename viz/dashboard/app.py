@@ -23,7 +23,7 @@ for _p in [_PROJECT_ROOT, os.path.join(_PROJECT_ROOT, "src")]:
 
 from viz.dashboard import loader as _loader
 from viz.dashboard import loader_results as _rl
-from viz.dashboard.views import action_view, attn_matrix, ckpt_compare, comparison, counterfactual, grid_heatmap, image_heatmap, image_saliency, trajectory
+from viz.dashboard.views import action_view, attn_matrix, cag_view, ckpt_compare, comparison, counterfactual, grid_heatmap, image_heatmap, image_saliency, trajectory
 
 
 def _save_online_h5(slice_dict: dict, h5_path: str) -> None:
@@ -538,13 +538,14 @@ elif mode == "Online (Inference)":
         except Exception as _e:
             st.error(f"Save failed: {_e}")
 
-    tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "🔲 Grid Heatmap",
         "🖼 Image Heatmap",
         "📊 Attention Matrix",
         "🤖 Action View",
         "🔀 Counterfactual",
         "🧩 Occlusion Saliency",
+        "📐 Language Grounding (CAG)",
     ])
 
     with tab0:
@@ -563,6 +564,8 @@ elif mode == "Online (Inference)":
         )
     with tab5:
         image_saliency.render()
+    with tab6:
+        cag_view.render()
 
 else:
     # ── Compare (Online) mode ─────────────────────────────────────────────────
