@@ -491,8 +491,18 @@ def render(
 
     # ── Step 3: Inference settings ────────────────────────────────────────────
     with st.expander("③ Inference settings"):
-        checkpoint_id = "pi05_droid_pytorch"
-        st.info(f"Checkpoint: `{checkpoint_id}`")
+        _ckpt_root = os.path.join(_PROJECT_ROOT, "checkpoints/viz")
+        _available_ckpts = sorted(
+            d for d in os.listdir(_ckpt_root)
+            if os.path.isdir(os.path.join(_ckpt_root, d))
+        ) if os.path.isdir(_ckpt_root) else ["pi05_droid_pytorch"]
+        _default_idx = (
+            _available_ckpts.index("pi05_droid_pytorch")
+            if "pi05_droid_pytorch" in _available_ckpts else 0
+        )
+        checkpoint_id = st.selectbox(
+            "Checkpoint", _available_ckpts, index=_default_idx, key="cf_checkpoint"
+        )
         episode_id = st.text_input(
             "Episode ID (folder name)",
             value=f"{dataset_name}_f{frame_idx}",

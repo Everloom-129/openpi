@@ -13,9 +13,40 @@ import numpy as np
 import streamlit as st
 
 
+def _infer_config_name(checkpoint_dir: str) -> str:
+    """Infer the training config name from the checkpoint directory name.
+
+    Strips a trailing ``_pytorch`` suffix, then tries progressively shorter
+    underscore-delimited names against the registered configs.  Falls back to
+    ``pi05_droid`` / ``pi0_droid`` when nothing matches.
+    """
+    import os as _os
+    from openpi.training import config as _cfg
+
+    raw = _os.path.basename(_os.path.normpath(checkpoint_dir))
+    candidate = raw[: -len("_pytorch")] if raw.endswith("_pytorch") else raw
+
+    while candidate:
+        try:
+            _cfg.get_config(candidate)
+            return candidate
+        except (ValueError, KeyError):
+            pass
+        idx = candidate.rfind("_")
+        if idx == -1:
+            break
+        candidate = candidate[:idx]
+
+    return "pi05_droid" if "pi05" in raw.lower() else "pi0_droid"
+
+
 @st.cache_resource
 def load_model(checkpoint_dir: str, device: str = "cuda:0"):
-    """Load Pi0.5 policy once, cache across reruns."""
+    """Load Pi0 or Pi0.5 policy once, cache across reruns.
+
+    The config is inferred from the checkpoint directory name:
+    'pi05' → pi05_droid, 'pi0' → pi0_droid.
+    """
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
@@ -24,7 +55,8 @@ def load_model(checkpoint_dir: str, device: str = "cuda:0"):
     from openpi.training import config as _config
     from openpi.policies import policy_config as _policy_config
 
-    config = _config.get_config("pi05_droid")  # must be this, not pi05_droid_pytorch
+    config_name = _infer_config_name(checkpoint_dir)
+    config = _config.get_config(config_name)
     policy = _policy_config.create_trained_policy(config, checkpoint_dir, pytorch_device=device)
     return policy
 
