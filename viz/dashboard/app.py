@@ -176,33 +176,61 @@ with st.sidebar:
         online_ckpt_path = os.path.join(CHECKPOINT_ROOT, online_ckpt)
 
         st.markdown("**Input**")
-        _EXAMPLE_DIR = os.path.join(_PROJECT_ROOT, "data/example")
-
-        # List all episode subdirectories under data/example/
-        _example_episodes = sorted(
-            d for d in os.listdir(_EXAMPLE_DIR)
-            if os.path.isdir(os.path.join(_EXAMPLE_DIR, d))
-        ) if os.path.isdir(_EXAMPLE_DIR) else []
-
-        online_episode = st.selectbox("Episode", _example_episodes or ["(none)"], key="online_episode")
-        online_camera = st.radio(
-            "Ext camera", ["right", "left"], horizontal=True, key="online_camera"
+        input_source = st.radio(
+            "Source", ["Episode", "Upload Image"], horizontal=True, key="online_input_source",
         )
 
-        # Auto-detect episode structure and metadata
-        _ep_dir = os.path.join(_EXAMPLE_DIR, online_episode)
-        _has_recordings = os.path.isdir(os.path.join(_ep_dir, "recordings", "frames"))
-        _frames_root = os.path.join(_ep_dir, "recordings", "frames") if _has_recordings else os.path.join(_ep_dir, "frames")
-        _hand_dir = os.path.join(_frames_root, "hand_camera")
-        _n_frames = len([f for f in os.listdir(_hand_dir) if f.endswith(".jpg")]) if os.path.isdir(_hand_dir) else 1
-        _max_frame = max(0, _n_frames - 1)
-        _instr_path = os.path.join(_ep_dir, "instruction.txt")
-        _default_instr = open(_instr_path).read().strip() if os.path.exists(_instr_path) else ""
+        if input_source == "Upload Image":
+            uploaded_exterior = st.file_uploader(
+                "Exterior camera image", type=["jpg", "jpeg", "png"], key="upload_ext",
+            )
+            uploaded_wrist = st.file_uploader(
+                "Wrist camera image (optional)", type=["jpg", "jpeg", "png"], key="upload_wrist",
+            )
+            instruction_text = st.text_input("Instruction", key="online_instruction_upload")
 
-        instruction_text = st.text_input(
-            "Instruction", value=_default_instr, key="online_instruction",
-        )
-        online_frame = st.slider("Frame", 0, _max_frame, 0, key="online_frame")
+            # Show previews
+            if uploaded_exterior:
+                st.image(uploaded_exterior, caption="Exterior", width=200)
+            if uploaded_wrist:
+                st.image(uploaded_wrist, caption="Wrist", width=200)
+
+            # Placeholders for episode-only variables
+            online_camera = "right"
+            online_frame = 0
+            _ep_dir = None
+            _has_recordings = False
+        else:
+            uploaded_exterior = None
+            uploaded_wrist = None
+
+            _EXAMPLE_DIR = os.path.join(_PROJECT_ROOT, "data/example")
+
+            # List all episode subdirectories under data/example/
+            _example_episodes = sorted(
+                d for d in os.listdir(_EXAMPLE_DIR)
+                if os.path.isdir(os.path.join(_EXAMPLE_DIR, d))
+            ) if os.path.isdir(_EXAMPLE_DIR) else []
+
+            online_episode = st.selectbox("Episode", _example_episodes or ["(none)"], key="online_episode")
+            online_camera = st.radio(
+                "Ext camera", ["right", "left"], horizontal=True, key="online_camera"
+            )
+
+            # Auto-detect episode structure and metadata
+            _ep_dir = os.path.join(_EXAMPLE_DIR, online_episode)
+            _has_recordings = os.path.isdir(os.path.join(_ep_dir, "recordings", "frames"))
+            _frames_root = os.path.join(_ep_dir, "recordings", "frames") if _has_recordings else os.path.join(_ep_dir, "frames")
+            _hand_dir = os.path.join(_frames_root, "hand_camera")
+            _n_frames = len([f for f in os.listdir(_hand_dir) if f.endswith(".jpg")]) if os.path.isdir(_hand_dir) else 1
+            _max_frame = max(0, _n_frames - 1)
+            _instr_path = os.path.join(_ep_dir, "instruction.txt")
+            _default_instr = open(_instr_path).read().strip() if os.path.exists(_instr_path) else ""
+
+            instruction_text = st.text_input(
+                "Instruction", value=_default_instr, key="online_instruction",
+            )
+            online_frame = st.slider("Frame", 0, _max_frame, 0, key="online_frame")
 
         def _available_gpu_devices() -> list[str]:
             try:
@@ -223,7 +251,26 @@ with st.sidebar:
                 import sys as _sys
                 _sys.path.insert(0, os.path.join(_PROJECT_ROOT, "viz"))
                 from pathlib import Path as _Path
-                if _has_recordings:
+                from PIL import Image as _PILImage
+
+                if input_source == "Upload Image":
+                    if not uploaded_exterior:
+                        st.error("Please upload at least an exterior camera image.")
+                        st.stop()
+                    ext_img = np.array(_PILImage.open(uploaded_exterior).convert("RGB"))
+                    if uploaded_wrist:
+                        wrist_img = np.array(_PILImage.open(uploaded_wrist).convert("RGB"))
+                    else:
+                        # Use a black placeholder if no wrist image provided
+                        wrist_img = np.zeros_like(ext_img)
+                    example = {
+                        "observation/exterior_image_1_left": ext_img,
+                        "observation/wrist_image_left": wrist_img,
+                        "observation/joint_position": np.zeros(7, dtype=np.float64),
+                        "observation/gripper_position": np.zeros(1, dtype=np.float64),
+                        "prompt": instruction_text,
+                    }
+                elif _has_recordings:
                     # DROID format: recordings/frames/{camera}/
                     from pipeline import load_example as _load_example
                     example = _load_example(
@@ -231,11 +278,12 @@ with st.sidebar:
                         index=online_frame,
                         camera=online_camera,
                     )
+                    example["prompt"] = instruction_text
                 else:
                     # Duck format: frames/{camera}/ directly
                     from attn_map import load_duck_example
                     example = load_duck_example(camera=online_camera, index=online_frame)
-                example["prompt"] = instruction_text
+                    example["prompt"] = instruction_text
                 try:
                     if gpu_device_sel == "Auto":
                         from attn_map import select_best_gpu as _sbg
