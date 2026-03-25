@@ -65,8 +65,8 @@ def run_inference(policy, example: dict) -> dict:
     """Run one forward pass with in-RAM attention capture and return a slice dict.
 
     Uses the gemma_pytorch attention buffer (same mechanism as pipeline.py) so no
-    files are written to disk. Returns a dict with schema meta/images/prefix for
-    direct use by the views. Full attention matrix is stored for all 18 layers.
+    files are written to disk. Returns a dict with schema meta/images/prefix/joint
+    for direct use by the views. Full attention matrix is stored for all 18 layers.
     """
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
     for p in [project_root, os.path.join(project_root, "src"), os.path.join(project_root, "viz")]:
@@ -78,11 +78,14 @@ def run_inference(policy, example: dict) -> dict:
 
     # ── Capture attention into RAM buffer ────────────────────────────────────
     _gpt.enable_attn_buffer()
+    _gpt.enable_suffix_attn_buffer()
     try:
-        _ = policy.infer(example)
+        result = policy.infer(example)
         buf = _gpt.get_attn_buffer()
+        suffix_buf = _gpt.get_suffix_attn_buffer()
     finally:
         _gpt.clear_attn_buffer()
+        _gpt.clear_suffix_attn_buffer()
 
     if not buf:
         st.warning("Attention buffer is empty — model may not have run the prefix forward pass.")
@@ -134,6 +137,24 @@ def run_inference(policy, example: dict) -> dict:
 
         prefix[f"layer_{layer_idx}"] = layer_data
 
+    # ── Build joint dict from suffix buffer ──────────────────────────────────
+    joint: dict[str, Any] = {}
+    for layer_idx, sa in suffix_buf.items():
+        if sa.ndim == 4:
+            sa = sa[0]              # drop batch dim → (n_heads, 8, k)
+        sa = sa.astype(np.float32)
+        a2i = sa[:, :, :TOTAL_IMAGE_TOKENS]                               # (n_heads, 8, 512)
+        a2t = sa[:, :, TEXT_START_IDX : TEXT_START_IDX + n_text_actual]  # (n_heads, 8, n_text)
+        a2a = sa[:, :, seq_len:]                                          # (n_heads, 8, ≤8)
+        joint[f"layer_{layer_idx}"] = {
+            "action_to_img":    a2i,
+            "action_to_text":   a2t,
+            "action_to_action": a2a,
+        }
+
+    pred_action = result.get("actions")    # (8, 8) float32
+    gt_action   = example.get("gt_action") # (8, 8) float32 or None
+
     return {
         "meta": {
             "prefix_len": TEXT_START_IDX,
@@ -146,7 +167,10 @@ def run_inference(policy, example: dict) -> dict:
             "exterior": _to_224(example.get("observation/exterior_image_1_left")),
             "wrist":    _to_224(example.get("observation/wrist_image_left")),
         },
-        "prefix": prefix,
+        "prefix":      prefix,
+        "joint":       joint or None,
+        "pred_action": pred_action,
+        "gt_action":   gt_action,
     }
 
 

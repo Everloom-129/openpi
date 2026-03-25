@@ -118,8 +118,28 @@ with st.sidebar:
         st.caption(f"HDF5 root: `{ATTN_H5_ROOT}`")
 
     elif mode == "Results (Benchmark)":
-        res_camera = st.radio("Camera", ["right", "left"], horizontal=True, key="res_camera")
-        _res_root = os.path.join(RESULTS_ROOT, res_camera)
+        # Dataset selector: scan sibling dirs of RESULTS_ROOT for those with left/ or right/
+        _res_parent = os.path.dirname(RESULTS_ROOT)
+        _default_ds = os.path.basename(RESULTS_ROOT)
+        _available_ds = []
+        if os.path.isdir(_res_parent):
+            for _d in sorted(os.listdir(_res_parent)):
+                _dp = os.path.join(_res_parent, _d)
+                if os.path.isdir(_dp) and any(
+                    os.path.isdir(os.path.join(_dp, c)) for c in ("left", "right")
+                ):
+                    _available_ds.append(_d)
+        _ds_idx = _available_ds.index(_default_ds) if _default_ds in _available_ds else 0
+        res_dataset = st.selectbox("Dataset", _available_ds or [_default_ds], index=_ds_idx, key="res_dataset")
+        _effective_res_root = os.path.join(_res_parent, res_dataset)
+
+        # Camera radio: only show cameras that actually exist for this dataset
+        _available_cameras = [c for c in ("right", "left") if os.path.isdir(os.path.join(_effective_res_root, c))]
+        if not _available_cameras:
+            st.error(f"No camera data found in `{_effective_res_root}`.")
+            st.stop()
+        res_camera = st.radio("Camera", _available_cameras, horizontal=True, key="res_camera")
+        _res_root = os.path.join(_effective_res_root, res_camera)
 
         outcomes = _rl.list_outcomes(_res_root)
         if not outcomes:
@@ -404,11 +424,20 @@ if mode == "Offline (HDF5)":
             return _loader.load_full_matrix_all_heads(path, layer)
         return _fn
 
+    _joint = {}
+    for _l in available_layers:
+        _a2i = _loader.load_action_to_img(h5_path, _l)
+        if _a2i is not None:
+            _joint[f"layer_{_l}"] = {"action_to_img": _a2i}
+
     data = {
-        "meta": meta,
-        "images": images,
-        "_load_t2i": _make_load_t2i(h5_path),
+        "meta":           meta,
+        "images":         images,
+        "_load_t2i":      _make_load_t2i(h5_path),
         "_load_full_all": _make_load_full_all(h5_path),
+        "joint":          _joint or None,
+        "pred_action":    _loader.load_pred_action(h5_path),
+        "gt_action":      _loader.load_gt_action(h5_path),
     }
 
     st.header(f"Checkpoint `{checkpoint_a}` · Episode `{episode}` · Frame `{frame_idx}`")
@@ -463,13 +492,20 @@ elif mode == "Results (Benchmark)":
             return _loader.load_full_matrix_all_heads(path, layer)
         return _fn
 
+    _joint_res = {}
+    for _l in available_layers:
+        _a2i = _loader.load_action_to_img(res_h5, _l)
+        if _a2i is not None:
+            _joint_res[f"layer_{_l}"] = {"action_to_img": _a2i}
+
     data = {
-        "meta": meta,
-        "images": images,
-        "_load_t2i": _make_load_t2i_res(res_h5),
+        "meta":           meta,
+        "images":         images,
+        "_load_t2i":      _make_load_t2i_res(res_h5),
         "_load_full_all": _make_load_full_res(res_h5),
-        "pred_action": _loader.load_pred_action(res_h5),
-        "gt_action": _loader.load_gt_action(res_h5),
+        "pred_action":    _loader.load_pred_action(res_h5),
+        "gt_action":      _loader.load_gt_action(res_h5),
+        "joint":          _joint_res or None,
     }
 
     st.header(f"{res_outcome} · `{res_episode}` · Frame `{res_frame}` · {res_camera} cam")
