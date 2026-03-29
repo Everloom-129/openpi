@@ -23,7 +23,7 @@ for _p in [_PROJECT_ROOT, os.path.join(_PROJECT_ROOT, "src")]:
 
 from viz.dashboard import loader as _loader
 from viz.dashboard import loader_results as _rl
-from viz.dashboard.views import action_view, attn_matrix, cag_view, ckpt_compare, comparison, counterfactual, grid_heatmap, image_heatmap, image_saliency, trajectory
+from viz.dashboard.views import action_view, attn_matrix, cag_view, ckpt_compare, comparison, counterfactual, dataset_browser, grid_heatmap, image_heatmap, image_saliency, trajectory
 
 
 def _save_online_h5(slice_dict: dict, h5_path: str) -> None:
@@ -90,7 +90,7 @@ with st.sidebar:
     st.title("🧠 Pi0.5 Attention")
     st.markdown("---")
 
-    mode = st.radio("Mode", ["Offline (HDF5)", "Results (Benchmark)", "Online (Inference)", "Compare (Online)"], index=0)
+    mode = st.radio("Mode", ["Offline (HDF5)", "Results (Benchmark)", "Online (Inference)", "Online (Dataset)", "Compare (Online)"], index=0)
 
     if mode == "Offline (HDF5)":
         checkpoints = _loader.list_checkpoints(ATTN_H5_ROOT)
@@ -269,6 +269,46 @@ with st.sidebar:
                     st.success("Inference complete!")
                 except Exception as e:
                     st.error(f"Inference failed: {e}")
+
+    elif mode == "Online (Dataset)":
+        # ── Online (Dataset) mode sidebar ─────────────────────────────────────
+        from viz.dashboard import inference as _inf
+
+        _DEFAULT_DS_ROOT = "/mnt/sda/edward/projects/toy_cube_benchmark/cube_gold"
+        ds_data_root = st.text_input(
+            "DATA_ROOT",
+            value=st.session_state.get("ds_data_root_val", _DEFAULT_DS_ROOT),
+            key="ds_data_root_input",
+        )
+        st.session_state["ds_data_root_val"] = ds_data_root
+
+        _ds_checkpoints = _inf.list_online_checkpoints(CHECKPOINT_ROOT)
+        if not _ds_checkpoints:
+            st.warning(f"No checkpoints found in `{CHECKPOINT_ROOT}`.")
+        ds_ckpt = st.selectbox(
+            "Checkpoint",
+            _ds_checkpoints or ["pi05_droid_pytorch"],
+            key="ds_ckpt",
+        )
+        ds_ckpt_path = os.path.join(CHECKPOINT_ROOT, ds_ckpt)
+
+        def _ds_gpu_devices() -> list[str]:
+            try:
+                import pynvml
+                pynvml.nvmlInit()
+                n = pynvml.nvmlDeviceGetCount()
+                pynvml.nvmlShutdown()
+                return ["Auto"] + [f"cuda:{i}" for i in range(n)] + ["cpu"]
+            except Exception:
+                return ["Auto", "cpu"]
+
+        ds_gpu = st.selectbox("GPU device", _ds_gpu_devices(), key="ds_gpu")
+
+        st.markdown("---")
+        if st.button("🗑 Clear selection", key="ds_clear"):
+            for k in ("ds_selected_episode", "ds_selected_frame", "online_data"):
+                st.session_state.pop(k, None)
+            st.rerun()
 
     else:
         # ── Compare (Online) mode sidebar ─────────────────────────────────────
@@ -602,6 +642,56 @@ elif mode == "Online (Inference)":
         image_saliency.render()
     with tab6:
         cag_view.render()
+
+elif mode == "Online (Dataset)":
+    # ── Online (Dataset) mode ─────────────────────────────────────────────────
+    st.header("Online (Dataset) — Browse & Infer")
+
+    dataset_browser.render(ds_data_root, ds_ckpt_path, ds_gpu)
+
+    # Show attention tabs once inference has run
+    if "online_data" in st.session_state:
+        data = st.session_state["online_data"]
+        available_layers = sorted(
+            int(k.split("_")[1])
+            for k in data.get("prefix", {})
+            if k.startswith("layer_")
+        )
+
+        ep  = st.session_state.get("ds_selected_episode", {})
+        frm = st.session_state.get("ds_selected_frame", 0)
+        st.divider()
+        st.subheader(f"Results — `{ep.get('episode_id', '')}` · frame {frm:05d}")
+        if data.get("meta", {}).get("instruction"):
+            st.caption(f"**Instruction:** {data['meta']['instruction']}")
+
+        tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+            "🔲 Grid Heatmap",
+            "🖼 Image Heatmap",
+            "📊 Attention Matrix",
+            "🤖 Action View",
+            "🔀 Counterfactual",
+            "🧩 Occlusion Saliency",
+            "📐 Language Grounding (CAG)",
+        ])
+        with tab0:
+            grid_heatmap.render(data, available_layers)
+        with tab1:
+            image_heatmap.render(data, available_layers)
+        with tab2:
+            attn_matrix.render(data, available_layers)
+        with tab3:
+            action_view.render(data, available_layers)
+        with tab4:
+            counterfactual.render(
+                attn_h5_root=ATTN_H5_ROOT,
+                checkpoints=_loader.list_checkpoints(ATTN_H5_ROOT),
+                default_checkpoint="",
+            )
+        with tab5:
+            image_saliency.render()
+        with tab6:
+            cag_view.render()
 
 else:
     # ── Compare (Online) mode ─────────────────────────────────────────────────

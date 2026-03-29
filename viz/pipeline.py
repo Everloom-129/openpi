@@ -27,6 +27,7 @@ Edit that file to add / remove / change prompt variants without touching code.
 Usage:
     uv run python viz/pipeline.py <DATA_ROOT> <RESULTS_ROOT>
     uv run python viz/pipeline.py <DATA_ROOT> <RESULTS_ROOT> --no-counterfactual
+    uv run python viz/pipeline.py <DATA_ROOT> <RESULTS_ROOT> --force   # reprocess all
     uv run python viz/pipeline.py <DATA_ROOT> <RESULTS_ROOT> \
         --checkpoint ./checkpoints/my_ckpt \
         --cf-config viz/config/my_prompts.yaml
@@ -242,6 +243,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--no-counterfactual", dest="counterfactual",
                         action="store_false",
                         help="Skip counterfactual prompt inference")
+    parser.add_argument("--force", action="store_true",
+                        help="Reprocess episodes even if pi05.md marker exists")
     args = parser.parse_args(argv)
 
     DATA_ROOT    = Path(args.data_root)
@@ -281,7 +284,7 @@ def main(argv: list[str] | None = None) -> None:
                 episode_dir.mkdir(parents=True, exist_ok=True)
 
                 marker = episode_dir / "pi05.md"
-                if marker.exists():
+                if marker.exists() and not args.force:
                     print(f"[skip] {outcome}/{date_dir.name}/{episode_id}")
                     skipped += 1
                     continue

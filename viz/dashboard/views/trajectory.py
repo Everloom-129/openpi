@@ -53,7 +53,7 @@ def _build_trajectory_figure(
     layers: list[int],
     t2i_data: dict[tuple[int, int], np.ndarray | None],  # (frame, layer) → (8, n_text, 512)
     imgs: dict[int, np.ndarray | None],                   # frame → (H, W, 3) uint8
-    tok_idx: int,
+    tok_idx: int | None,
     camera: str,
     agg_fn,
     row_label_prefix: str = "",
@@ -61,7 +61,8 @@ def _build_trajectory_figure(
     """Build a (layers × frames) matplotlib figure.
 
     rows = selected layers, cols = selected frames.
-    agg_fn is applied to (8, 512) → (512,).
+    agg_fn is applied to (n_heads, 512) → (512,).
+    tok_idx=None means aggregate (mean) over all text tokens.
     """
     n_rows = len(layers)
     n_cols = len(frames)
@@ -100,7 +101,9 @@ def _build_trajectory_figure(
                 ax.text(0.5, 0.5, "N/A", ha="center", va="center",
                         transform=ax.transAxes, color="gray", fontsize=7)
             else:
-                attn_512 = agg_fn(t2i[:, tok_idx, :])  # (8,512) → (512,)
+                # tok_idx=None → mean over all text tokens before head aggregation
+                heads_512 = t2i.mean(axis=1) if tok_idx is None else t2i[:, tok_idx, :]
+                attn_512 = agg_fn(heads_512)  # (n_heads, 512) → (512,)
                 hmap = _attn_to_heatmap(attn_512, camera)
                 cell_img = _overlay(img, hmap)
                 ax.imshow(cell_img, aspect="equal")
@@ -310,6 +313,7 @@ def _render_action_benchmark(
                 g = gt_data[frame]
                 if p is None or g is None:
                     continue
+                p = p[: g.shape[0]]  # clip pred to GT length (pi0.5=15, GT=8)
                 # Mask NaN GT rows (near episode end)
                 valid = ~np.isnan(g).any(axis=1)
                 if not valid.any():
@@ -359,6 +363,7 @@ def _render_action_benchmark(
                     g_arr = gt_data[frame]
                     if p is None or g_arr is None:
                         continue
+                    p = p[: g_arr.shape[0]]  # clip pred to GT length
                     valid = ~np.isnan(g_arr).any(axis=1)
                     if valid.any():
                         err_matrix[:, fi] = np.sqrt(
@@ -529,28 +534,42 @@ def render(
     if meta.get("instruction"):
         st.caption(f"**Instruction:** {meta['instruction']}")
 
-    # Deduplicate labels (same logic as grid_heatmap)
-    raw_labels = [t.replace("▁", " ").strip() or f"[{i}]" for i, t in enumerate(real_texts)]
-    seen: dict[str, int] = {}
-    token_labels: list[str] = []
-    for lbl in raw_labels:
-        if raw_labels.count(lbl) > 1:
-            seen[lbl] = seen.get(lbl, 0) + 1
-            token_labels.append(f"{lbl}#{seen[lbl]}")
-        else:
-            token_labels.append(lbl)
-
-    selected_label = st.pills(
-        "Token (shared across all frames):",
-        options=token_labels,
-        default=token_labels[min(3, n_real - 1)],
-        selection_mode="single",
-        key="traj_tok",
+    tok_mode = st.radio(
+        "Token mode",
+        ["Single token", "All text tokens (mean)"],
+        horizontal=True,
+        key="traj_tok_mode",
     )
-    if selected_label is None:
-        st.info("Click a token to visualize its attention.")
-        return
-    tok_idx = token_labels.index(selected_label)
+
+    tok_idx: int | None
+    selected_label: str
+
+    if tok_mode == "All text tokens (mean)":
+        tok_idx = None
+        selected_label = "all tokens (mean)"
+    else:
+        # Deduplicate labels (same logic as grid_heatmap)
+        raw_labels = [t.replace("▁", " ").strip() or f"[{i}]" for i, t in enumerate(real_texts)]
+        seen: dict[str, int] = {}
+        token_labels: list[str] = []
+        for lbl in raw_labels:
+            if raw_labels.count(lbl) > 1:
+                seen[lbl] = seen.get(lbl, 0) + 1
+                token_labels.append(f"{lbl}#{seen[lbl]}")
+            else:
+                token_labels.append(lbl)
+
+        selected_label = st.pills(
+            "Token (shared across all frames):",
+            options=token_labels,
+            default=token_labels[min(3, n_real - 1)],
+            selection_mode="single",
+            key="traj_tok",
+        )
+        if selected_label is None:
+            st.info("Click a token to visualize its attention.")
+            return
+        tok_idx = token_labels.index(selected_label)
 
     # ── Frame thumbnail strip ─────────────────────────────────────────────────
     with st.expander("Frame thumbnails", expanded=True):
@@ -682,11 +701,14 @@ def render(
             else:
                 delta_t2i[(frame, cf_layer)] = None
 
-        # For delta, clamp tok_idx to available tokens
-        delta_tok = min(tok_idx, min(
-            (arr.shape[1] - 1 for arr in delta_t2i.values() if arr is not None),
-            default=tok_idx,
-        ))
+        # For delta, clamp tok_idx to available tokens (None = all tokens, pass through)
+        if tok_idx is None:
+            delta_tok = None
+        else:
+            delta_tok = min(tok_idx, min(
+                (arr.shape[1] - 1 for arr in delta_t2i.values() if arr is not None),
+                default=tok_idx,
+            ))
 
         for chunk_idx, chunk_start in enumerate(range(0, len(selected_frames), CHUNK_SIZE)):
             chunk = selected_frames[chunk_start : chunk_start + CHUNK_SIZE]
