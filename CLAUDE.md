@@ -95,6 +95,24 @@ ext_camera     wrist_camera  zero_padding text_tokens   action_tokens
    256              256          256         ~100            8
 ```
 
+`TEXT_START_IDX = 768` is the same for both π₀ and π₀.₅. What differs is the **content and length of the text tokens** (N - 768):
+
+#### π₀.₅ text format (state in discrete language tokens)
+`PaligemmaTokenizer.tokenize(prompt, state=state_array)` →
+```
+"Task: {instruction}, State: {s0} {s1} ... {s7};\nAction: "
+```
+~100 tokens (instruction + 8 discretized joint-state numbers + header)
+
+#### π₀ text format (state is a continuous suffix token, NOT in text)
+`PaligemmaTokenizer.tokenize(prompt, state=None)` →
+```
+"{instruction}\n"
+```
+~20–50 tokens (instruction only)
+
+**Impact on visualization**: Token labels (`token_texts` in `/meta`) must match the format the model actually used. The current viz code (`inference.py`, `attn_h5_writer.py`) generates labels using the π₀.₅ format even for π₀ checkpoints — this is a known bug. Always check `"pi05" in config_name` before choosing the tokenizer call.
+
 This layout is critical for all slicing/indexing in the visualization code.
 
 ### Dashboard Modes

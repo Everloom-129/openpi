@@ -132,6 +132,11 @@ def load_example(data_dir: Path, index: int, camera: str = "right") -> dict:
 
 # ── Core inference + H5 write ──────────────────────────────────────────────────
 
+def _is_pi05(policy) -> bool:
+    """Return True if the loaded policy uses the π₀.₅ architecture (state in text tokens)."""
+    return bool(getattr(getattr(policy, "_model", None), "pi05", True))
+
+
 def infer_and_save(
     policy,
     example: dict,
@@ -169,6 +174,7 @@ def infer_and_save(
         suffix_attn_buffer=suffix_buf or {},
         gt_action=example.get("gt_action"),
         pred_action=result.get("actions"),
+        is_pi05=_is_pi05(policy),
     )
     return result
 
@@ -234,10 +240,13 @@ def process_episode(
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Pi0.5 batch attention pipeline")
+    parser = argparse.ArgumentParser(description="Pi0/Pi0.5 batch attention pipeline")
     parser.add_argument("data_root",    help="Root dir with success/ and failure/ subdirs")
     parser.add_argument("results_root", help="Output root directory")
     parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
+    parser.add_argument("--model", default=None,
+                        help="Training config name, e.g. 'pi0_droid' or 'pi05_droid'. "
+                             "If omitted, inferred from checkpoint directory name.")
     parser.add_argument("--cf-config",  default=DEFAULT_CF_CONFIG,
                         help="Path to counterfactual YAML config")
     parser.add_argument("--no-counterfactual", dest="counterfactual",
@@ -260,7 +269,7 @@ def main(argv: list[str] | None = None) -> None:
     device_id = select_best_gpu()
     device = f"cuda:{device_id}"
     print(f"Loading policy from {args.checkpoint} on {device} ...")
-    policy = get_policy(args.checkpoint, device=device)
+    policy = get_policy(args.checkpoint, device=device, config_name=args.model)
     print("Policy loaded.\n")
 
     total_episodes = processed = skipped = errors = 0

@@ -22,9 +22,9 @@ from h1_1_object_detection import (
     generate_summary_plot,
     run_object_detection,
 )
+from openpi.models_pytorch import gemma_pytorch as _gpt
 from openpi.shared import image_tools
 from attn_pipeline import copy_instruction, get_video_length, load_toy_example, timer
-from attn_map import select_best_gpu
 
 
 # ============================================================================
@@ -99,33 +99,29 @@ def get_white_list_frames(data_dir: Path) -> list[int]:
         return []
 
 
-def extract_attention_map_from_policy(policy, example, layer: int, camera: str = "wrist"):
+def extract_attention_map_from_buffer(attn_buffer: dict, layer: int, camera: str = "wrist"):
     """
-    Extract attention map for a specific layer and camera after inference.
+    Extract attention map for a specific layer and camera from the in-RAM buffer.
 
     Args:
-        policy: Trained policy
-        example: Input example (already processed by policy.infer)
+        attn_buffer: dict[layer_idx, ndarray(1, n_heads, seq, seq)] from _gpt.get_attn_buffer()
         layer: Layer index
         camera: 'wrist' or 'exterior'
 
     Returns:
         Attention map (16x16) or None if not found
     """
-    # Load attention map (should already exist from policy.infer call)
-    device_id = str(select_best_gpu())
-    attn_path = Path(f"attn/{device_id}/layers_prefix") / f"attn_map_layer_{layer}.npy"
-    if not attn_path.exists():
+    if layer not in attn_buffer:
         return None
 
-    attn_map = np.load(attn_path)  # [Batch, Heads, Seq, Seq]
+    attn_data = attn_buffer[layer]  # [1, Heads, Seq, Seq]
 
     # Process attention
-    if attn_map.ndim == 4:
-        attn_map = attn_map[0]  # Remove batch: [Heads, Seq, Seq]
+    if attn_data.ndim == 4:
+        attn_data = attn_data[0]  # Remove batch: [Heads, Seq, Seq]
 
     # Average across heads
-    attn_avg = attn_map.mean(axis=0) if attn_map.ndim == 3 else attn_map
+    attn_avg = attn_data.mean(axis=0) if attn_data.ndim == 3 else attn_data
 
     # Extract text->image attention
     num_img = 256
@@ -371,14 +367,17 @@ def run_counterfactual_analysis(
             example = example_base.copy()
             example["prompt"] = prompt_text
 
-            # Run inference
-            _ = policy.infer(example)
+            # Run inference with buffer capture
+            _gpt.enable_attn_buffer()
+            try:
+                _ = policy.infer(example)
+                buf = _gpt.get_attn_buffer()
+                attn = extract_attention_map_from_buffer(buf, layer, camera=camera)
+            finally:
+                _gpt.clear_attn_buffer()
 
-            # Extract attention
-            attn_map = extract_attention_map_from_policy(policy, example, layer, camera=camera)
-
-            if attn_map is not None:
-                attention_maps[prompt_key] = attn_map
+            if attn is not None:
+                attention_maps[prompt_key] = attn
 
         if not attention_maps:
             continue
@@ -1554,21 +1553,27 @@ def main():
                         # OBJECT DETECTION ANALYSIS
                         # ============================================================
                         if ENABLE_OBJECT_DETECTION:
-                            # Run inference to generate attention maps
+                            # Run inference with buffer capture
                             print(f"    Running inference (object detection)...")
-                            _ = policy.infer(example)
+                            _gpt.enable_attn_buffer()
+                            try:
+                                _ = policy.infer(example)
+                                attn_buffer = _gpt.get_attn_buffer()
 
-                            # Run object detection analysis
-                            print(f"    Analyzing attention-object correlation...")
-                            frame_results = run_object_detection(
-                                policy,
-                                example,
-                                frame_idx,
-                                str(data_dir),
-                                episode_dir,
-                                layers=LAYERS,
-                                camera=CAMERA,
-                            )
+                                # Run object detection analysis
+                                print(f"    Analyzing attention-object correlation...")
+                                frame_results = run_object_detection(
+                                    policy,
+                                    example,
+                                    frame_idx,
+                                    str(data_dir),
+                                    episode_dir,
+                                    attn_buffer=attn_buffer,
+                                    layers=LAYERS,
+                                    camera=CAMERA,
+                                )
+                            finally:
+                                _gpt.clear_attn_buffer()
 
                             if frame_results:
                                 all_results[frame_idx] = frame_results

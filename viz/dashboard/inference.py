@@ -97,23 +97,26 @@ def run_inference(policy, example: dict) -> dict:
     n_text = seq_len - TEXT_START_IDX
 
     # ── Tokenize instruction for token labels ────────────────────────────────
+    # Run the policy's own input transform pipeline (which includes quantile
+    # normalization + prompt cleaning + discretization) on a shallow copy so we
+    # get the *exact* token IDs the model saw, then decode them to text pieces.
     token_texts: list[str] = [f"tok_{i}" for i in range(n_text)]
+    n_text_actual = n_text
     try:
         from openpi.models.tokenizer import PaligemmaTokenizer
+        # Shallow-copy the dict so TokenizePrompt's pop("prompt") doesn't clobber the original.
+        inputs_copy = {**example}
+        transformed = policy._input_transform(inputs_copy)
+        token_ids = np.asarray(transformed["tokenized_prompt"])
+        token_mask_arr = np.asarray(transformed["tokenized_prompt_mask"])
+        n_real = int(token_mask_arr.sum())
+        real_ids = token_ids[:n_real].tolist()
         tokenizer = PaligemmaTokenizer()
-        joint_pos = example.get("observation/joint_position", np.zeros(7))
-        gripper_pos = np.atleast_1d(example.get("observation/gripper_position", np.zeros(1)))
-        state = np.concatenate([np.atleast_1d(joint_pos), gripper_pos])
-        instruction = example.get("prompt", "").strip()
-        disc = np.digitize(state, bins=np.linspace(-1, 1, 257)[:-1]) - 1
-        state_str = " ".join(map(str, disc))
-        full_prompt = f"Task: {instruction}, State: {state_str};\nAction: "
-        ids = tokenizer._tokenizer.encode(full_prompt, add_bos=True)
-        token_texts = [tokenizer._tokenizer.id_to_piece(i) for i in ids]
+        token_texts = [tokenizer._tokenizer.id_to_piece(i) for i in real_ids]
+        n_text_actual = min(n_text, len(token_texts))
     except Exception as e:
         st.warning(f"Tokenizer failed: {e}. Using generic token labels.")
-
-    n_text_actual = min(n_text, len(token_texts))
+        n_text_actual = min(n_text, len(token_texts))
 
     # ── Resize images to 224×224 ─────────────────────────────────────────────
     def _to_224(img: np.ndarray | None) -> np.ndarray | None:

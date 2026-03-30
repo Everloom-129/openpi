@@ -17,11 +17,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
 
+from openpi.models_pytorch import gemma_pytorch as _gpt
 from openpi.policies import policy_config as _policy_config
 from openpi.shared import image_tools
 from openpi.training import config as _config
-
-from attn_map import select_best_gpu
 
 
 def load_pineapple_example(camera: str = "left", index: int = 0):
@@ -238,11 +237,17 @@ def run_object_detection(
     frame_idx: int,
     data_dir: str,
     episode_dir: Path,
+    attn_buffer: dict,
     layers: list[int] | None = None,
     camera: str = "left",
 ):
     """
     Runs the object detection correlation analysis for specified layers on a single frame.
+
+    Args:
+        attn_buffer: In-RAM attention buffer from _gpt.get_attn_buffer().
+                     dict[layer_idx, ndarray(1, n_heads, seq, seq)]
+
     Returns:
         Dictionary with results for each layer
     """
@@ -264,22 +269,14 @@ def run_object_detection(
     frame_dir = episode_dir / "object" / f"{frame_idx:05d}"
     frame_dir.mkdir(parents=True, exist_ok=True)
 
-    attn_mode = "prefix"
-    device_id = str(select_best_gpu())
-    attn_base = Path(f"attn/{device_id}/layers_{attn_mode}")
-    if not str(attn_base).endswith(f"layers_{attn_mode}"):
-        attn_base = attn_base / f"layers_{attn_mode}"
-
     for layer_idx in layers:
         print(f"  Processing Layer {layer_idx}...")
 
-        attn_path = attn_base / f"attn_map_layer_{layer_idx}.npy"
-
-        if not attn_path.exists():
-            print(f"    Warning: Attention map not found for Layer {layer_idx} at {attn_path}. Skipping.")
+        if layer_idx not in attn_buffer:
+            print(f"    Warning: Layer {layer_idx} not found in attention buffer. Skipping.")
             continue
 
-        attn_map = np.load(attn_path)  # [Batch, Heads, Seq, Seq]
+        attn_map = attn_buffer[layer_idx]  # [1, Heads, Seq, Seq]
 
         # Process attention: average across heads, then extract text->image attention
         if attn_map.ndim == 4:
@@ -586,13 +583,19 @@ def main():
                 )
 
             print("Running Inference to generate attention maps...")
-            _ = policy.infer(example)
+            _gpt.enable_attn_buffer()
+            try:
+                _ = policy.infer(example)
+                attn_buffer = _gpt.get_attn_buffer()
 
-            # Analyze object detection correlation
-            print("Analyzing attention-object correlation...")
-            frame_results = run_object_detection(
-                policy, example, frame_idx, str(data_dir), episode_dir, layers=layers_to_test, camera=camera
-            )
+                # Analyze object detection correlation
+                print("Analyzing attention-object correlation...")
+                frame_results = run_object_detection(
+                    policy, example, frame_idx, str(data_dir), episode_dir,
+                    attn_buffer=attn_buffer, layers=layers_to_test, camera=camera
+                )
+            finally:
+                _gpt.clear_attn_buffer()
 
             all_results[frame_idx] = frame_results
 
