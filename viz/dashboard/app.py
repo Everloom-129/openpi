@@ -90,7 +90,7 @@ with st.sidebar:
     st.title("🧠 Pi0.5 Attention")
     st.markdown("---")
 
-    mode = st.radio("Mode", ["Offline (HDF5)", "Results (Benchmark)", "Online (Inference)", "Online (Dataset)", "Compare (Online)"], index=0)
+    mode = st.radio("Mode", ["Offline (HDF5)", "Results (Benchmark)", "Online (Inference)", "Online (Upload)", "Online (Dataset)", "Compare (Online)"], index=0)
 
     if mode == "Offline (HDF5)":
         checkpoints = _loader.list_checkpoints(ATTN_H5_ROOT)
@@ -196,61 +196,33 @@ with st.sidebar:
         online_ckpt_path = os.path.join(CHECKPOINT_ROOT, online_ckpt)
 
         st.markdown("**Input**")
-        input_source = st.radio(
-            "Source", ["Episode", "Upload Image"], horizontal=True, key="online_input_source",
+        _EXAMPLE_DIR = os.path.join(_PROJECT_ROOT, "data/example")
+
+        # List all episode subdirectories under data/example/
+        _example_episodes = sorted(
+            d for d in os.listdir(_EXAMPLE_DIR)
+            if os.path.isdir(os.path.join(_EXAMPLE_DIR, d))
+        ) if os.path.isdir(_EXAMPLE_DIR) else []
+
+        online_episode = st.selectbox("Episode", _example_episodes or ["(none)"], key="online_episode")
+        online_camera = st.radio(
+            "Ext camera", ["right", "left"], horizontal=True, key="online_camera"
         )
 
-        if input_source == "Upload Image":
-            uploaded_exterior = st.file_uploader(
-                "Exterior camera image", type=["jpg", "jpeg", "png"], key="upload_ext",
-            )
-            uploaded_wrist = st.file_uploader(
-                "Wrist camera image (optional)", type=["jpg", "jpeg", "png"], key="upload_wrist",
-            )
-            instruction_text = st.text_input("Instruction", key="online_instruction_upload")
+        # Auto-detect episode structure and metadata
+        _ep_dir = os.path.join(_EXAMPLE_DIR, online_episode)
+        _has_recordings = os.path.isdir(os.path.join(_ep_dir, "recordings", "frames"))
+        _frames_root = os.path.join(_ep_dir, "recordings", "frames") if _has_recordings else os.path.join(_ep_dir, "frames")
+        _hand_dir = os.path.join(_frames_root, "hand_camera")
+        _n_frames = len([f for f in os.listdir(_hand_dir) if f.endswith(".jpg")]) if os.path.isdir(_hand_dir) else 1
+        _max_frame = max(0, _n_frames - 1)
+        _instr_path = os.path.join(_ep_dir, "instruction.txt")
+        _default_instr = open(_instr_path).read().strip() if os.path.exists(_instr_path) else ""
 
-            # Show previews
-            if uploaded_exterior:
-                st.image(uploaded_exterior, caption="Exterior", width=200)
-            if uploaded_wrist:
-                st.image(uploaded_wrist, caption="Wrist", width=200)
-
-            # Placeholders for episode-only variables
-            online_camera = "right"
-            online_frame = 0
-            _ep_dir = None
-            _has_recordings = False
-        else:
-            uploaded_exterior = None
-            uploaded_wrist = None
-
-            _EXAMPLE_DIR = os.path.join(_PROJECT_ROOT, "data/example")
-
-            # List all episode subdirectories under data/example/
-            _example_episodes = sorted(
-                d for d in os.listdir(_EXAMPLE_DIR)
-                if os.path.isdir(os.path.join(_EXAMPLE_DIR, d))
-            ) if os.path.isdir(_EXAMPLE_DIR) else []
-
-            online_episode = st.selectbox("Episode", _example_episodes or ["(none)"], key="online_episode")
-            online_camera = st.radio(
-                "Ext camera", ["right", "left"], horizontal=True, key="online_camera"
-            )
-
-            # Auto-detect episode structure and metadata
-            _ep_dir = os.path.join(_EXAMPLE_DIR, online_episode)
-            _has_recordings = os.path.isdir(os.path.join(_ep_dir, "recordings", "frames"))
-            _frames_root = os.path.join(_ep_dir, "recordings", "frames") if _has_recordings else os.path.join(_ep_dir, "frames")
-            _hand_dir = os.path.join(_frames_root, "hand_camera")
-            _n_frames = len([f for f in os.listdir(_hand_dir) if f.endswith(".jpg")]) if os.path.isdir(_hand_dir) else 1
-            _max_frame = max(0, _n_frames - 1)
-            _instr_path = os.path.join(_ep_dir, "instruction.txt")
-            _default_instr = open(_instr_path).read().strip() if os.path.exists(_instr_path) else ""
-
-            instruction_text = st.text_input(
-                "Instruction", value=_default_instr, key="online_instruction",
-            )
-            online_frame = st.slider("Frame", 0, _max_frame, 0, key="online_frame")
+        instruction_text = st.text_input(
+            "Instruction", value=_default_instr, key="online_instruction",
+        )
+        online_frame = st.slider("Frame", 0, _max_frame, 0, key="online_frame")
 
         def _available_gpu_devices() -> list[str]:
             try:
@@ -271,26 +243,7 @@ with st.sidebar:
                 import sys as _sys
                 _sys.path.insert(0, os.path.join(_PROJECT_ROOT, "viz"))
                 from pathlib import Path as _Path
-                from PIL import Image as _PILImage
-
-                if input_source == "Upload Image":
-                    if not uploaded_exterior:
-                        st.error("Please upload at least an exterior camera image.")
-                        st.stop()
-                    ext_img = np.array(_PILImage.open(uploaded_exterior).convert("RGB"))
-                    if uploaded_wrist:
-                        wrist_img = np.array(_PILImage.open(uploaded_wrist).convert("RGB"))
-                    else:
-                        # Use a black placeholder if no wrist image provided
-                        wrist_img = np.zeros_like(ext_img)
-                    example = {
-                        "observation/exterior_image_1_left": ext_img,
-                        "observation/wrist_image_left": wrist_img,
-                        "observation/joint_position": np.zeros(7, dtype=np.float64),
-                        "observation/gripper_position": np.zeros(1, dtype=np.float64),
-                        "prompt": instruction_text,
-                    }
-                elif _has_recordings:
+                if _has_recordings:
                     # DROID format: recordings/frames/{camera}/
                     from pipeline import load_example as _load_example
                     example = _load_example(
@@ -298,12 +251,11 @@ with st.sidebar:
                         index=online_frame,
                         camera=online_camera,
                     )
-                    example["prompt"] = instruction_text
                 else:
                     # Duck format: frames/{camera}/ directly
                     from attn_map import load_duck_example
                     example = load_duck_example(camera=online_camera, index=online_frame)
-                    example["prompt"] = instruction_text
+                example["prompt"] = instruction_text
                 try:
                     if gpu_device_sel == "Auto":
                         from attn_map import select_best_gpu as _sbg
@@ -317,6 +269,97 @@ with st.sidebar:
                     st.success("Inference complete!")
                 except Exception as e:
                     st.error(f"Inference failed: {e}")
+
+    elif mode == "Online (Upload)":
+        # ── Online (Upload) mode sidebar ──────────────────────────────────────
+        from viz.dashboard import inference as _inf
+
+        _upl_checkpoints = _inf.list_online_checkpoints(CHECKPOINT_ROOT)
+        if not _upl_checkpoints:
+            st.warning(f"No checkpoints found in `{CHECKPOINT_ROOT}`.")
+
+        upl_ckpt = st.selectbox(
+            "Checkpoint",
+            _upl_checkpoints or ["pi05_droid_pytorch"],
+            key="upl_ckpt",
+        )
+        upl_ckpt_path = os.path.join(CHECKPOINT_ROOT, upl_ckpt)
+
+        st.markdown("**Upload Images**")
+        uploaded_exterior = st.file_uploader(
+            "Exterior camera image", type=["jpg", "jpeg", "png"], key="upload_ext",
+        )
+        uploaded_wrist = st.file_uploader(
+            "Wrist camera image (optional)", type=["jpg", "jpeg", "png"], key="upload_wrist",
+        )
+
+        # Show previews
+        if uploaded_exterior:
+            st.image(uploaded_exterior, caption="Exterior", width=200)
+        if uploaded_wrist:
+            st.image(uploaded_wrist, caption="Wrist", width=200)
+
+        upl_instruction = st.text_input("Instruction", key="upl_instruction")
+
+        # Editable robot state (reviewer feedback: zeros may not be ideal)
+        with st.expander("Robot state (advanced)", expanded=False):
+            st.caption("Joint positions (7-DoF, radians). Defaults to zeros (neutral).")
+            _jp_cols = st.columns(7)
+            upl_joint_pos = np.array([
+                _jp_cols[i].number_input(f"j{i}", value=0.0, format="%.3f", key=f"upl_jp_{i}")
+                for i in range(7)
+            ], dtype=np.float64)
+            upl_gripper = st.number_input(
+                "Gripper position (0=open, 1=closed)", value=0.0,
+                min_value=0.0, max_value=1.0, step=0.1, key="upl_gripper",
+            )
+
+        def _upl_gpu_devices() -> list[str]:
+            try:
+                import pynvml
+                pynvml.nvmlInit()
+                n = pynvml.nvmlDeviceGetCount()
+                pynvml.nvmlShutdown()
+                return ["Auto"] + [f"cuda:{i}" for i in range(n)] + ["cpu"]
+            except Exception:
+                return ["Auto", "cpu"]
+
+        upl_gpu_sel = st.selectbox("GPU device", _upl_gpu_devices(), key="upl_gpu")
+
+        upl_run_btn = st.button("▶ Run Inference", type="primary", key="upl_run")
+
+        if upl_run_btn:
+            if not uploaded_exterior:
+                st.error("Please upload at least an exterior camera image.")
+            else:
+                with st.spinner("Loading model and running inference…"):
+                    from PIL import Image as _PILImage
+
+                    ext_img = np.array(_PILImage.open(uploaded_exterior).convert("RGB"))
+                    if uploaded_wrist:
+                        wrist_img = np.array(_PILImage.open(uploaded_wrist).convert("RGB"))
+                    else:
+                        wrist_img = np.zeros_like(ext_img)
+                    example = {
+                        "observation/exterior_image_1_left": ext_img,
+                        "observation/wrist_image_left": wrist_img,
+                        "observation/joint_position": upl_joint_pos,
+                        "observation/gripper_position": np.array([upl_gripper], dtype=np.float64),
+                        "prompt": upl_instruction,
+                    }
+                    try:
+                        if upl_gpu_sel == "Auto":
+                            from attn_map import select_best_gpu as _sbg
+                            _dev_id = _sbg()
+                            gpu_device = f"cuda:{_dev_id}" if isinstance(_dev_id, int) else str(_dev_id)
+                        else:
+                            gpu_device = upl_gpu_sel
+                        policy = _inf.load_model(upl_ckpt_path, device=gpu_device)
+                        slice_dict = _inf.run_inference(policy, example)
+                        st.session_state["upload_data"] = slice_dict
+                        st.success("Inference complete!")
+                    except Exception as e:
+                        st.error(f"Inference failed: {e}")
 
     elif mode == "Online (Dataset)":
         # ── Online (Dataset) mode sidebar ─────────────────────────────────────
@@ -661,6 +704,50 @@ elif mode == "Online (Inference)":
             st.success(f"Saved to `{_h5_save_path}`")
         except Exception as _e:
             st.error(f"Save failed: {_e}")
+
+    tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "🔲 Grid Heatmap",
+        "🖼 Image Heatmap",
+        "📊 Attention Matrix",
+        "🤖 Action View",
+        "🔀 Counterfactual",
+        "🧩 Occlusion Saliency",
+        "📐 Language Grounding (CAG)",
+    ])
+
+    with tab0:
+        grid_heatmap.render(data, available_layers)
+    with tab1:
+        image_heatmap.render(data, available_layers)
+    with tab2:
+        attn_matrix.render(data, available_layers)
+    with tab3:
+        action_view.render(data, available_layers)
+    with tab4:
+        counterfactual.render(
+            attn_h5_root=ATTN_H5_ROOT,
+            checkpoints=_loader.list_checkpoints(ATTN_H5_ROOT),
+            default_checkpoint="",
+        )
+    with tab5:
+        image_saliency.render()
+    with tab6:
+        cag_view.render()
+
+elif mode == "Online (Upload)":
+    # ── Online (Upload) mode ──────────────────────────────────────────────────
+    st.header("Online (Upload) — Drag & Drop Images")
+
+    if "upload_data" not in st.session_state:
+        st.info("Upload images in the sidebar and click **▶ Run Inference** to begin.")
+        st.stop()
+
+    data = st.session_state["upload_data"]
+    available_layers = sorted(
+        int(k.split("_")[1])
+        for k in data.get("prefix", {})
+        if k.startswith("layer_")
+    )
 
     tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "🔲 Grid Heatmap",
