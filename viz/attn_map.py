@@ -400,8 +400,56 @@ def get_keyframes(total_frames: int, horizon: int) -> list[int]:
     return list(range(0, total_frames, horizon))
 
 
-def get_policy(checkpoint_dir: str, device: str = "cuda:0"):
-    config = _config.get_config("pi05_droid")
+# TODO refactor this
+def infer_config_name(checkpoint_dir: str) -> str:
+    """Infer the training config name from the checkpoint directory name.
+
+    Resolution order:
+    1. Strip a trailing ``_pytorch`` suffix (added by the conversion scripts).
+    2. Try the resulting string as-is against the registered configs.
+    3. If not found, progressively drop trailing ``_<word>`` segments and retry
+       (handles custom names like ``pi0_aloha_towel_lora_v2`` → ``pi0_aloha_towel``).
+    4. If still not found, fall back to the canonical DROID config for the detected
+       model family (``pi05_droid`` or ``pi0_droid``).
+
+    Examples
+    --------
+    ``pi05_droid_pytorch``        → ``pi05_droid``
+    ``pi0_aloha_towel_pytorch``   → ``pi0_aloha_towel``
+    ``pi05_libero_pytorch``       → ``pi05_libero``
+    ``pi0_droid_lora_pytorch``    → ``pi0_droid``  (lora suffix stripped)
+    ``my_custom_ckpt``            → ``pi05_droid``  (unknown → default)
+    """
+    raw = os.path.basename(os.path.normpath(checkpoint_dir))
+
+    # Strip _pytorch suffix
+    candidate = raw[: -len("_pytorch")] if raw.endswith("_pytorch") else raw
+
+    # Try progressively shorter names by stripping trailing _<word> segments
+    while candidate:
+        try:
+            _config.get_config(candidate)  # raises ValueError if unknown
+            return candidate
+        except (ValueError, KeyError):
+            pass
+        # Drop the last underscore-delimited segment
+        idx = candidate.rfind("_")
+        if idx == -1:
+            break
+        candidate = candidate[:idx]
+
+    # Last resort: choose the DROID config for the right model family
+    name_lower = raw.lower()
+    if "pi05" in name_lower:
+        return "pi05_droid"
+    return "pi0_droid"
+
+
+def get_policy(checkpoint_dir: str, device: str = "cuda:0", config_name: str | None = None):
+    if config_name is None:
+        config_name = infer_config_name(checkpoint_dir)
+    print(f"[policy] Using config '{config_name}' for checkpoint '{checkpoint_dir}'")
+    config = _config.get_config(config_name)
     policy = _policy_config.create_trained_policy(config, checkpoint_dir, pytorch_device=device)
     return policy
 
@@ -460,14 +508,13 @@ def select_best_gpu():
 
 
 if __name__ == "__main__":
-    config = _config.get_config("pi05_droid")
     checkpoint_dir = "./checkpoints/viz/pi05_droid_pytorch"
 
     # Auto-select GPU with most free memory
     device_id = select_best_gpu()
     device = f"cuda:{device_id}"
 
-    policy = _policy_config.create_trained_policy(config, checkpoint_dir, pytorch_device=device)
+    policy = get_policy(checkpoint_dir, device=device)
     print(f"Policy loaded on device: {device}")
 
     camera = "left"

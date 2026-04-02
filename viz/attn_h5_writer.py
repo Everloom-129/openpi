@@ -61,9 +61,11 @@ def _resize_224(img: np.ndarray) -> np.ndarray:
     return np.array(pil.resize((224, 224), Image.BILINEAR), dtype=np.uint8)
 
 
-def _tokenize_instruction(instruction: str) -> tuple[list[int], list[str]]:
-    """Tokenize *instruction* with a zeroed state for token-label metadata.
+def _tokenize_instruction(instruction: str, is_pi05: bool = True) -> tuple[list[int], list[str]]:
+    """Tokenize *instruction* for token-label metadata.
 
+    For pi0.5 (is_pi05=True): uses "Task: ..., State: ...;\\nAction: " format with zeroed state.
+    For pi0   (is_pi05=False): uses plain instruction + "\\n" (state is a continuous suffix token).
     Falls back to placeholder labels if the tokenizer is unavailable.
     """
     try:
@@ -74,11 +76,16 @@ def _tokenize_instruction(instruction: str) -> tuple[list[int], list[str]]:
         from openpi.models.tokenizer import PaligemmaTokenizer
 
         tokenizer = PaligemmaTokenizer()
-        state = np.zeros(8)
-        disc = np.digitize(state, bins=np.linspace(-1, 1, 257)[:-1]) - 1
-        state_str = " ".join(map(str, disc))
-        full_prompt = f"Task: {instruction}, State: {state_str};\nAction: "
-        ids = tokenizer._tokenizer.encode(full_prompt, add_bos=True)
+        if is_pi05:
+            state = np.zeros(8)
+            disc = np.digitize(state, bins=np.linspace(-1, 1, 257)[:-1]) - 1
+            state_str = " ".join(map(str, disc))
+            full_prompt = f"Task: {instruction}, State: {state_str};\nAction: "
+            ids = tokenizer._tokenizer.encode(full_prompt, add_bos=True)
+        else:
+            # pi0: instruction only; state is injected as a continuous suffix token
+            cleaned = instruction.strip().replace("_", " ").replace("\n", " ")
+            ids = tokenizer._tokenizer.encode(cleaned, add_bos=True) + tokenizer._tokenizer.encode("\n")
         texts = [tokenizer._tokenizer.id_to_piece(i) for i in ids]
         return ids, texts
     except Exception:
@@ -95,6 +102,7 @@ def _write_h5_core(
     suffix_arrays: dict[int, np.ndarray] | None = None,
     gt_action: np.ndarray | None = None,
     pred_action: np.ndarray | None = None,
+    is_pi05: bool = True,
 ) -> bool:
     """Write a single HDF5 from an in-memory layer dict.
 
@@ -111,7 +119,7 @@ def _write_h5_core(
     n_text = seq_len - TEXT_START_IDX
 
     # Tokenize
-    token_ids, token_texts = _tokenize_instruction(instruction)
+    token_ids, token_texts = _tokenize_instruction(instruction, is_pi05=is_pi05)
     if not token_texts:
         token_texts = [f"tok_{i}" for i in range(n_text)]
         token_ids = list(range(n_text))
@@ -240,6 +248,7 @@ def write_attn_h5_from_buffer(
     suffix_attn_buffer: dict[int, np.ndarray] | None = None,
     gt_action: np.ndarray | None = None,
     pred_action: np.ndarray | None = None,
+    is_pi05: bool = True,
 ) -> bool:
     """Write HDF5 directly from in-RAM attention buffers (primary API).
 
@@ -250,12 +259,15 @@ def write_attn_h5_from_buffer(
     trajectory.h5; writes ``/gt_action``. Pass None to omit.
     *pred_action* is the ``result["actions"]`` array from ``policy.infer()``; writes
     ``/pred_action``. Pass None to omit.
+    *is_pi05* controls which tokenization format is used for token label metadata:
+    True (default) for π₀.₅ ("Task: ..., State: ...;\\nAction: "), False for π₀ (instruction only).
     """
     return _write_h5_core(
         attn_buffer, Path(h5_path), ext_img, wrist_img, instruction, frame_idx,
         suffix_arrays=suffix_attn_buffer or {},
         gt_action=gt_action,
         pred_action=pred_action,
+        is_pi05=is_pi05,
     )
 
 

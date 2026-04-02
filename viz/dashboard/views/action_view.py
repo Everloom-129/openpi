@@ -162,11 +162,18 @@ def render(
 
 def _render_pred_gt_benchmark(data: dict) -> None:
     """Render Predicted vs Ground-Truth action benchmark for a single frame."""
-    pred = data.get("pred_action")   # (8, 8) float32 or None
+    pred = data.get("pred_action")   # (N, 8) float32 or None — N may exceed 8
     gt   = data.get("gt_action")     # (8, 8) float32, NaN-padded, or None
 
     if pred is None and gt is None:
         return
+
+    # Model action chunks can be longer than OPEN_LOOP_HORIZON (e.g. pi0.5=15, pi0=10).
+    # Clip both to 8 steps for display.
+    if pred is not None:
+        pred = pred[:8]
+    if gt is not None:
+        gt = gt[:8]
 
     with st.expander("Action Benchmark — Pred vs GT", expanded=True):
         st.caption(

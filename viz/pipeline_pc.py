@@ -239,7 +239,8 @@ def main(argv: list[str] | None = None) -> None:
     device = f"cuda:{device_id}"
     print(f"Loading one policy instance on {device} ...")
     policy = get_policy(args.checkpoint, device=device)
-    print("Policy loaded.\n")
+    is_pi05 = bool(getattr(getattr(policy, "_model", None), "pi05", True))
+    print(f"Policy loaded (pi05={is_pi05}).\n")
 
     infer_q: queue.Queue[InferTask | None] = queue.Queue(maxsize=args.infer_queue_size)
     write_q: queue.Queue[WriteTask | None] = queue.Queue(maxsize=args.write_queue_size)
@@ -346,6 +347,7 @@ def main(argv: list[str] | None = None) -> None:
                     wrist_img=task.example["observation/wrist_image_left"],
                     instruction=task.prompt,
                     frame_idx=task.frame_idx,
+                    is_pi05=is_pi05,
                 )
                 with lock:
                     if ok:

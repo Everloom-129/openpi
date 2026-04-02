@@ -182,16 +182,21 @@ def _run_one_prompt(
     seq_len = int(first.shape[-1])
     n_text = seq_len - TEXT_START_IDX
 
+    is_pi05 = bool(getattr(getattr(policy, "_model", None), "pi05", True))
+
     token_texts = [f"tok_{i}" for i in range(n_text)]
     try:
         from openpi.models.tokenizer import PaligemmaTokenizer
         tokenizer = PaligemmaTokenizer()
-        state = np.concatenate([joint_pos, gripper_pos])
         instr = prompt.strip().replace("_", " ").replace("\n", " ")
-        discretized = np.digitize(state, bins=np.linspace(-1, 1, 257)[:-1]) - 1
-        state_str = " ".join(map(str, discretized))
-        full_prompt = f"Task: {instr}, State: {state_str};\nAction: "
-        token_ids = tokenizer._tokenizer.encode(full_prompt, add_bos=True)
+        if is_pi05:
+            state = np.concatenate([joint_pos, gripper_pos])
+            discretized = np.digitize(state, bins=np.linspace(-1, 1, 257)[:-1]) - 1
+            state_str = " ".join(map(str, discretized))
+            full_prompt = f"Task: {instr}, State: {state_str};\nAction: "
+            token_ids = tokenizer._tokenizer.encode(full_prompt, add_bos=True)
+        else:
+            token_ids = tokenizer._tokenizer.encode(instr, add_bos=True) + tokenizer._tokenizer.encode("\n")
         token_texts = [tokenizer._tokenizer.id_to_piece(i) for i in token_ids]
     except Exception:
         pass
@@ -227,7 +232,8 @@ def _run_one_prompt(
             "wrist":    _to_224(wrist_img),
         },
         "prefix": prefix,
-        "_attn_buffer": buf,  # kept for _save_cf_h5
+        "_attn_buffer": buf,   # kept for _save_cf_h5
+        "_is_pi05": is_pi05,   # kept for _save_cf_h5
     }
 
 
@@ -246,6 +252,7 @@ def _save_cf_h5(
     buf = slice_dict.get("_attn_buffer", {})
     images = slice_dict.get("images", {})
     instruction = slice_dict.get("meta", {}).get("instruction", "")
+    is_pi05 = slice_dict.get("_is_pi05", True)
     dst = _loader.h5_path_cf(checkpoint_id, episode_id, frame_idx, prompt_slug, attn_h5_root)
 
     write_attn_h5_from_buffer(
@@ -255,6 +262,7 @@ def _save_cf_h5(
         wrist_img=images.get("wrist"),
         instruction=instruction,
         frame_idx=frame_idx,
+        is_pi05=is_pi05,
     )
     return dst
 

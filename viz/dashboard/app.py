@@ -23,7 +23,7 @@ for _p in [_PROJECT_ROOT, os.path.join(_PROJECT_ROOT, "src")]:
 
 from viz.dashboard import loader as _loader
 from viz.dashboard import loader_results as _rl
-from viz.dashboard.views import action_view, attn_matrix, cag_view, ckpt_compare, comparison, counterfactual, grid_heatmap, image_heatmap, image_saliency, trajectory
+from viz.dashboard.views import action_view, attn_matrix, cag_view, ckpt_compare, comparison, counterfactual, dataset_browser, grid_heatmap, image_heatmap, image_saliency, trajectory
 
 
 def _save_online_h5(slice_dict: dict, h5_path: str) -> None:
@@ -90,7 +90,7 @@ with st.sidebar:
     st.title("🧠 Pi0.5 Attention")
     st.markdown("---")
 
-    mode = st.radio("Mode", ["Offline (HDF5)", "Results (Benchmark)", "Online (Inference)", "Compare (Online)"], index=0)
+    mode = st.radio("Mode", ["Offline (HDF5)", "Results (Benchmark)", "Online (Inference)", "Online (Dataset)", "Compare (Online)"], index=0)
 
     if mode == "Offline (HDF5)":
         checkpoints = _loader.list_checkpoints(ATTN_H5_ROOT)
@@ -118,8 +118,28 @@ with st.sidebar:
         st.caption(f"HDF5 root: `{ATTN_H5_ROOT}`")
 
     elif mode == "Results (Benchmark)":
-        res_camera = st.radio("Camera", ["right", "left"], horizontal=True, key="res_camera")
-        _res_root = os.path.join(RESULTS_ROOT, res_camera)
+        # Dataset selector: scan sibling dirs of RESULTS_ROOT for those with left/ or right/
+        _res_parent = os.path.dirname(RESULTS_ROOT)
+        _default_ds = os.path.basename(RESULTS_ROOT)
+        _available_ds = []
+        if os.path.isdir(_res_parent):
+            for _d in sorted(os.listdir(_res_parent)):
+                _dp = os.path.join(_res_parent, _d)
+                if os.path.isdir(_dp) and any(
+                    os.path.isdir(os.path.join(_dp, c)) for c in ("left", "right")
+                ):
+                    _available_ds.append(_d)
+        _ds_idx = _available_ds.index(_default_ds) if _default_ds in _available_ds else 0
+        res_dataset = st.selectbox("Dataset", _available_ds or [_default_ds], index=_ds_idx, key="res_dataset")
+        _effective_res_root = os.path.join(_res_parent, res_dataset)
+
+        # Camera radio: only show cameras that actually exist for this dataset
+        _available_cameras = [c for c in ("right", "left") if os.path.isdir(os.path.join(_effective_res_root, c))]
+        if not _available_cameras:
+            st.error(f"No camera data found in `{_effective_res_root}`.")
+            st.stop()
+        res_camera = st.radio("Camera", _available_cameras, horizontal=True, key="res_camera")
+        _res_root = os.path.join(_effective_res_root, res_camera)
 
         outcomes = _rl.list_outcomes(_res_root)
         if not outcomes:
@@ -298,6 +318,46 @@ with st.sidebar:
                 except Exception as e:
                     st.error(f"Inference failed: {e}")
 
+    elif mode == "Online (Dataset)":
+        # ── Online (Dataset) mode sidebar ─────────────────────────────────────
+        from viz.dashboard import inference as _inf
+
+        _DEFAULT_DS_ROOT = "/mnt/sda/edward/projects/toy_cube_benchmark/cube_gold"
+        ds_data_root = st.text_input(
+            "DATA_ROOT",
+            value=st.session_state.get("ds_data_root_val", _DEFAULT_DS_ROOT),
+            key="ds_data_root_input",
+        )
+        st.session_state["ds_data_root_val"] = ds_data_root
+
+        _ds_checkpoints = _inf.list_online_checkpoints(CHECKPOINT_ROOT)
+        if not _ds_checkpoints:
+            st.warning(f"No checkpoints found in `{CHECKPOINT_ROOT}`.")
+        ds_ckpt = st.selectbox(
+            "Checkpoint",
+            _ds_checkpoints or ["pi05_droid_pytorch"],
+            key="ds_ckpt",
+        )
+        ds_ckpt_path = os.path.join(CHECKPOINT_ROOT, ds_ckpt)
+
+        def _ds_gpu_devices() -> list[str]:
+            try:
+                import pynvml
+                pynvml.nvmlInit()
+                n = pynvml.nvmlDeviceGetCount()
+                pynvml.nvmlShutdown()
+                return ["Auto"] + [f"cuda:{i}" for i in range(n)] + ["cpu"]
+            except Exception:
+                return ["Auto", "cpu"]
+
+        ds_gpu = st.selectbox("GPU device", _ds_gpu_devices(), key="ds_gpu")
+
+        st.markdown("---")
+        if st.button("🗑 Clear selection", key="ds_clear"):
+            for k in ("ds_selected_episode", "ds_selected_frame", "online_data"):
+                st.session_state.pop(k, None)
+            st.rerun()
+
     else:
         # ── Compare (Online) mode sidebar ─────────────────────────────────────
         from viz.dashboard import inference as _inf
@@ -452,11 +512,20 @@ if mode == "Offline (HDF5)":
             return _loader.load_full_matrix_all_heads(path, layer)
         return _fn
 
+    _joint = {}
+    for _l in available_layers:
+        _a2i = _loader.load_action_to_img(h5_path, _l)
+        if _a2i is not None:
+            _joint[f"layer_{_l}"] = {"action_to_img": _a2i}
+
     data = {
-        "meta": meta,
-        "images": images,
-        "_load_t2i": _make_load_t2i(h5_path),
+        "meta":           meta,
+        "images":         images,
+        "_load_t2i":      _make_load_t2i(h5_path),
         "_load_full_all": _make_load_full_all(h5_path),
+        "joint":          _joint or None,
+        "pred_action":    _loader.load_pred_action(h5_path),
+        "gt_action":      _loader.load_gt_action(h5_path),
     }
 
     st.header(f"Checkpoint `{checkpoint_a}` · Episode `{episode}` · Frame `{frame_idx}`")
@@ -511,13 +580,20 @@ elif mode == "Results (Benchmark)":
             return _loader.load_full_matrix_all_heads(path, layer)
         return _fn
 
+    _joint_res = {}
+    for _l in available_layers:
+        _a2i = _loader.load_action_to_img(res_h5, _l)
+        if _a2i is not None:
+            _joint_res[f"layer_{_l}"] = {"action_to_img": _a2i}
+
     data = {
-        "meta": meta,
-        "images": images,
-        "_load_t2i": _make_load_t2i_res(res_h5),
+        "meta":           meta,
+        "images":         images,
+        "_load_t2i":      _make_load_t2i_res(res_h5),
         "_load_full_all": _make_load_full_res(res_h5),
-        "pred_action": _loader.load_pred_action(res_h5),
-        "gt_action": _loader.load_gt_action(res_h5),
+        "pred_action":    _loader.load_pred_action(res_h5),
+        "gt_action":      _loader.load_gt_action(res_h5),
+        "joint":          _joint_res or None,
     }
 
     st.header(f"{res_outcome} · `{res_episode}` · Frame `{res_frame}` · {res_camera} cam")
@@ -614,6 +690,56 @@ elif mode == "Online (Inference)":
         image_saliency.render()
     with tab6:
         cag_view.render()
+
+elif mode == "Online (Dataset)":
+    # ── Online (Dataset) mode ─────────────────────────────────────────────────
+    st.header("Online (Dataset) — Browse & Infer")
+
+    dataset_browser.render(ds_data_root, ds_ckpt_path, ds_gpu)
+
+    # Show attention tabs once inference has run
+    if "online_data" in st.session_state:
+        data = st.session_state["online_data"]
+        available_layers = sorted(
+            int(k.split("_")[1])
+            for k in data.get("prefix", {})
+            if k.startswith("layer_")
+        )
+
+        ep  = st.session_state.get("ds_selected_episode", {})
+        frm = st.session_state.get("ds_selected_frame", 0)
+        st.divider()
+        st.subheader(f"Results — `{ep.get('episode_id', '')}` · frame {frm:05d}")
+        if data.get("meta", {}).get("instruction"):
+            st.caption(f"**Instruction:** {data['meta']['instruction']}")
+
+        tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+            "🔲 Grid Heatmap",
+            "🖼 Image Heatmap",
+            "📊 Attention Matrix",
+            "🤖 Action View",
+            "🔀 Counterfactual",
+            "🧩 Occlusion Saliency",
+            "📐 Language Grounding (CAG)",
+        ])
+        with tab0:
+            grid_heatmap.render(data, available_layers)
+        with tab1:
+            image_heatmap.render(data, available_layers)
+        with tab2:
+            attn_matrix.render(data, available_layers)
+        with tab3:
+            action_view.render(data, available_layers)
+        with tab4:
+            counterfactual.render(
+                attn_h5_root=ATTN_H5_ROOT,
+                checkpoints=_loader.list_checkpoints(ATTN_H5_ROOT),
+                default_checkpoint="",
+            )
+        with tab5:
+            image_saliency.render()
+        with tab6:
+            cag_view.render()
 
 else:
     # ── Compare (Online) mode ─────────────────────────────────────────────────

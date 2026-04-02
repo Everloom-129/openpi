@@ -102,7 +102,8 @@ def _build_grid_figure(
             ax.text(0.5, 0.5, "N/A", ha="center", va="center",
                     transform=ax.transAxes, color="gray", fontsize=7)
         else:
-            attn_512 = agg_fn(t2i[:, tok_idx, :])
+            safe_tok = min(tok_idx, t2i.shape[1] - 1)
+            attn_512 = agg_fn(t2i[:, safe_tok, :])
             hmap = _attn_to_heatmap(attn_512, camera)
             ax.imshow(_overlay(camera_img, hmap), aspect="equal")
         ax.set_title(f"L{layer}", color="white", fontsize=8, pad=3)

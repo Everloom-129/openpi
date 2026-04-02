@@ -5,7 +5,7 @@ and is assigned to a specific GPU. This maximizes GPU utilization when processin
 large datasets with many episodes.
 
 Key improvements over pipeline.py:
-  - N workers × N GPUs = N× throughput (理论上)
+  - N workers × N GPUs = N× throughput
   - Automatic GPU load balancing
   - Shared progress tracking with multiprocessing.Manager
   - Each worker loads policy once and reuses for all episodes
@@ -94,6 +94,7 @@ def worker_main(
     cf_prompts: list[dict],
     shared_stats: dict,
     camera: str,
+    config_name: str | None = None,
 ) -> None:
     """Main loop for a worker process.
     
@@ -136,7 +137,7 @@ def worker_main(
     # ═══════════════════════════════════════════════════════════════════════════
     device = "cuda:0"  # Always 0 due to CUDA_VISIBLE_DEVICES masking
     print(f"[Worker {worker_id}] Loading policy from {checkpoint} ...")
-    policy = get_policy(checkpoint, device=device)
+    policy = get_policy(checkpoint, device=device, config_name=config_name)
     print(f"[Worker {worker_id}] Policy loaded ✓\n")
     
     # ═══════════════════════════════════════════════════════════════════════════
@@ -302,11 +303,14 @@ def load_cf_config(config_path: str | Path) -> list[dict]:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Multi-process Pi0.5 batch attention pipeline"
+        description="Multi-process Pi0/Pi0.5 batch attention pipeline"
     )
     parser.add_argument("data_root", help="Root dir with success/ and failure/ subdirs")
     parser.add_argument("results_root", help="Output root directory")
     parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
+    parser.add_argument("--model", default=None,
+                        help="Training config name, e.g. 'pi0_droid' or 'pi05_droid'. "
+                             "If omitted, inferred from checkpoint directory name.")
     parser.add_argument("--cf-config", default=DEFAULT_CF_CONFIG,
                         help="Path to counterfactual YAML config")
     parser.add_argument("--no-counterfactual", dest="counterfactual",
@@ -421,7 +425,7 @@ def main(argv: list[str] | None = None) -> None:
         gpu_id = gpu_ids[worker_id % len(gpu_ids)]  # Round-robin GPU assignment
         p = mp.Process(
             target=worker_main,
-            args=(worker_id, gpu_id, task_queue, args.checkpoint, cf_prompts, shared_stats, args.camera),
+            args=(worker_id, gpu_id, task_queue, args.checkpoint, cf_prompts, shared_stats, args.camera, args.model),
         )
         p.start()
         processes.append(p)
