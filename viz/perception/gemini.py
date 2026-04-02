@@ -54,18 +54,18 @@ def _parse_response(response_text: str) -> tuple[list, list]:
     return bboxes, grounded_atoms
 
 
-def detect_and_translate(
+def detect(
     image: Image.Image,
     task_instruction: str,
     client: genai.Client | None = None,
     model_id: str = "gemini-robotics-er-1.5-preview",
     temperature: float | None = None,
 ) -> tuple[list[dict], list[dict]]:
-    """Detect objects and translate task in a single Gemini API call.
+    """Detect objects in an image using Gemini.
 
     Args:
         image: The image to analyze.
-        task_instruction: The natural language task to translate.
+        task_instruction: The natural language task instruction.
         client: Gemini API client. If None, a new client will be created.
         model_id: Gemini model ID to use.
         temperature: Temperature for generation.
@@ -73,10 +73,10 @@ def detect_and_translate(
     Returns:
         Tuple of (bboxes, grounded_atoms) where:
         - bboxes: List of detected objects with bounding boxes
-        - grounded_atoms: List of predicate specifications
+        - grounded_atoms: Always [] (detect prompt does not return predicates)
     """
     client = client or gemini_client()
-    prompt = load_prompt("detect_and_translate").format(task_instruction=task_instruction)
+    prompt = load_prompt("detect").format(task_instruction=task_instruction)
     response = client.models.generate_content(
         model=model_id,
         contents=[image, prompt],
@@ -87,18 +87,18 @@ def detect_and_translate(
     return _parse_response(response.text)
 
 
-async def detect_and_translate_async(
+async def detect_async(
     image: Image.Image,
     task_instruction: str,
     client: genai.Client | None = None,
     model_id: str = "gemini-robotics-er-1.5-preview",
     temperature: float | None = None,
 ) -> tuple[list[dict], list[dict]]:
-    """Asynchronously detect objects and translate task in a single Gemini API call.
+    """Asynchronously detect objects in an image using Gemini.
 
     Args:
         image: The image to analyze.
-        task_instruction: The natural language task to translate.
+        task_instruction: The natural language task instruction.
         client: Gemini API client. If None, a new client will be created.
         model_id: Gemini model ID to use.
         temperature: Temperature for generation.
@@ -106,10 +106,10 @@ async def detect_and_translate_async(
     Returns:
         Tuple of (bboxes, grounded_atoms) where:
         - bboxes: List of detected objects with bounding boxes.
-        - grounded_atoms: List of predicate specifications.
+        - grounded_atoms: Always [] (detect prompt does not return predicates).
     """
     client = client or gemini_client()
-    prompt = load_prompt("detect_and_translate").format(task_instruction=task_instruction)
+    prompt = load_prompt("detect").format(task_instruction=task_instruction)
     response = await client.aio.models.generate_content(
         model=model_id,
         contents=[image, prompt],
