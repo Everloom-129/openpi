@@ -80,6 +80,9 @@ st.set_page_config(
 
 ATTN_H5_ROOT = os.path.join(_PROJECT_ROOT, "attn_h5")
 CHECKPOINT_ROOT = os.path.join(_PROJECT_ROOT, "checkpoints/viz")
+JAX_CHECKPOINT_ROOT = os.path.join(
+    os.path.expanduser("~"), ".cache/openpi/openpi-assets/checkpoints"
+)
 RESULTS_ROOT = os.environ.get(
     "RESULTS_ROOT",
     "/data3/tonyw/toy_cube_benchmark/pi05_vis/cube_gold",
@@ -184,16 +187,32 @@ with st.sidebar:
     elif mode == "Online (Inference)":
         from viz.dashboard import inference as _inf
 
-        online_checkpoints = _inf.list_online_checkpoints(CHECKPOINT_ROOT)
+        # Backend selector
+        online_backend = st.radio(
+            "Backend", ["PyTorch", "JAX"], horizontal=True, key="online_backend"
+        )
+        _backend_key = "pytorch" if online_backend == "PyTorch" else "jax"
+
+        # Each backend has its own checkpoint root
+        _ckpt_root = CHECKPOINT_ROOT if _backend_key == "pytorch" else JAX_CHECKPOINT_ROOT
+
+        # List checkpoints filtered by backend type
+        online_checkpoints = _inf.list_online_checkpoints_by_backend(
+            _ckpt_root, backend=_backend_key
+        )
         if not online_checkpoints:
-            st.warning(f"No checkpoints found in `{CHECKPOINT_ROOT}`.")
+            st.warning(
+                f"No **{online_backend}** checkpoints found in `{_ckpt_root}`.\n\n"
+                f"**PyTorch** checkpoints contain `model.safetensors`.\n"
+                f"**JAX** checkpoints contain a `params/` directory."
+            )
 
         online_ckpt = st.selectbox(
             "Checkpoint",
-            online_checkpoints or ["checkpoints/viz/pi05_droid_pytorch"],
+            online_checkpoints or ["(none)"],
             key="online_ckpt",
         )
-        online_ckpt_path = os.path.join(CHECKPOINT_ROOT, online_ckpt)
+        online_ckpt_path = os.path.join(_ckpt_root, online_ckpt)
 
         st.markdown("**Input**")
         _EXAMPLE_DIR = os.path.join(_PROJECT_ROOT, "data/example")
@@ -224,51 +243,66 @@ with st.sidebar:
         )
         online_frame = st.slider("Frame", 0, _max_frame, 0, key="online_frame")
 
-        def _available_gpu_devices() -> list[str]:
-            try:
-                import pynvml
-                pynvml.nvmlInit()
-                n = pynvml.nvmlDeviceGetCount()
-                pynvml.nvmlShutdown()
-                return ["Auto"] + [f"cuda:{i}" for i in range(n)] + ["cpu"]
-            except Exception:
-                return ["Auto", "cpu"]
+        # GPU selector — only for PyTorch (JAX uses its own device management)
+        if _backend_key == "pytorch":
+            def _available_gpu_devices() -> list[str]:
+                try:
+                    import pynvml
+                    pynvml.nvmlInit()
+                    n = pynvml.nvmlDeviceGetCount()
+                    pynvml.nvmlShutdown()
+                    return ["Auto"] + [f"cuda:{i}" for i in range(n)] + ["cpu"]
+                except Exception:
+                    return ["Auto", "cpu"]
 
-        gpu_device_sel = st.selectbox("GPU device", _available_gpu_devices(), key="gpu_device")
+            gpu_device_sel = st.selectbox("GPU device", _available_gpu_devices(), key="gpu_device")
 
         run_btn = st.button("▶ Run Inference", type="primary")
 
         if run_btn:
-            with st.spinner("Loading model and running inference…"):
-                import sys as _sys
-                _sys.path.insert(0, os.path.join(_PROJECT_ROOT, "viz"))
-                from pathlib import Path as _Path
-                if _has_recordings:
-                    # DROID format: recordings/frames/{camera}/
-                    from pipeline import load_example as _load_example
-                    example = _load_example(
-                        data_dir=_Path(_ep_dir),
-                        index=online_frame,
-                        camera=online_camera,
-                    )
-                else:
-                    # Duck format: frames/{camera}/ directly
-                    from attn_map import load_duck_example
-                    example = load_duck_example(camera=online_camera, index=online_frame)
-                example["prompt"] = instruction_text
-                try:
-                    if gpu_device_sel == "Auto":
-                        from attn_map import select_best_gpu as _sbg
-                        _dev_id = _sbg()
-                        gpu_device = f"cuda:{_dev_id}" if isinstance(_dev_id, int) else str(_dev_id)
+            if online_ckpt == "(none)":
+                st.error(f"No {online_backend} checkpoint selected.")
+            else:
+                with st.spinner(f"Loading {online_backend} model and running inference…"):
+                    import sys as _sys
+                    _sys.path.insert(0, os.path.join(_PROJECT_ROOT, "viz"))
+                    from pathlib import Path as _Path
+                    if _has_recordings:
+                        # DROID format: recordings/frames/{camera}/
+                        from pipeline import load_example as _load_example
+                        example = _load_example(
+                            data_dir=_Path(_ep_dir),
+                            index=online_frame,
+                            camera=online_camera,
+                        )
                     else:
-                        gpu_device = gpu_device_sel
-                    policy = _inf.load_model(online_ckpt_path, device=gpu_device)
-                    slice_dict = _inf.run_inference(policy, example)
-                    st.session_state["online_data"] = slice_dict
-                    st.success("Inference complete!")
-                except Exception as e:
-                    st.error(f"Inference failed: {e}")
+                        # Duck format: frames/{camera}/ directly
+                        from attn_map import load_duck_example
+                        example = load_duck_example(camera=online_camera, index=online_frame)
+                    example["prompt"] = instruction_text
+                    try:
+                        if _backend_key == "pytorch":
+                            if gpu_device_sel == "Auto":
+                                from attn_map import select_best_gpu as _sbg
+                                _dev_id = _sbg()
+                                gpu_device = f"cuda:{_dev_id}" if isinstance(_dev_id, int) else str(_dev_id)
+                            else:
+                                gpu_device = gpu_device_sel
+                            policy = _inf.load_model(online_ckpt_path, device=gpu_device)
+                            slice_dict = _inf.run_inference(policy, example)
+                        else:
+                            # JAX backend
+                            from viz.dashboard import inference_jax as _inf_jax
+                            config_name = _inf_jax._infer_config_name(online_ckpt_path)
+                            is_pi05 = "pi05" in config_name
+                            model, _config = _inf_jax.load_jax_model_cached(online_ckpt_path)
+                            slice_dict = _inf_jax.run_jax_inference(
+                                model, example, is_pi05=is_pi05,
+                            )
+                        st.session_state["online_data"] = slice_dict
+                        st.success(f"Inference complete! (backend: {online_backend})")
+                    except Exception as e:
+                        st.error(f"Inference failed: {e}")
 
     elif mode == "Online (Dataset)":
         # ── Online (Dataset) mode sidebar ─────────────────────────────────────

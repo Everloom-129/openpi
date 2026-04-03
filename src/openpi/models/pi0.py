@@ -5,6 +5,7 @@ import flax.nnx as nnx
 import flax.nnx.bridge as nnx_bridge
 import jax
 import jax.numpy as jnp
+import numpy as np
 from typing_extensions import override
 
 from openpi.models import model as _model
@@ -98,6 +99,10 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+
+        # Attention logit masking config (for ablation experiments).
+        self.attn_logit_mask_layers = config.attn_logit_mask_layers
+        self.attn_logit_mask_percentile = config.attn_logit_mask_percentile
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -234,7 +239,11 @@ class Pi0(_model.BaseModel):
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        _, kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions,
+            attn_mask_config=self.attn_logit_mask_layers,
+            attn_mask_pct=self.attn_logit_mask_percentile,
+        )
 
         def step(carry):
             x_t, time = carry
@@ -277,3 +286,42 @@ class Pi0(_model.BaseModel):
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
+
+    def forward_with_attention(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int = 10,
+    ) -> tuple[_model.Actions, dict[int, np.ndarray], dict[int, np.ndarray]]:
+        """Run inference and return (actions, prefix_attn, suffix_attn).
+
+        Captures prefix attention via jax.debug.callback into the JAX
+        attention buffer (host RAM). Suffix attention is not captured
+        (denoising loop makes it impractical).
+        """
+        from openpi.models.gemma import (
+            clear_jax_attn_buffer,
+            enable_jax_attn_buffer,
+            get_jax_attn_buffer,
+        )
+
+        observation = _model.preprocess_observation(None, observation, train=False)
+
+        # ── Prefix forward with attention capture ─────────────────────────
+        enable_jax_attn_buffer()
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions,
+            attn_mask_config=self.attn_logit_mask_layers,
+            attn_mask_pct=self.attn_logit_mask_percentile,
+        )
+        prefix_attn = dict(get_jax_attn_buffer() or {})
+        clear_jax_attn_buffer()
+
+        # ── Full sample_actions for actual actions ────────────────────────
+        actions = self.sample_actions(rng, observation, num_steps=num_steps)
+
+        return actions, prefix_attn, {}

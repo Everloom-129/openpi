@@ -31,6 +31,12 @@ This fork extends openpi with **attention visualization tools** to study the int
 - **Trajectory** — multi-frame attention grid across an episode
 - **Counterfactual** — compare attention under different text prompts
 
+**Real-time attention server** — `scripts/serve_policy_with_attn.py` runs a WebSocket policy server with synchronous attention capture. After each inference, attention heatmaps are rendered and served via HTTP for live browser viewing. The robot client blocks until visualization is complete. Launch with:
+```bash
+bash scripts/run_attn_server.sh [checkpoint_dir] [device]
+# Then open http://localhost:8001 in a browser
+```
+
 **Token layout** used throughout:
 ```
 [0:256]       [256:512]    [512:768]     [768:N]      [N:N+8]

@@ -185,3 +185,34 @@ def list_online_checkpoints(checkpoint_root: str = "checkpoints/viz") -> list[st
         d for d in os.listdir(checkpoint_root)
         if os.path.isdir(os.path.join(checkpoint_root, d))
     )
+
+
+def detect_backend(checkpoint_dir: str) -> str:
+    """Detect whether a checkpoint is PyTorch or JAX.
+
+    Returns "pytorch" if ``model.safetensors`` exists, "jax" if ``params/``
+    exists, or "unknown".
+    """
+    if os.path.isfile(os.path.join(checkpoint_dir, "model.safetensors")):
+        return "pytorch"
+    if os.path.isdir(os.path.join(checkpoint_dir, "params")):
+        return "jax"
+    return "unknown"
+
+
+def list_online_checkpoints_by_backend(
+    checkpoint_root: str = "checkpoints/viz", backend: str = "all"
+) -> list[str]:
+    """List checkpoints filtered by backend type.
+
+    Args:
+        checkpoint_root: Root directory containing checkpoint subdirs.
+        backend: "pytorch", "jax", or "all".
+    """
+    all_ckpts = list_online_checkpoints(checkpoint_root)
+    if backend == "all":
+        return all_ckpts
+    return [
+        d for d in all_ckpts
+        if detect_backend(os.path.join(checkpoint_root, d)) == backend
+    ]

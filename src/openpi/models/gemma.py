@@ -33,12 +33,58 @@ import einops
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 import openpi.models.lora as lora
 import openpi.shared.array_typing as at
 import openpi.training.sharding as sharding
 
 PALIGEMMA_VOCAB_SIZE = 257_152
+
+
+# ── In-RAM attention capture (JAX version) ────────────────────────────────────
+# Parallel to the PyTorch buffer in gemma_pytorch.py.
+# Usage:
+#   enable_jax_attn_buffer()
+#   result = model.forward_with_attention(rng, obs)  # or any forward call
+#   buf = get_jax_attn_buffer()       # dict[layer_idx, ndarray(B, N, T, S)]
+#   clear_jax_attn_buffer()           # always in finally block
+#
+# The buffer is populated via jax.debug.callback inside Attention.__call__.
+# Only works during eager (non-jitted) execution or when the callback is
+# supported by the runtime.
+
+_JAX_ATTN_BUFFER: dict[int, np.ndarray] | None = None
+_JAX_ATTN_BUFFER_NOTIFIED: bool = False
+
+
+def enable_jax_attn_buffer() -> None:
+    """Arm the in-RAM JAX attention buffer."""
+    global _JAX_ATTN_BUFFER, _JAX_ATTN_BUFFER_NOTIFIED  # noqa: PLW0603
+    _JAX_ATTN_BUFFER = {}
+    if not _JAX_ATTN_BUFFER_NOTIFIED:
+        print("[attn-jax] Attention capture enabled — attention will be held in RAM.")
+        _JAX_ATTN_BUFFER_NOTIFIED = True
+
+
+def get_jax_attn_buffer() -> dict[int, np.ndarray] | None:
+    return _JAX_ATTN_BUFFER
+
+
+def clear_jax_attn_buffer() -> None:
+    global _JAX_ATTN_BUFFER  # noqa: PLW0603
+    _JAX_ATTN_BUFFER = None
+
+
+def _store_attn_callback(weights):
+    """Host callback to store attention weights in the global buffer.
+
+    Called via jax.debug.callback from inside nn.scan — layers execute in order,
+    so we use len(buffer) as the auto-incrementing layer index.
+    """
+    if _JAX_ATTN_BUFFER is not None:
+        layer_idx = len(_JAX_ATTN_BUFFER)
+        _JAX_ATTN_BUFFER[layer_idx] = np.array(weights)
 
 
 @dataclasses.dataclass
@@ -154,6 +200,30 @@ class Embedder(nn.Module):
         return jnp.dot(x, self.input_embedding_table.T)
 
 
+def _mask_attn_percentile(logits, mode, pct, big_neg):
+    """Mask top or bottom percentile of attention logits.
+
+    Args:
+        logits: float[B, K, G, T, S] — attention logits after causal masking.
+        mode: int scalar — 0=disabled, 1=mask top pct, 2=mask bottom pct.
+        pct: float scalar — percentile to mask (e.g. 10.0 for top/bottom 10%).
+        big_neg: large negative value used for masking.
+
+    Returns:
+        logits with the specified percentile set to big_neg.
+    """
+    valid = logits > (big_neg + 1.0)
+    flat = logits.reshape(logits.shape[0], -1)
+    valid_flat = valid.reshape(valid.shape[0], -1)
+    flat_nan = jnp.where(valid_flat, flat, jnp.nan)
+    thresh_high = jnp.nanpercentile(flat_nan, 100.0 - pct, axis=-1).reshape(-1, 1, 1, 1, 1)
+    thresh_low = jnp.nanpercentile(flat_nan, pct, axis=-1).reshape(-1, 1, 1, 1, 1)
+    top_masked = jnp.where((logits >= thresh_high) & valid, big_neg, logits)
+    bot_masked = jnp.where((logits <= thresh_low) & valid, big_neg, logits)
+    out = jnp.where(mode == 1, top_masked, logits)
+    return jnp.where(mode == 2, bot_masked, out)
+
+
 @at.typecheck
 class Attention(nn.Module):
     """Attention module."""
@@ -161,7 +231,7 @@ class Attention(nn.Module):
     configs: Sequence[Config]
 
     @nn.compact
-    def __call__(self, xs, positions, attn_mask, kv_cache):
+    def __call__(self, xs, positions, attn_mask, kv_cache, attn_mask_mode=0, attn_mask_pct=10.0):
         # all experts must share the same head dim, num heads, and num kv heads for self-attention to work
         assert all(config.head_dim == self.configs[0].head_dim for config in self.configs)
         assert all(config.num_heads == self.configs[0].num_heads for config in self.configs)
@@ -225,7 +295,17 @@ class Attention(nn.Module):
         big_neg = -2.3819763e38  # See gemma/modules.py
         masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)
 
+        # Percentile-based attention logit masking (for ablation experiments).
+        # mode: 0=disabled, 1=mask top percentile, 2=mask bottom percentile.
+        masked_logits = _mask_attn_percentile(masked_logits, attn_mask_mode, attn_mask_pct, big_neg)
+
         probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
+
+        # Capture attention weights to host RAM (no-op when buffer is disabled).
+        if _JAX_ATTN_BUFFER is not None:
+            # Collapse GQA groups: (B, K, G, T, S) -> (B, num_heads, T, S)
+            probs_flat = einops.rearrange(probs, "B K G T S -> B (K G) T S")
+            jax.debug.callback(_store_attn_callback, probs_flat)
 
         encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
         encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
@@ -290,7 +370,7 @@ class Block(nn.Module):
     dropout_bdims: tuple[int, ...] = ()
 
     @nn.compact
-    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True):  # noqa: FBT002
+    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, attn_mask_mode, attn_mask_pct, deterministic=True):  # noqa: FBT002
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
@@ -305,7 +385,7 @@ class Block(nn.Module):
             gates.append(gate if x is not None else None)
 
         pre_attn = sharding.activation_sharding_constraint(pre_attn)
-        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)
+        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache, attn_mask_mode, attn_mask_pct)
         post_attn = jax.tree.map(lambda x: drop(x, deterministic), post_attn)
         post_attn = sharding.activation_sharding_constraint(post_attn)
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, post_attn, gates, strict=True)]
@@ -359,7 +439,7 @@ class Module(nn.Module):
         block_cls = nn.remat(
             Block,
             prevent_cse=False,
-            static_argnums=(5,),  # 0=self, 6=deterministic
+            static_argnums=(7,),  # 0=xs(carry), ..., 7=deterministic
             policy=jax.checkpoint_policies.nothing_saveable,
         )
         self.layers = nn.scan(
@@ -367,12 +447,14 @@ class Module(nn.Module):
             variable_axes={"params": 0},
             split_rngs={"params": True, "dropout": True},
             in_axes=(
-                0,
-                nn.broadcast,
-                nn.broadcast,
-                nn.broadcast,
-                nn.broadcast,
-            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic
+                0,             # kv_cache
+                nn.broadcast,  # positions
+                nn.broadcast,  # attn_mask
+                nn.broadcast,  # adarms_cond
+                0,             # attn_mask_mode — scanned per layer
+                nn.broadcast,  # attn_mask_pct
+                nn.broadcast,  # deterministic
+            ),
             length=self.configs[0].depth,
         )(
             configs=self.configs,
@@ -396,13 +478,26 @@ class Module(nn.Module):
         *,
         kv_cache: KVCache | None = None,
         deterministic: bool = True,
+        attn_mask_config: dict[int, int] | None = None,
+        attn_mask_pct: float = 10.0,
     ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
-        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)
+        depth = self.configs[0].depth
+        if attn_mask_config is not None:
+            attn_mask_mode = jnp.zeros(depth, dtype=jnp.int32)
+            for layer_idx, mode in attn_mask_config.items():
+                attn_mask_mode = attn_mask_mode.at[layer_idx].set(mode)
+        else:
+            attn_mask_mode = jnp.zeros(depth, dtype=jnp.int32)
+
+        embedded, kv_cache = self.layers(
+            embedded, kv_cache, positions, mask, adarms_cond,
+            attn_mask_mode, jnp.float32(attn_mask_pct), deterministic,
+        )
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
 

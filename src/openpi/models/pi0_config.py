@@ -32,6 +32,11 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
+    # Attention logit masking: maps layer_index -> mode (1=mask top percentile, 2=mask bottom percentile).
+    # None = disabled. Example: {7: 1} masks top 10% of logits in layer 7.
+    attn_logit_mask_layers: dict[int, int] | None = None
+    attn_logit_mask_percentile: float = 10.0
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)

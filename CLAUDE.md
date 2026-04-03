@@ -122,6 +122,7 @@ This layout is critical for all slicing/indexing in the visualization code.
 - **Offline (HDF5)**: Browse pre-computed attention from `attn_h5/` (legacy format)
 - **Results (Benchmark)**: Browse batch pipeline output from `RESULTS_ROOT`. Camera (left/right) is selected in the sidebar — resolves to `RESULTS_ROOT/{camera}/`. Includes Trajectory tab with action benchmark.
 - **Online (Inference)**: Live inference on example episodes from `data/example/`. Episodes are auto-discovered; structure (DROID `recordings/frames/` vs duck `frames/`) is detected automatically. GPU list is detected via `pynvml`; "Auto" selects the GPU with most free memory.
+- **Live (Attention Server)**: `scripts/serve_policy_with_attn.py` serves a WebSocket policy (port 8000) and an HTTP attention viewer (port 8001). Attention is captured via RAM buffer and rendered synchronously before returning actions. Launch: `bash scripts/run_attn_server.sh [checkpoint_dir] [device]`.
 
 `RESULTS_ROOT` is set via environment variable in `viz/start_app.sh` (per-user). Default layout:
 ```
@@ -156,8 +157,38 @@ finally:
 
 This same pattern is used in:
 - `viz/pipeline.py` / `viz/pipeline_mp.py` — batch offline inference
-- `viz/dashboard/inference.py` — online inference
+- `viz/dashboard/inference.py` — online inference (PyTorch)
+- `viz/dashboard/inference_jax.py` — online inference (JAX, uses `Pi0.forward_with_attention`)
 - `viz/dashboard/views/counterfactual.py` — counterfactual prompt inference
+- `scripts/serve_policy_with_attn.py` — real-time attention server (sync, in-process)
+
+A JAX-side buffer API (`enable_jax_attn_buffer` / `get_jax_attn_buffer` / `clear_jax_attn_buffer`) exists in `src/openpi/models/gemma.py` but is **not wired to the scan output** due to memory constraints (stacking attention across 18 layers causes OOM). For JAX attention visualization, use the PyTorch checkpoint or `forward_with_attention()`.
+
+### Attention Logit Masking (Ablation Experiments)
+> NOTICE: this part is not verified yet, ask user to execute this
+The JAX model (`src/openpi/models/gemma.py`) supports configurable per-layer attention logit masking for real-world ablation experiments. This masks the top or bottom N% of attention logits (pre-softmax) in specified layers during the **prefix forward pass only**.
+
+**Configuration** (in `Pi0Config`):
+```python
+Pi0Config(
+    attn_logit_mask_layers={7: 1},       # layer 7, mode 1 (mask top)
+    attn_logit_mask_percentile=10.0,     # mask top/bottom 10%
+)
+# Modes: 0=disabled (default), 1=mask top N%, 2=mask bottom N%
+# Multiple layers: {7: 1, 10: 2, 4: 1}
+````
+
+**How it works:**
+1. `_mask_attn_percentile()` in `gemma.py` computes the Nth percentile of valid (non-padding) logits flattened across all heads and positions
+2. Per-layer mode array (shape `[depth]`) is passed through `nn.scan` with `in_axes=0`
+3. Applied between causal masking and softmax — uses `jnp.where` (not Python `if`) for JAX traceability
+4. Only applied during prefix pass in `sample_actions()` — suffix (action denoising) passes use defaults (mode=0)
+
+**Key files:**
+- `src/openpi/models/gemma.py` — `_mask_attn_percentile()`, threaded through `Attention` → `Block` → `Module`
+- `src/openpi/models/pi0.py` — wired to prefix pass in `sample_actions()`
+- `src/openpi/models/pi0_config.py` — `attn_logit_mask_layers`, `attn_logit_mask_percentile` fields
+- `src/openpi/models/attn_mask_test.py` — 10 unit tests
 
 ### Batch Pipeline
 
