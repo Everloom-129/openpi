@@ -108,11 +108,33 @@ class Policy(BasePolicy):
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
 
-        # Add demodiffusion parameters to sample_kwargs
+        # For PyTorch models, blend guidance into noise here (outside torch.compile).
+        # For JAX models, pass through as kwargs to sample_actions.
         if retargeted_actions_norm is not None:
-            sample_kwargs["retargeted_actions_norm"] = retargeted_actions_norm
-            sample_kwargs["time"] = diffusion_time
-            sample_kwargs["action_dim_used"] = action_dim_used
+            if self._is_pytorch_model:
+                dim = action_dim_used if action_dim_used is not None else 8
+                # Generate noise if not already provided
+                if "noise" not in sample_kwargs:
+                    obs_for_shape = _model.Observation.from_dict(inputs)
+                    bsize = obs_for_shape.state.shape[0]
+                    action_horizon = self._model.config.action_horizon
+                    action_dim = self._model.config.action_dim
+                    blended_noise = torch.normal(
+                        mean=0.0, std=1.0,
+                        size=(bsize, action_horizon, action_dim),
+                        dtype=torch.float32, device=self._pytorch_device,
+                    )
+                else:
+                    blended_noise = sample_kwargs["noise"].clone()
+                blended_noise[:, :, :dim] = (
+                    diffusion_time * blended_noise[:, :, :dim]
+                    + (1 - diffusion_time) * retargeted_actions_norm[:, :, :dim]
+                )
+                sample_kwargs["noise"] = blended_noise
+            else:
+                sample_kwargs["retargeted_actions_norm"] = retargeted_actions_norm
+                sample_kwargs["time"] = diffusion_time
+                sample_kwargs["action_dim_used"] = action_dim_used
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()

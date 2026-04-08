@@ -373,37 +373,17 @@ class PI0Pytorch(nn.Module):
         return F.mse_loss(u_t, v_t, reduction="none")
 
     @torch.no_grad()
-    def sample_actions(
-        self,
-        device,
-        observation,
-        noise=None,
-        num_steps=10,
-        retargeted_actions_norm=None,
-        time=1.0,
-        action_dim_used=None,
-    ) -> Tensor:
+    def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)
 
-        Args:
-            retargeted_actions_norm: Normalized guidance actions for demo-guided diffusion.
-                Shape: (batch_size, action_horizon, action_dim). If provided, the first
-                `action_dim_used` dims of noise are blended with these actions.
-            time: Diffusion time for blending (0.0 = fully use guidance, 1.0 = fully use noise).
-            action_dim_used: Number of action dims to blend (default 8 for DROID).
+        For demo-guided diffusion, pass pre-blended noise via the `noise` parameter.
+        Blending is done in policy.py before calling this method, keeping the signature
+        stable for torch.compile.
         """
         bsize = observation.state.shape[0]
         if noise is None:
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
-
-        # Blend guidance actions into noise for demo-guided diffusion
-        if retargeted_actions_norm is not None:
-            dim = action_dim_used if action_dim_used is not None else 8
-            noise = noise.clone()
-            noise[:, :, :dim] = (
-                time * noise[:, :, :dim] + (1 - time) * retargeted_actions_norm[:, :, :dim]
-            )
 
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
 
@@ -427,9 +407,9 @@ class PI0Pytorch(nn.Module):
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
 
         x_t = noise
-        denoise_time = torch.tensor(1.0, dtype=torch.float32, device=device)
-        while denoise_time >= -dt / 2:
-            expanded_time = denoise_time.expand(bsize)
+        time = torch.tensor(1.0, dtype=torch.float32, device=device)
+        while time >= -dt / 2:
+            expanded_time = time.expand(bsize)
             v_t = self.denoise_step(
                 state,
                 prefix_pad_masks,
@@ -440,7 +420,7 @@ class PI0Pytorch(nn.Module):
 
             # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t + dt * v_t
-            denoise_time += dt
+            time += dt
         return x_t
 
     def denoise_step(
