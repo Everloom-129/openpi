@@ -8,7 +8,7 @@ results_*/
 attn/
 CIS700-Explaining-Attention-of-VLAs/
 viz/s
-
+attn_*/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

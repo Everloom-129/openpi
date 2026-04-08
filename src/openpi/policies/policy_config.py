@@ -88,7 +88,11 @@ def create_trained_policy(
             *repack_transforms.outputs,
         ],
         sample_kwargs=sample_kwargs,
-        metadata=train_config.policy_metadata,
+        metadata={
+            **(train_config.policy_metadata or {}),
+            "action_horizon": train_config.model.action_horizon,
+            "action_dim": train_config.model.action_dim,
+        },
         is_pytorch=is_pytorch,
         pytorch_device=pytorch_device if is_pytorch else None,
     )
