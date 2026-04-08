@@ -201,11 +201,12 @@ class Embedder(nn.Module):
 
 
 def _mask_attn_percentile(logits, mode, pct, big_neg):
-    """Mask top or bottom percentile of attention logits.
+    """Mask attention logits by percentile.
 
     Args:
         logits: float[B, K, G, T, S] — attention logits after causal masking.
-        mode: int scalar — 0=disabled, 1=mask top pct, 2=mask bottom pct.
+        mode: int scalar — 0=disabled, 1=mask top pct, 2=mask bottom pct,
+              3=mask below min threshold (keep only top pct%, mask the rest).
         pct: float scalar — percentile to mask (e.g. 10.0 for top/bottom 10%).
         big_neg: large negative value used for masking.
 
@@ -220,8 +221,11 @@ def _mask_attn_percentile(logits, mode, pct, big_neg):
     thresh_low = jnp.nanpercentile(flat_nan, pct, axis=-1).reshape(-1, 1, 1, 1, 1)
     top_masked = jnp.where((logits >= thresh_high) & valid, big_neg, logits)
     bot_masked = jnp.where((logits <= thresh_low) & valid, big_neg, logits)
+    # mode 3: keep only top pct%, mask everything below the (100-pct) threshold
+    min_filtered = jnp.where((logits < thresh_high) & valid, big_neg, logits)
     out = jnp.where(mode == 1, top_masked, logits)
-    return jnp.where(mode == 2, bot_masked, out)
+    out = jnp.where(mode == 2, bot_masked, out)
+    return jnp.where(mode == 3, min_filtered, out)
 
 
 @at.typecheck

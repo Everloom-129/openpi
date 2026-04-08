@@ -20,7 +20,6 @@
   - `enable_jax_attn_buffer()`, `get_jax_attn_buffer()`, `clear_jax_attn_buffer()`
   - API stubs in place; not wired to scan output (OOM risk with 18-layer stacking)
 
-- [x] **CLAUDE.md updated** with masking architecture and JAX attention docs
 
 ## In Progress / Next Steps
 

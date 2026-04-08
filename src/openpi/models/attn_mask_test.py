@@ -126,6 +126,48 @@ class TestMaskAttnPercentile:
                 f"pct={pct}: expected ~{expected}, got {newly_masked.sum()}"
             )
 
+    def test_mode_3_min_filter_keeps_top_10_percent(self):
+        """Mode 3 should mask everything below the top 10%, keeping only the highest logits."""
+        logits = self._make_logits(b=1, k=1, g=1, t=20, s=20, seed=42)
+        result = _mask_attn_percentile(logits, mode=3, pct=10.0, big_neg=self.BIG_NEG)
+
+        logits_np = np.array(logits)
+        result_np = np.array(result)
+
+        valid = logits_np > (self.BIG_NEG + 1.0)
+        n_valid = valid.sum()
+
+        # Count surviving (not masked) positions
+        still_valid = result_np > (self.BIG_NEG + 1.0)
+        n_surviving = still_valid.sum()
+
+        # Should keep approximately 10% of valid logits
+        expected_surviving = int(n_valid * 0.10)
+        assert abs(n_surviving - expected_surviving) <= 2, (
+            f"Expected ~{expected_surviving} surviving, got {n_surviving}"
+        )
+
+        # Surviving values should be the highest ones
+        if n_surviving > 0:
+            valid_vals = logits_np[valid]
+            thresh = np.percentile(valid_vals, 90.0)
+            surviving_vals = logits_np[still_valid]
+            assert np.all(surviving_vals >= thresh - 1e-5)
+
+    def test_mode_3_inverse_of_mode_1(self):
+        """Mode 3 (keep top N%) and mode 1 (mask top N%) should be complementary."""
+        logits = self._make_logits(b=1, k=1, g=1, t=20, s=20, seed=77)
+        mode1 = _mask_attn_percentile(logits, mode=1, pct=10.0, big_neg=self.BIG_NEG)
+        mode3 = _mask_attn_percentile(logits, mode=3, pct=10.0, big_neg=self.BIG_NEG)
+
+        logits_np = np.array(logits)
+        valid = logits_np > (self.BIG_NEG + 1.0)
+
+        # What mode 1 masks should be what mode 3 keeps (and vice versa)
+        mode1_masked = (np.array(mode1) <= self.BIG_NEG + 1.0) & valid
+        mode3_kept = np.array(mode3) > (self.BIG_NEG + 1.0)
+        np.testing.assert_array_equal(mode1_masked, mode3_kept)
+
     def test_jit_compatible(self):
         """The function should work under jax.jit."""
         logits = self._make_logits()
@@ -134,8 +176,14 @@ class TestMaskAttnPercentile:
         def masked(logits):
             return _mask_attn_percentile(logits, mode=1, pct=10.0, big_neg=self.BIG_NEG)
 
+        @jax.jit
+        def masked_mode3(logits):
+            return _mask_attn_percentile(logits, mode=3, pct=10.0, big_neg=self.BIG_NEG)
+
         result = masked(logits)
         assert result.shape == logits.shape
+        result3 = masked_mode3(logits)
+        assert result3.shape == logits.shape
 
 
 class TestMaskAttnConfig:

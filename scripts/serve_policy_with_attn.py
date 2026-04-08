@@ -7,9 +7,9 @@ Architecture:
   - WebSocket (port 8000): robot client sends obs, receives actions
   - HTTP     (port 8001): browser auto-refreshes to show latest attention
 
-The server is **synchronous**: it finishes generating the attention
-visualizations before returning the action to the robot client, so the
-robot naturally waits while you inspect the attention.
+The action is returned to the robot as soon as inference + attention capture
+finishes. The matplotlib rendering runs in a background thread so it does
+not block the control loop.
 
 Usage:
     uv run python scripts/serve_policy_with_attn.py \
@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import http.server
 import io
 import json
@@ -52,12 +53,33 @@ class AttnState:
         self._data: dict | None = None
         # PNG bytes of the latest visualization
         self._png_bytes: bytes = b""
+        # Background renderer thread pool (1 thread — renders sequentially,
+        # never blocks the inference/action return path).
+        self._render_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="viz")
 
     def update(self, data: dict, png_bytes: bytes):
         with self._lock:
             self._step += 1
             self._data = data
             self._png_bytes = png_bytes
+
+    def submit_render(self, attn_data: dict, viz_layer: int, viz_head: str):
+        """Submit a render job to the background thread. Non-blocking."""
+        self._render_pool.submit(self._render_and_update, attn_data, viz_layer, viz_head)
+
+    def _render_and_update(self, attn_data: dict, viz_layer: int, viz_head: str):
+        """Render PNG and update shared state. Runs in background thread."""
+        try:
+            t0 = time.monotonic()
+            png = render_attention_png(attn_data, layer=viz_layer, head=viz_head)
+            viz_ms = (time.monotonic() - t0) * 1000
+            self.update(attn_data, png)
+            logger.info(
+                "Step %d rendered: viz=%.0fms, infer was %.0fms",
+                self.step, viz_ms, attn_data["infer_ms"],
+            )
+        except Exception:
+            logger.exception("Background render failed")
 
     @property
     def step(self) -> int:
@@ -270,9 +292,10 @@ def start_viz_server(port: int):
 # ── Policy server with attention capture ─────────────────────────────────────
 
 def run_inference_with_attn(policy, obs: dict, viz_layer: int, viz_head: str) -> dict:
-    """Infer + capture attention + render viz, then return actions.
+    """Infer + capture attention, submit viz to background, return actions immediately.
 
-    This is synchronous: the robot client blocks until visualization is done.
+    The matplotlib rendering happens in a background thread so the robot
+    gets its action back without waiting for the PNG to be drawn.
     """
     from openpi.models_pytorch import gemma_pytorch as _gpt
 
@@ -367,13 +390,8 @@ def run_inference_with_attn(policy, obs: dict, viz_layer: int, viz_head: str) ->
         "infer_ms": infer_ms,
     }
 
-    # ── Render visualization (blocking) ──────────────────────────────────
-    t1 = time.monotonic()
-    png = render_attention_png(attn_data, layer=viz_layer, head=viz_head)
-    viz_ms = (time.monotonic() - t1) * 1000
-    logger.info("Step %d: infer=%.0fms, viz=%.0fms", ATTN_STATE.step + 1, infer_ms, viz_ms)
-
-    ATTN_STATE.update(attn_data, png)
+    # ── Submit rendering to background thread (non-blocking) ─────────────
+    ATTN_STATE.submit_render(attn_data, viz_layer, viz_head)
 
     return result
 
