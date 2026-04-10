@@ -58,7 +58,7 @@ def detect(
     image: Image.Image,
     task_instruction: str,
     client: genai.Client | None = None,
-    model_id: str = "gemini-robotics-er-1.5-preview",
+    model_id: str = "gemini-2.5-flash",
     temperature: float | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Detect objects in an image using Gemini.
@@ -91,7 +91,7 @@ async def detect_async(
     image: Image.Image,
     task_instruction: str,
     client: genai.Client | None = None,
-    model_id: str = "gemini-robotics-er-1.5-preview",
+    model_id: str = "gemini-2.5-flash",
     temperature: float | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Asynchronously detect objects in an image using Gemini.

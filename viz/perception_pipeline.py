@@ -21,6 +21,13 @@ Output layout:
                             │   └── masks       uint8(N, H, W)  SAM2 segmentation masks
                             └── /right/      (future: external camera)
 
+Issue:
+1. need to add external cam
+2. object label is too general and unique now (1k+ labels fro 11 episodes)
+3. object label is inconsitent within an episode
+4. overlap rule?
+
+
 Usage:
     uv run python viz/perception_pipeline.py <DATA_ROOT>
     uv run python viz/perception_pipeline.py <DATA_ROOT> --no-sam2
@@ -29,13 +36,16 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import time
+from collections import Counter, defaultdict
 from functools import cache
 from pathlib import Path
 
 import h5py
 import numpy as np
+import yaml
 from PIL import Image
 
 from attn_map import get_keyframes
@@ -47,7 +57,7 @@ from pipeline import OPEN_LOOP_HORIZON, get_video_length, load_example
 CAMERA: str = "right"
 SAM2_CHECKPOINT: str = "./checkpoints/viz/sam2.1_hiera_large.pt"
 SAM2_CONFIG: str = "configs/sam2.1/sam2.1_hiera_l.yaml"
-GEMINI_MODEL: str = "gemini-2.0-flash"
+GEMINI_MODEL: str = "gemini-2.5-flash"
 _DETECT_PROMPT_PATH = Path(__file__).parent / "perception" / "prompts" / "detect.txt"
 
 
@@ -64,30 +74,17 @@ def _gemini_client():
     return genai.Client()
 
 
-def detect_objects(
-    image: Image.Image,
-    instruction: str,
-    model_id: str = GEMINI_MODEL,
-) -> list[dict]:
-    """Detect objects in an image using Gemini.
+_LABEL_ALIASES = ("label", "name", "object", "description", "class")
+_RETRY_PROMPT_SUFFIX = "\n\nCRITICAL: Return ONLY the raw JSON object. No markdown, no code fences, no extra text. The response must start with {{ and end with }}."
+MAX_DETECT_RETRIES = 3
 
-    Returns a list of dicts: {"label": str, "box_2d": [ymin, xmin, ymax, xmax]} (0–1000 scale).
-    Returns [] on parse failure.
+
+def _parse_detect_response(text: str) -> list[dict] | None:
+    """Parse and normalise a Gemini detection response.
+
+    Returns a list of valid bbox dicts on success, or None if parsing failed.
     """
-    from google.genai import types
-
-    prompt = _load_detect_prompt().format(task_instruction=instruction)
-    response = _gemini_client().models.generate_content(
-        model=model_id,
-        contents=[image, prompt],
-        config=types.GenerateContentConfig(
-            temperature=None,
-            thinking_config=types.ThinkingConfig(thinking_budget=0),
-        ),
-    )
-
-    text = response.text.strip()
-    # Strip optional markdown code fencing
+    text = text.strip()
     if text.startswith("```"):
         parts = text.split("```")
         text = parts[1].lstrip("json").strip() if len(parts) > 1 else text
@@ -95,10 +92,63 @@ def detect_objects(
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        print(f"    [warn] Gemini returned non-JSON: {text[:200]}")
-        return []
+        return None
 
-    return [b for b in data.get("bboxes", []) if len(b.get("box_2d", [])) == 4]
+    normalized = []
+    for b in data.get("bboxes", []):
+        if len(b.get("box_2d", [])) != 4:
+            continue
+        if "label" not in b:
+            for alias in _LABEL_ALIASES[1:]:
+                if alias in b:
+                    b["label"] = b.pop(alias)
+                    break
+            else:
+                print(f"    [warn] bbox missing label key (keys={list(b.keys())}), skipping")
+                continue
+        normalized.append(b)
+    return normalized
+
+
+def detect_objects(
+    image: Image.Image,
+    instruction: str,
+    model_id: str = GEMINI_MODEL,
+) -> list[dict]:
+    """Detect objects in an image using Gemini, with up to MAX_DETECT_RETRIES retries.
+
+    Returns a list of dicts: {"label": str, "box_2d": [ymin, xmin, ymax, xmax]} (0–1000 scale).
+    Returns [] if all attempts fail.
+    """
+    from google.genai import types
+
+    base_prompt = _load_detect_prompt().format(task_instruction=instruction)
+
+    for attempt in range(1, MAX_DETECT_RETRIES + 1):
+        prompt = base_prompt if attempt == 1 else base_prompt + _RETRY_PROMPT_SUFFIX
+        try:
+            response = _gemini_client().models.generate_content(
+                model=model_id,
+                contents=[image, prompt],
+                config=types.GenerateContentConfig(
+                    temperature=None,
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                ),
+            )
+            result = _parse_detect_response(response.text)
+        except Exception as e:
+            print(f"    [warn] Gemini API error (attempt {attempt}/{MAX_DETECT_RETRIES}): {e}")
+            result = None
+
+        if result is not None:
+            if attempt > 1:
+                print(f"    [retry ok] succeeded on attempt {attempt}")
+            return result
+
+        print(f"    [warn] Gemini non-JSON (attempt {attempt}/{MAX_DETECT_RETRIES}): {response.text[:120]!r}")
+
+    print(f"    [error] detect_objects failed after {MAX_DETECT_RETRIES} attempts, returning []")
+    return []
 
 
 # ── SAM2 segmentation ──────────────────────────────────────────────────────────
@@ -276,19 +326,127 @@ def process_frame(
     return "ok"
 
 
+# ── Label statistics ───────────────────────────────────────────────────────────
+
+def write_episode_label_stats(
+    episode_perception_dir: Path,
+    episode_id: str,
+    instruction: str,
+    outcome: str,
+) -> dict[str, int]:
+    """Scan all perception.h5 files in an episode and write label_stats.yaml.
+
+    Reads whatever Gemini detected (new or pre-existing frames) so the stats are
+    always complete even when frames were skipped.
+
+    Returns: {label: frames_detected} for dataset-level aggregation.
+    """
+    label_frame_counts: Counter = Counter()
+    total_keyframes = 0
+
+    for frame_dir in sorted(episode_perception_dir.iterdir()):
+        h5_path = frame_dir / "perception.h5"
+        if not h5_path.exists():
+            continue
+        total_keyframes += 1
+        try:
+            with h5py.File(h5_path, "r") as f:
+                if "wrist/bboxes/labels" in f:
+                    for raw in f["wrist/bboxes/labels"][:]:
+                        label = raw.decode() if isinstance(raw, bytes) else str(raw)
+                        label_frame_counts[label] += 1
+        except Exception as e:
+            print(f"    [label stats warn] {h5_path.name}: {e}")
+
+    if not total_keyframes:
+        return {}
+
+    label_stats = {
+        label: {
+            "frames_detected": count,
+            "detection_rate": round(count / total_keyframes, 4),
+        }
+        for label, count in sorted(label_frame_counts.items())
+    }
+
+    yaml_path = episode_perception_dir / "label_stats.yaml"
+    with open(yaml_path, "w") as f:
+        yaml.dump(
+            {
+                "episode": episode_id,
+                "instruction": instruction,
+                "outcome": outcome,
+                "total_keyframes": total_keyframes,
+                "label_stats": label_stats,
+                "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            },
+            f, default_flow_style=False, sort_keys=False, allow_unicode=True,
+        )
+    print(f"  Label stats → {yaml_path.relative_to(episode_perception_dir.parent.parent)}")
+    return dict(label_frame_counts)
+
+
+def write_dataset_label_stats(
+    data_root: Path,
+    all_episode_counts: list[dict[str, int]],
+    total_episodes_processed: int,
+) -> None:
+    """Aggregate per-episode label counts into a dataset-level label_stats.yaml.
+
+    For each label records: total detections, episodes_detected, episode_rate,
+    and per-episode detection stats (mean / min / max / std).
+    """
+    # Collect per-label list of frame-detection counts (one entry per episode where seen)
+    label_ep_counts: dict[str, list[int]] = defaultdict(list)
+    for ep_counts in all_episode_counts:
+        for label, count in ep_counts.items():
+            label_ep_counts[label].append(count)
+
+    label_stats = {}
+    for label in sorted(label_ep_counts.keys()):
+        arr = np.array(label_ep_counts[label], dtype=float)
+        label_stats[label] = {
+            "total_detections": int(arr.sum()),
+            "episodes_detected": int(len(arr)),
+            "episode_rate": round(float(len(arr) / total_episodes_processed), 4) if total_episodes_processed else 0.0,
+            "detections_per_episode": {
+                "mean": round(float(arr.mean()), 2),
+                "min":  int(arr.min()),
+                "max":  int(arr.max()),
+                "std":  round(float(arr.std()), 2),
+            },
+        }
+
+    yaml_path = data_root / "label_stats.yaml"
+    with open(yaml_path, "w") as f:
+        yaml.dump(
+            {
+                "total_episodes_processed": total_episodes_processed,
+                "unique_labels": len(label_stats),
+                "label_stats": label_stats,
+                "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            },
+            f, default_flow_style=False, sort_keys=False, allow_unicode=True,
+        )
+    print(f"Dataset label stats → {yaml_path}")
+
+
 # ── Episode processing ─────────────────────────────────────────────────────────
 
 def process_episode(
     data_dir: Path,
+    outcome: str = "",
     **frame_kwargs,
-) -> dict:
+) -> tuple[dict, dict[str, int]]:
     """Process all keyframes of one episode.
 
-    Returns stats dict: {total, ok, skipped, errors}.
+    Returns: (stats dict, label_frame_counts dict)
+      - stats: {total, ok, skipped, errors}
+      - label_frame_counts: {label: frames_detected} across this episode
     """
     total_frames = get_video_length(data_dir)
     if total_frames == 0:
-        return {"total": 0, "ok": 0, "skipped": 0, "errors": 0}
+        return {"total": 0, "ok": 0, "skipped": 0, "errors": 0}, {}
 
     keyframes = get_keyframes(total_frames, OPEN_LOOP_HORIZON)
     episode_perception_dir = data_dir / "perception"
@@ -306,7 +464,6 @@ def process_episode(
                 print(f"    {frame_idx:05d}/perception.h5  (skip)")
                 stats["skipped"] += 1
             else:
-                n_obj = 0  # reported inside process_frame via bboxes length
                 print(f"    {frame_idx:05d}/perception.h5  ✓")
                 stats["ok"] += 1
 
@@ -319,7 +476,15 @@ def process_episode(
             traceback.print_exc()
             stats["errors"] += 1
 
-    return stats
+    # Write episode-level label stats (reads all h5 files, including pre-existing ones)
+    episode_perception_dir.mkdir(exist_ok=True)
+    instruction_path = data_dir / "instruction.txt"
+    instruction = instruction_path.read_text().strip() if instruction_path.exists() else ""
+    label_counts = write_episode_label_stats(
+        episode_perception_dir, data_dir.name, instruction, outcome
+    )
+
+    return stats, label_counts
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -363,6 +528,7 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     total_episodes = processed = skipped = errors = 0
+    all_episode_label_counts: list[dict[str, int]] = []  # for dataset-level stats
 
     for outcome in ("success", "failure"):
         outcome_dir = DATA_ROOT / outcome
@@ -381,13 +547,25 @@ def main(argv: list[str] | None = None) -> None:
                 marker = data_dir / "perception.md"
                 if marker.exists() and not args.force:
                     print(f"[skip] {outcome}/{date_dir.name}/{episode_id}")
+                    # Still collect label stats from existing perception.h5 files
+                    ep_perc_dir = data_dir / "perception"
+                    if ep_perc_dir.exists():
+                        instruction_path = data_dir / "instruction.txt"
+                        instruction = instruction_path.read_text().strip() if instruction_path.exists() else ""
+                        label_counts = write_episode_label_stats(ep_perc_dir, episode_id, instruction, outcome)
+                        if label_counts:
+                            all_episode_label_counts.append(label_counts)
                     skipped += 1
                     continue
 
                 print(f"\n[{total_episodes}] {outcome}/{date_dir.name}/{episode_id}")
                 t0 = time.perf_counter()
 
-                stats = process_episode(data_dir=data_dir, **frame_kwargs)
+                stats, label_counts = process_episode(
+                    data_dir=data_dir, outcome=outcome, **frame_kwargs
+                )
+                if label_counts:
+                    all_episode_label_counts.append(label_counts)
 
                 elapsed = time.perf_counter() - t0
                 print(
@@ -411,6 +589,11 @@ def main(argv: list[str] | None = None) -> None:
                         f"GeminiModel: {args.gemini_model}\n"
                     )
                     processed += 1
+
+    # Dataset-level label stats (written even if some episodes were skipped)
+    total_counted = skipped + processed
+    if all_episode_label_counts:
+        write_dataset_label_stats(DATA_ROOT, all_episode_label_counts, total_counted)
 
     print(f"\n{'=' * 50}")
     print(f"Total episodes:         {total_episodes}")
