@@ -22,6 +22,13 @@ Produces the schema expected by viz/dashboard/loader.py:
         cols = [joint_velocity×7, gripper_position×1]  (action_dim=8)
     /pred_action        float32[8, action_dim]   gzip-4
         Pi0.5 predicted actions for the same horizon (DroidOutputs[:, :8])
+    /suffix_denoising
+        n_steps         int32
+        action_traj     float32[n_steps, action_horizon, action_dim]   gzip-4
+            x_t after each Euler step; index 0 = mostly noise, index -1 = clean action
+        layer_{i}/
+            action_to_img_steps  float32[n_steps, 8, 512]   gzip-4
+            group_masses         float32[n_steps, 4]         gzip-4
 
 Primary entry point (pipeline.py):
     from attn_h5_writer import write_attn_h5_from_buffer
@@ -100,8 +107,10 @@ def _write_h5_core(
     instruction: str,
     frame_idx: int,
     suffix_arrays: dict[int, np.ndarray] | None = None,
+    suffix_steps_arrays: list[dict[int, np.ndarray]] | None = None,
     gt_action: np.ndarray | None = None,
     pred_action: np.ndarray | None = None,
+    action_traj: list[np.ndarray] | None = None,
     is_pi05: bool = True,
 ) -> bool:
     """Write a single HDF5 from an in-memory layer dict.
@@ -233,6 +242,64 @@ def _write_h5_core(
                     chunks=(1, 8, TOTAL_IMAGE_TOKENS),
                 )
 
+        # /suffix_denoising  — per-NFE-step action attention (compact)
+        # Stores mean-over-heads attention for every denoising step so the
+        # dashboard can plot attention-mass trajectories without re-running inference.
+        #
+        # Schema per layer:
+        #   action_to_img_steps  float32(n_steps, 8_action, 512_patches)
+        #   group_masses         float32(n_steps, 4)  — [ext, wrist, text, action_self]
+        if suffix_steps_arrays:
+            n_steps = len(suffix_steps_arrays)
+            text_end = TEXT_START_IDX + n_text_actual
+            sd_grp = f.create_group("suffix_denoising")
+            sd_grp.create_dataset("n_steps", data=np.int32(n_steps))
+
+            # Gather layer indices from first step
+            layer_indices = sorted(suffix_steps_arrays[0].keys())
+            for layer_idx in layer_indices:
+                img_steps   = []   # (n_steps, 8, 512)
+                mass_steps  = []   # (n_steps, 4)
+                for step_dict in suffix_steps_arrays:
+                    sa = step_dict[layer_idx]
+                    if sa.ndim == 4:
+                        sa = sa[0]              # (n_heads, 8, seq_len)
+                    sa = sa.astype(np.float32)
+                    mean_h = sa.mean(axis=0)    # (8, seq_len)
+                    img_steps.append(mean_h[:, :TOTAL_IMAGE_TOKENS])  # (8, 512)
+                    # Group masses — mean over action steps then sum per region
+                    mean_ha = mean_h.mean(axis=0)   # (seq_len,)
+                    mass_steps.append([
+                        float(mean_ha[:NUM_IMAGE_TOKENS].sum()),                    # ext
+                        float(mean_ha[NUM_IMAGE_TOKENS:TOTAL_IMAGE_TOKENS].sum()),  # wrist
+                        float(mean_ha[TEXT_START_IDX:text_end].sum()),              # text
+                        float(mean_ha[text_end:].sum()),                            # action self
+                    ])
+
+                lg = sd_grp.create_group(f"layer_{layer_idx}")
+                lg.create_dataset(
+                    "action_to_img_steps",
+                    data=np.array(img_steps,  dtype=np.float32),   # (n_steps, 8, 512)
+                    compression="gzip", compression_opts=4,
+                    chunks=(1, 8, TOTAL_IMAGE_TOKENS),
+                )
+                lg.create_dataset(
+                    "group_masses",
+                    data=np.array(mass_steps, dtype=np.float32),   # (n_steps, 4)
+                    compression="gzip", compression_opts=4,
+                )
+
+            # /suffix_denoising/action_traj — x_t after each Euler step
+            # shape: (n_steps, action_horizon, action_dim)  e.g. (10, 15, 8)
+            # index 0 = after 1st step (mostly noise), index -1 = final clean action
+            if action_traj:
+                traj_arr = np.stack(action_traj, axis=0).astype(np.float32)
+                sd_grp.create_dataset(
+                    "action_traj",
+                    data=traj_arr,
+                    compression="gzip", compression_opts=4,
+                )
+
     return True
 
 
@@ -246,27 +313,34 @@ def write_attn_h5_from_buffer(
     instruction: str = "",
     frame_idx: int = 0,
     suffix_attn_buffer: dict[int, np.ndarray] | None = None,
+    suffix_steps_buffer: list[dict[int, np.ndarray]] | None = None,
     gt_action: np.ndarray | None = None,
     pred_action: np.ndarray | None = None,
+    action_traj: list[np.ndarray] | None = None,
     is_pi05: bool = True,
 ) -> bool:
     """Write HDF5 directly from in-RAM attention buffers (primary API).
 
-    *attn_buffer* is the dict returned by ``gemma_pytorch.get_attn_buffer()`` (prefix).
-    *suffix_attn_buffer* is the dict from ``gemma_pytorch.get_suffix_attn_buffer()``
-    (action-token attention); writes ``/suffix/layer_{i}/action_to_img``.
-    *gt_action* is a float32 array of shape (OPEN_LOOP_HORIZON, action_dim) loaded from
-    trajectory.h5; writes ``/gt_action``. Pass None to omit.
-    *pred_action* is the ``result["actions"]`` array from ``policy.infer()``; writes
-    ``/pred_action``. Pass None to omit.
-    *is_pi05* controls which tokenization format is used for token label metadata:
-    True (default) for π₀.₅ ("Task: ..., State: ...;\\nAction: "), False for π₀ (instruction only).
+    *attn_buffer* — prefix attention from ``gemma_pytorch.get_attn_buffer()``.
+    *suffix_attn_buffer* — averaged action attention from ``get_suffix_attn_buffer()``;
+        writes ``/suffix/layer_{i}/action_to_img``.
+    *suffix_steps_buffer* — per-NFE-step list from ``get_suffix_attn_steps_buffer()``;
+        writes compact ``/suffix_denoising/`` group (group_masses + action_to_img_steps).
+        Does not affect /prefix or /suffix groups.
+    *gt_action* — float32(OPEN_LOOP_HORIZON, action_dim) from trajectory.h5.
+    *pred_action* — ``result["actions"]`` from ``policy.infer()``.
+    *action_traj* — list of float32(action_horizon, action_dim) from
+        ``get_action_traj_buffer()``, one entry per Euler step; written to
+        ``/suffix_denoising/action_traj`` as float32(n_steps, action_horizon, action_dim).
+    *is_pi05* — selects tokenization format for token-label metadata.
     """
     return _write_h5_core(
         attn_buffer, Path(h5_path), ext_img, wrist_img, instruction, frame_idx,
         suffix_arrays=suffix_attn_buffer or {},
+        suffix_steps_arrays=suffix_steps_buffer or [],
         gt_action=gt_action,
         pred_action=pred_action,
+        action_traj=action_traj,
         is_pi05=is_pi05,
     )
 

@@ -23,7 +23,7 @@ for _p in [_PROJECT_ROOT, os.path.join(_PROJECT_ROOT, "src")]:
 
 from viz.dashboard import loader as _loader
 from viz.dashboard import loader_results as _rl
-from viz.dashboard.views import action_view, attn_matrix, cag_view, ckpt_compare, comparison, counterfactual, dataset_browser, grid_heatmap, image_heatmap, image_saliency, trajectory
+from viz.dashboard.views import action_view, attn_matrix, cag_view, ckpt_compare, comparison, counterfactual, dataset_browser, denoising_view, grid_heatmap, image_heatmap, image_saliency, trajectory
 
 
 def _save_online_h5(slice_dict: dict, h5_path: str) -> None:
@@ -216,6 +216,13 @@ with st.sidebar:
         _hand_dir = os.path.join(_frames_root, "hand_camera")
         _n_frames = len([f for f in os.listdir(_hand_dir) if f.endswith(".jpg")]) if os.path.isdir(_hand_dir) else 1
         _max_frame = max(0, _n_frames - 1)
+        # Clamp to trajectory.h5 length when present (images may outnumber traj rows)
+        _traj_path = os.path.join(_ep_dir, "trajectory.h5")
+        if _has_recordings and os.path.exists(_traj_path):
+            import h5py as _h5py
+            with _h5py.File(_traj_path, "r") as _f:
+                _traj_len = _f["observation/robot_state/joint_positions"].shape[0]
+            _max_frame = min(_max_frame, _traj_len - 1)
         _instr_path = os.path.join(_ep_dir, "instruction.txt")
         _default_instr = open(_instr_path).read().strip() if os.path.exists(_instr_path) else ""
 
@@ -575,12 +582,13 @@ if mode == "Offline (HDF5)":
     if meta.get("instruction"):
         st.caption(f"**Instruction:** {meta['instruction']}")
 
-    tab0, tab1, tab2, tab3, tab4 = st.tabs([
+    tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "🔲 Grid Heatmap",
         "🖼 Image Heatmap",
         "📊 Attention Matrix",
         "🤖 Action View",
         "⚖ Compare",
+        "🧠 Denoising",
     ])
 
     with tab0:
@@ -600,6 +608,12 @@ if mode == "Offline (HDF5)":
             attn_h5_root=ATTN_H5_ROOT,
             default_checkpoint=checkpoint_a,
             checkpoints=checkpoints,
+        )
+
+    with tab5:
+        denoising_view.render(
+            available_layers=available_layers,
+            h5_path=h5_path,
         )
 
 elif mode == "Results (Benchmark)":
@@ -643,13 +657,14 @@ elif mode == "Results (Benchmark)":
     if meta.get("instruction"):
         st.caption(f"**Instruction:** {meta['instruction']}")
 
-    tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "🔲 Grid Heatmap",
         "🖼 Image Heatmap",
         "📊 Attention Matrix",
         "🤖 Action View",
         "⚖ Compare",
         "📈 Trajectory",
+        "🧠 Denoising",
     ])
 
     with tab0:
@@ -674,6 +689,17 @@ elif mode == "Results (Benchmark)":
             episode=res_episode,
             available_frames=res_all_frames,
             cf_slugs=res_cf_slugs,
+        )
+    with tab6:
+        _all_res_h5 = [
+            _rl.h5_path_results(_res_root, res_outcome, res_date, res_episode, f)
+            for f in res_all_frames
+        ]
+        denoising_view.render(
+            available_layers=available_layers,
+            h5_path=res_h5,
+            all_frame_paths=_all_res_h5,
+            frame_labels=[str(f) for f in res_all_frames],
         )
 
 elif mode == "Online (Inference)":
@@ -705,7 +731,7 @@ elif mode == "Online (Inference)":
         except Exception as _e:
             st.error(f"Save failed: {_e}")
 
-    tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "🔲 Grid Heatmap",
         "🖼 Image Heatmap",
         "📊 Attention Matrix",
@@ -713,6 +739,7 @@ elif mode == "Online (Inference)":
         "🔀 Counterfactual",
         "🧩 Occlusion Saliency",
         "📐 Language Grounding (CAG)",
+        "🧠 Denoising",
     ])
 
     with tab0:
@@ -733,6 +760,12 @@ elif mode == "Online (Inference)":
         image_saliency.render()
     with tab6:
         cag_view.render()
+    with tab7:
+        denoising_view.render(
+            available_layers=available_layers,
+            mem_images=data.get("images"),
+            mem_denoising=data.get("suffix_denoising"),
+        )
 
 elif mode == "Online (Upload)":
     # ── Online (Upload) mode ──────────────────────────────────────────────────
@@ -749,7 +782,7 @@ elif mode == "Online (Upload)":
         if k.startswith("layer_")
     )
 
-    tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "🔲 Grid Heatmap",
         "🖼 Image Heatmap",
         "📊 Attention Matrix",
@@ -757,6 +790,7 @@ elif mode == "Online (Upload)":
         "🔀 Counterfactual",
         "🧩 Occlusion Saliency",
         "📐 Language Grounding (CAG)",
+        "🧠 Denoising",
     ])
 
     with tab0:
@@ -777,6 +811,12 @@ elif mode == "Online (Upload)":
         image_saliency.render()
     with tab6:
         cag_view.render()
+    with tab7:
+        denoising_view.render(
+            available_layers=available_layers,
+            mem_images=data.get("images"),
+            mem_denoising=data.get("suffix_denoising"),
+        )
 
 elif mode == "Online (Dataset)":
     # ── Online (Dataset) mode ─────────────────────────────────────────────────
@@ -784,23 +824,15 @@ elif mode == "Online (Dataset)":
 
     dataset_browser.render(ds_data_root, ds_ckpt_path, ds_gpu)
 
-    # Show attention tabs once inference has run
-    if "online_data" in st.session_state:
+    # Attention tabs are shown only on the results page
+    if st.session_state.get("ds_page") == "results" and "online_data" in st.session_state:
         data = st.session_state["online_data"]
         available_layers = sorted(
             int(k.split("_")[1])
             for k in data.get("prefix", {})
             if k.startswith("layer_")
         )
-
-        ep  = st.session_state.get("ds_selected_episode", {})
-        frm = st.session_state.get("ds_selected_frame", 0)
-        st.divider()
-        st.subheader(f"Results — `{ep.get('episode_id', '')}` · frame {frm:05d}")
-        if data.get("meta", {}).get("instruction"):
-            st.caption(f"**Instruction:** {data['meta']['instruction']}")
-
-        tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
             "🔲 Grid Heatmap",
             "🖼 Image Heatmap",
             "📊 Attention Matrix",
@@ -808,6 +840,7 @@ elif mode == "Online (Dataset)":
             "🔀 Counterfactual",
             "🧩 Occlusion Saliency",
             "📐 Language Grounding (CAG)",
+            "🧠 Denoising",
         ])
         with tab0:
             grid_heatmap.render(data, available_layers)
@@ -827,6 +860,12 @@ elif mode == "Online (Dataset)":
             image_saliency.render()
         with tab6:
             cag_view.render()
+        with tab7:
+            denoising_view.render(
+                available_layers=available_layers,
+                mem_images=data.get("images"),
+                mem_denoising=data.get("suffix_denoising"),
+            )
 
 else:
     # ── Compare (Online) mode ─────────────────────────────────────────────────

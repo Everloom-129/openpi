@@ -279,6 +279,8 @@ def render(
     else:
         row_display = [_token_label(i, token_texts, s) for i in range(r_start, r_end)]
         selected_row_label = st.selectbox("Query token", row_display, index=0, key="am_row_sel")
+        if selected_row_label is None:
+            return
         tok_local = row_display.index(selected_row_label)
         seq_row = r_start + tok_local
         sel_display = selected_row_label

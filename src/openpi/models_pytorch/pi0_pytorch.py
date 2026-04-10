@@ -425,6 +425,11 @@ class PI0Pytorch(nn.Module):
             # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t + dt * v_t
             time += dt
+
+            # Record action chunk after this step (for denoising trajectory analysis)
+            import openpi.models_pytorch.gemma_pytorch as _gpt
+            _gpt.append_action_traj(x_t[0].detach().cpu().numpy())
+
         return x_t
 
     def denoise_step(

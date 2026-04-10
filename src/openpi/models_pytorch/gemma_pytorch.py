@@ -13,7 +13,7 @@ from transformers.models.gemma import modeling_gemma
 # ── In-RAM attention capture ───────────────────────────────────────────────────
 # Usage (pipeline.py):
 #   _gpt.enable_attn_buffer()         # arm prefix capture
-#   _gpt.enable_suffix_attn_buffer()  # arm suffix capture
+#   _gpt.enable_suffix_attn_buffer(capture_steps=1)  # arm suffix capture (first N NFE steps)
 #   result = policy.infer(example)
 #   buf        = _gpt.get_attn_buffer()
 #   suffix_buf = _gpt.get_suffix_attn_buffer()
@@ -31,6 +31,8 @@ _ATTN_BUFFER_NOTIFIED: bool = False
 
 _SUFFIX_ATTN_BUFFER: dict[int, np.ndarray] | None = None
 _SUFFIX_ATTN_BUFFER_NOTIFIED: bool = False
+_SUFFIX_ATTN_BUFFER_CALL_COUNT: int = 0   # NFE steps seen so far this infer()
+_SUFFIX_ATTN_BUFFER_CAPTURE_STEPS: int = 1  # how many early steps to average
 
 
 def enable_attn_buffer() -> None:
@@ -53,10 +55,19 @@ def clear_attn_buffer() -> None:
     _ATTN_BUFFER = None
 
 
-def enable_suffix_attn_buffer() -> None:
-    """Arm the in-RAM suffix (action-token) attention buffer."""
+def enable_suffix_attn_buffer(capture_steps: int = 1) -> None:
+    """Arm the in-RAM suffix (action-token) attention buffer.
+
+    Args:
+        capture_steps: Number of early denoising NFE steps to capture and average.
+            Subsequent steps are ignored.  Default 1 captures only the first step.
+            Set to a large number (e.g. 999) to capture and average all steps.
+    """
     global _SUFFIX_ATTN_BUFFER, _SUFFIX_ATTN_BUFFER_NOTIFIED
+    global _SUFFIX_ATTN_BUFFER_CALL_COUNT, _SUFFIX_ATTN_BUFFER_CAPTURE_STEPS
     _SUFFIX_ATTN_BUFFER = {}
+    _SUFFIX_ATTN_BUFFER_CALL_COUNT = 0
+    _SUFFIX_ATTN_BUFFER_CAPTURE_STEPS = capture_steps
     if not _SUFFIX_ATTN_BUFFER_NOTIFIED:
         print("[attn] Suffix attention capture enabled — action-token attention will be held in RAM.")
         _SUFFIX_ATTN_BUFFER_NOTIFIED = True
@@ -67,10 +78,85 @@ def get_suffix_attn_buffer() -> dict[int, np.ndarray] | None:
     return _SUFFIX_ATTN_BUFFER
 
 
+def get_suffix_attn_buffer_step_count() -> int:
+    """Return how many NFE steps were captured in the last infer() call."""
+    return _SUFFIX_ATTN_BUFFER_CALL_COUNT
+
+
 def clear_suffix_attn_buffer() -> None:
     """Disarm and discard the suffix buffer. Call in a finally block after infer()."""
-    global _SUFFIX_ATTN_BUFFER
+    global _SUFFIX_ATTN_BUFFER, _SUFFIX_ATTN_BUFFER_CALL_COUNT
     _SUFFIX_ATTN_BUFFER = None
+    _SUFFIX_ATTN_BUFFER_CALL_COUNT = 0
+
+
+# ── Per-step suffix buffer (stores every NFE step separately) ─────────────────
+# Use this when you need to analyze how attention evolves over denoising.
+# Each entry in the list is one NFE step: {layer_idx: ndarray(1, n_heads, 8, k)}.
+
+_SUFFIX_ATTN_STEPS_BUFFER: list[dict[int, np.ndarray]] | None = None
+
+
+def enable_suffix_attn_steps_buffer() -> None:
+    """Arm per-step suffix attention capture.
+
+    Every NFE call appends a fresh {layer_idx: ndarray} snapshot to the list.
+    Use get_suffix_attn_steps_buffer() after infer() to retrieve all steps.
+    Can be used together with enable_suffix_attn_buffer().
+    """
+    global _SUFFIX_ATTN_STEPS_BUFFER
+    _SUFFIX_ATTN_STEPS_BUFFER = []
+
+
+def get_suffix_attn_steps_buffer() -> list[dict[int, np.ndarray]] | None:
+    """Return list of per-step attention dicts, or None if not armed.
+
+    Index 0 = first denoising step (most noise), index -1 = last step (clean action).
+    Each dict: {layer_idx: ndarray(1, n_heads, 8_action_steps, seq_len)}.
+    """
+    return _SUFFIX_ATTN_STEPS_BUFFER
+
+
+def clear_suffix_attn_steps_buffer() -> None:
+    """Disarm and discard the per-step buffer. Call in a finally block after infer()."""
+    global _SUFFIX_ATTN_STEPS_BUFFER
+    _SUFFIX_ATTN_STEPS_BUFFER = None
+
+
+# ── Action trajectory buffer (stores x_t after each Euler step) ───────────────
+# Each entry is float32(action_horizon, action_dim) — the denoised action chunk
+# after that NFE step.  Index 0 = after 1st step (least denoised),
+# index -1 = after last step (== pred_action / final clean action).
+
+_ACTION_TRAJ_BUFFER: list[np.ndarray] | None = None
+
+
+def enable_action_traj_buffer() -> None:
+    """Arm the action trajectory buffer. Call once before each policy.infer()."""
+    global _ACTION_TRAJ_BUFFER
+    _ACTION_TRAJ_BUFFER = []
+
+
+def append_action_traj(x_t: np.ndarray) -> None:
+    """Append x_t (after one Euler step) to the buffer. Called from pi0_pytorch."""
+    if _ACTION_TRAJ_BUFFER is not None:
+        _ACTION_TRAJ_BUFFER.append(x_t)
+
+
+def get_action_traj_buffer() -> list[np.ndarray] | None:
+    """Return list of per-step action arrays, or None if not armed.
+
+    Index 0 = after 1st denoising step (mostly noise),
+    index -1 = final clean action (== pred_action).
+    Each entry: float32(action_horizon, action_dim).
+    """
+    return _ACTION_TRAJ_BUFFER
+
+
+def clear_action_traj_buffer() -> None:
+    """Disarm and discard the action trajectory buffer. Call in a finally block."""
+    global _ACTION_TRAJ_BUFFER
+    _ACTION_TRAJ_BUFFER = None
 
 
 class PaliGemmaWithExpertModel(nn.Module):
@@ -161,6 +247,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         use_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
     ):
+        global _SUFFIX_ATTN_BUFFER_CALL_COUNT
         if adarms_cond is None:
             adarms_cond = [None, None]
         if inputs_embeds[1] is None:
@@ -196,11 +283,34 @@ class PaliGemmaWithExpertModel(nn.Module):
             )
 
             # --- Capture suffix attention into RAM buffer ---
+            # Only accumulate the first _SUFFIX_ATTN_BUFFER_CAPTURE_STEPS NFE steps.
+            # After that the buffer holds their per-layer average and further steps
+            # are ignored.  Accumulation: running sum → divide on the final step.
             if not self.training and _SUFFIX_ATTN_BUFFER is not None:
                 if suffix_output.attentions is not None:
-                    for i, layer_attn in enumerate(suffix_output.attentions):
-                        _SUFFIX_ATTN_BUFFER[i] = layer_attn.detach().cpu().to(torch.float32).numpy()
+                    if _SUFFIX_ATTN_BUFFER_CALL_COUNT < _SUFFIX_ATTN_BUFFER_CAPTURE_STEPS:
+                        for i, layer_attn in enumerate(suffix_output.attentions):
+                            arr = layer_attn.detach().cpu().to(torch.float32).numpy()
+                            if i in _SUFFIX_ATTN_BUFFER:
+                                _SUFFIX_ATTN_BUFFER[i] = _SUFFIX_ATTN_BUFFER[i] + arr
+                            else:
+                                _SUFFIX_ATTN_BUFFER[i] = arr
+                    _SUFFIX_ATTN_BUFFER_CALL_COUNT += 1
+                    # Normalize to an average on the last captured step
+                    if _SUFFIX_ATTN_BUFFER_CALL_COUNT == _SUFFIX_ATTN_BUFFER_CAPTURE_STEPS:
+                        n = _SUFFIX_ATTN_BUFFER_CAPTURE_STEPS
+                        for i in _SUFFIX_ATTN_BUFFER:
+                            _SUFFIX_ATTN_BUFFER[i] = _SUFFIX_ATTN_BUFFER[i] / n
             # ------------------------------------------------
+
+            # --- Per-step capture (appends every NFE step to a list) ---------
+            if not self.training and _SUFFIX_ATTN_STEPS_BUFFER is not None:
+                if suffix_output.attentions is not None:
+                    step_snap: dict[int, np.ndarray] = {}
+                    for i, layer_attn in enumerate(suffix_output.attentions):
+                        step_snap[i] = layer_attn.detach().cpu().to(torch.float32).numpy()
+                    _SUFFIX_ATTN_STEPS_BUFFER.append(step_snap)
+            # -----------------------------------------------------------------
 
             suffix_output = suffix_output.last_hidden_state
             prefix_output = None

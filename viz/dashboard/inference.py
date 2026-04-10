@@ -78,14 +78,17 @@ def run_inference(policy, example: dict) -> dict:
 
     # ── Capture attention into RAM buffer ────────────────────────────────────
     _gpt.enable_attn_buffer()
-    _gpt.enable_suffix_attn_buffer()
+    _gpt.enable_suffix_attn_buffer(capture_steps=1)
+    _gpt.enable_suffix_attn_steps_buffer()
     try:
         result = policy.infer(example)
-        buf = _gpt.get_attn_buffer()
-        suffix_buf = _gpt.get_suffix_attn_buffer()
+        buf          = _gpt.get_attn_buffer()
+        suffix_buf   = _gpt.get_suffix_attn_buffer()
+        steps_buf    = _gpt.get_suffix_attn_steps_buffer() or []
     finally:
         _gpt.clear_attn_buffer()
         _gpt.clear_suffix_attn_buffer()
+        _gpt.clear_suffix_attn_steps_buffer()
 
     if not buf:
         st.warning("Attention buffer is empty — model may not have run the prefix forward pass.")
@@ -158,6 +161,38 @@ def run_inference(policy, example: dict) -> dict:
     pred_action = result.get("actions")    # (8, 8) float32
     gt_action   = example.get("gt_action") # (8, 8) float32 or None
 
+    # ── Build suffix_denoising dict from per-step buffer ─────────────────────
+    # Mirrors the /suffix_denoising HDF5 schema so denoising_view can consume
+    # in-memory data with the same code path as Results (HDF5) mode.
+    suffix_denoising: dict[str, Any] = {}
+    if steps_buf:
+        n_steps  = len(steps_buf)
+        text_end = TEXT_START_IDX + n_text_actual
+        suffix_denoising["n_steps"] = n_steps
+        layer_indices = sorted(steps_buf[0].keys())
+        for layer_idx in layer_indices:
+            img_steps  = []
+            mass_steps = []
+            for step_dict in steps_buf:
+                sa = step_dict[layer_idx]
+                if sa.ndim == 4:
+                    sa = sa[0]                          # (n_heads, 8, seq_len)
+                sa = sa.astype(np.float32)
+                mean_h  = sa.mean(axis=0)               # (8, seq_len)
+                img_steps.append(mean_h[:, :TOTAL_IMAGE_TOKENS])   # (8, 512)
+                mean_ha = mean_h.mean(axis=0)           # (seq_len,)
+                mass_steps.append([
+                    float(mean_ha[:256].sum()),                     # ext
+                    float(mean_ha[256:512].sum()),                  # wrist
+                    float(mean_ha[TEXT_START_IDX:text_end].sum()),  # text
+                    float(mean_ha[text_end:].sum()),                # action self
+                ])
+            suffix_denoising[f"layer_{layer_idx}"] = {
+                "n_steps":             n_steps,
+                "action_to_img_steps": np.array(img_steps,  dtype=np.float32),  # (S, 8, 512)
+                "group_masses":        np.array(mass_steps, dtype=np.float32),  # (S, 4)
+            }
+
     return {
         "meta": {
             "prefix_len": TEXT_START_IDX,
@@ -170,10 +205,11 @@ def run_inference(policy, example: dict) -> dict:
             "exterior": _to_224(example.get("observation/exterior_image_1_left")),
             "wrist":    _to_224(example.get("observation/wrist_image_left")),
         },
-        "prefix":      prefix,
-        "joint":       joint or None,
-        "pred_action": pred_action,
-        "gt_action":   gt_action,
+        "prefix":            prefix,
+        "joint":             joint or None,
+        "pred_action":       pred_action,
+        "gt_action":         gt_action,
+        "suffix_denoising":  suffix_denoising or None,
     }
 
 

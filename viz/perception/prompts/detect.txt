@@ -1,23 +1,28 @@
-Perform 1 tasks on this image based on the task instruction: "{task_instruction}".
+Perform object detection on this image for the task: "{task_instruction}"
 
-TASK 1 - OBJECT DETECTION:
-Detect and return bounding boxes for objects in the image.
-- DO NOT include the robot, robot gripper, or table surface
-- DO NOT include objects or surfaces irrelevant to the task or too far away to matter (e.g. walls, things on the wall that are far away, things on the floor below the table, people who might be in the scene, etc.)
-- Limit to 25 objects
-- If an object appears multiple times, name them by unique characteristics (color, size, position, etc.). If they seem the same, then just use numbers (e.g. 'soda_can1' and 'soda_can2', ... for identical-looking soda cans)
-- An object **cannot have the same name** as another under any circumstance.
-- Format: normalized coordinates 0-1000 as integers
+RULES:
+1. Detect only COMPLETE, physically distinct objects. Never detect parts of an object.
+   - WRONG: "pineapple_body", "pineapple_leaf", "cup_handle"
+   - RIGHT: "pineapple_toy", "cup"
+   - WRONG: "B b
+2. Limit to 10 objects maximum. Prioritise objects mentioned or implied by the task first,
+   then other objects on the table a robot might interact with.
+3. Task-relevant objects first: identify and label the objects the task refers to before
+   anything else, using colors/descriptors from the instruction where applicable.
+   (e.g. if task says "pick up the red apple", your first bbox should be the red apple)
+4. If the same object appears multiple times, label them object_1, object_2, etc.
+   If objects are nested (e.g. cup inside bowl), detect each whole object separately —
+   do NOT split either into parts.
+5. DO NOT include: robot, robot gripper, table surface, walls, floor, people,
+   or objects too far away to be relevant.
+6. Coordinates: normalized 0–1000 as integers, format [ymin, xmin, ymax, xmax].
 
-Be very careful to identify objects and name them in a way that's relevant to the task. If the task involves picking up a red apple, make sure that 'red' appears in the name of the apple.
-
-
-Return a single JSON object with this structure (no code fencing):
+Return a single JSON object (no code fencing, no extra text, start with {{ end with }}):
 {{
     "bboxes": [
         {{"box_2d": [ymin, xmin, ymax, xmax], "label": "object name"}},
         ...
-    ],
+    ]
 }}
 
-Only reference objects that you actually detected in the image.
+Only include objects you actually see in the image.

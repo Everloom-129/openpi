@@ -235,8 +235,7 @@ def main(argv: list[str] | None = None) -> None:
             write_marker(ep, cf_prompts)
             processed_early += 1
 
-    device_id = select_best_gpu()
-    device = f"cuda:{device_id}"
+    device = select_best_gpu()
     print(f"Loading one policy instance on {device} ...")
     policy = get_policy(args.checkpoint, device=device)
     is_pi05 = bool(getattr(getattr(policy, "_model", None), "pi05", True))

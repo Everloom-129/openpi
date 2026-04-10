@@ -63,7 +63,7 @@ Each HDF5 file contains:
 - `/prefix/layer_{i}/` — `text_to_img` float32(8, n_text, 512) + `full` float32(8, seq, seq) for all 18 layers
 - `/suffix/layer_{i}/` — `action_to_img` float32(n_heads, 8, 512) — action-token → image attention
 - `/gt_action` — float32(8, 8): ground-truth [joint_velocity×7, gripper×1] from trajectory.h5, NaN-padded near episode end
-- `/pred_action` — float32(8, 8): Pi0.5 predicted actions from policy.infer()
+- `/pred_action` — float32(N, 8): full predicted action chunk from policy.infer(). N varies by model (pi0.5=15, pi0=10). Dashboard clips to first 8 steps (OPEN_LOOP_HORIZON) for display.
 
 **2. Loader Layer** — `viz/dashboard/loader.py`
 Streamlit-cached functions for efficient data access. Key constants:
@@ -83,7 +83,7 @@ Modular tabs, each independently customizable:
 - `grid_heatmap.py` — text→image attention as 16×16 grids per camera
 - `image_heatmap.py` — attention overlaid on RGB images
 - `attn_matrix.py` — full sequence-level attention matrix
-- `action_view.py` — where action tokens attend + pred vs GT action benchmark
+- `action_view.py` — action→image heatmap grid (8 steps × 2 cameras), temporal coupling, attention source breakdown, pred vs GT benchmark. Requires `data["joint"]` dict; falls back to text-proxy view when absent.
 - `trajectory.py` — multi-frame attention grid + action benchmark across episode
 - `comparison.py` / `counterfactual.py` — multi-checkpoint or counterfactual prompt comparisons
 
@@ -119,9 +119,9 @@ This layout is critical for all slicing/indexing in the visualization code.
 
 `viz/dashboard/app.py` wires sidebar controls to loader and views.
 
-- **Offline (HDF5)**: Browse pre-computed attention from `attn_h5/` (legacy format)
-- **Results (Benchmark)**: Browse batch pipeline output from `RESULTS_ROOT`. Camera (left/right) is selected in the sidebar — resolves to `RESULTS_ROOT/{camera}/`. Includes Trajectory tab with action benchmark.
-- **Online (Inference)**: Live inference on example episodes from `data/example/`. Episodes are auto-discovered; structure (DROID `recordings/frames/` vs duck `frames/`) is detected automatically. GPU list is detected via `pynvml`; "Auto" selects the GPU with most free memory.
+- **Offline (HDF5)**: Browse pre-computed attention from `attn_h5/` (legacy format). Populates `data["joint"]` from `/suffix/` HDF5 group (action→image only; no action→text or temporal coupling).
+- **Results (Benchmark)**: Browse batch pipeline output from `RESULTS_ROOT`. Camera (left/right) is selected in the sidebar — resolves to `RESULTS_ROOT/{camera}/`. Includes Trajectory tab with action benchmark. Also populates `data["joint"]`.
+- **Online (Inference)**: Live inference on example episodes from `data/example/`. Episodes are auto-discovered; structure (DROID `recordings/frames/` vs duck `frames/`) is detected automatically. GPU list is detected via `pynvml`; "Auto" selects the GPU with most free memory. Captures both prefix and suffix attention; `gt_action` available for DROID episodes (has trajectory.h5), None for duck format.
 
 `RESULTS_ROOT` is set via environment variable in `viz/start_app.sh` (per-user). Default layout:
 ```
@@ -154,10 +154,24 @@ finally:
 
 `viz/attn_h5_writer.write_attn_h5_from_buffer(attn_buffer, h5_path, ..., suffix_attn_buffer, gt_action, pred_action)` converts the buffer directly to HDF5.
 
+Both buffers should be enabled together in a single `policy.infer()` call (see `pipeline.py`).
+`viz/dashboard/inference.py` enables both and returns `{"prefix": ..., "joint": ..., "pred_action": ..., "gt_action": ...}`.
+
 This same pattern is used in:
 - `viz/pipeline.py` / `viz/pipeline_mp.py` — batch offline inference
-- `viz/dashboard/inference.py` — online inference
+- `viz/dashboard/inference.py` — online inference (captures both prefix + suffix)
 - `viz/dashboard/views/counterfactual.py` — counterfactual prompt inference
+
+### Action Denoising Analysis — `viz/action/`
+
+Standalone analysis scripts for action→token attention across denoising steps:
+- `export_denoising_spreadsheet.py` — episode-fair averaging over a dataset; outputs Excel + line/grid plots. Run via `bash viz/export_attn_grid.sh`.
+- `analyze_variance_by_outcome.py` — within-episode std of action self-attention, split by success/failure; Mann-Whitney U test + strip/box plots.
+- `plot_denoising_attn.py` — single-inference figure: action→image and action→text attention across all NFE steps.
+- `denoising_attn_dashboard.py` — interactive Streamlit dashboard for per-step attention.
+- `example_suffix_attn.py` — minimal example capturing suffix attention for one frame.
+
+All scripts use `Path(__file__).resolve().parents[2]` to reach the repo root (one extra level vs. `viz/` scripts).
 
 ### Batch Pipeline
 
@@ -179,7 +193,7 @@ The dashboard auto-detects the format by checking for `recordings/frames/`.
 `src/openpi/` contains the upstream model implementations:
 - `models/` — JAX implementations (PaliGemma backbone + action expert)
 - `models_pytorch/` — PyTorch equivalents; `gemma_pytorch.py` owns the attention buffer
-- `policies/` — Pi0, Pi0-FAST, Pi0.5 policy definitions; DROID output is `actions[:, :8]` (float32, shape 8×8)
+- `policies/` — Pi0, Pi0-FAST, Pi0.5 policy definitions; `policy.infer()` returns `{"actions": ndarray(N, 8)}` where N is the full chunk size (pi0.5=15, pi0=10). Use `actions[:8]` for the OPEN_LOOP_HORIZON=8 steps that are actually executed.
 - `training/` — training configs and data loaders
 - `serving/` — policy server for remote inference
 

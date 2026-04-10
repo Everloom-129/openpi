@@ -155,14 +155,20 @@ def infer_and_save(
     from openpi.models_pytorch import gemma_pytorch as _gpt
 
     _gpt.enable_attn_buffer()
-    _gpt.enable_suffix_attn_buffer()
+    _gpt.enable_suffix_attn_buffer(capture_steps=1)   # averaged first-step (existing /suffix)
+    _gpt.enable_suffix_attn_steps_buffer()             # all steps → /suffix_denoising attn
+    _gpt.enable_action_traj_buffer()                   # x_t after each Euler step
     try:
-        result = policy.infer(example)
-        buf        = _gpt.get_attn_buffer()
-        suffix_buf = _gpt.get_suffix_attn_buffer()
+        result          = policy.infer(example)
+        buf             = _gpt.get_attn_buffer()
+        suffix_buf      = _gpt.get_suffix_attn_buffer()
+        suffix_steps    = _gpt.get_suffix_attn_steps_buffer()
+        action_traj     = _gpt.get_action_traj_buffer()
     finally:
         _gpt.clear_attn_buffer()
         _gpt.clear_suffix_attn_buffer()
+        _gpt.clear_suffix_attn_steps_buffer()
+        _gpt.clear_action_traj_buffer()
 
     write_attn_h5_from_buffer(
         attn_buffer=buf or {},
@@ -172,8 +178,10 @@ def infer_and_save(
         instruction=example["prompt"],
         frame_idx=frame_idx,
         suffix_attn_buffer=suffix_buf or {},
+        suffix_steps_buffer=suffix_steps or [],
         gt_action=example.get("gt_action"),
         pred_action=result.get("actions"),
+        action_traj=action_traj or [],
         is_pi05=_is_pi05(policy),
     )
     return result
@@ -266,8 +274,7 @@ def main(argv: list[str] | None = None) -> None:
             print(f"  [{cf['method']}] {cf['key']!r}: {cf['prompt']!r}")
         print()
 
-    device_id = select_best_gpu()
-    device = f"cuda:{device_id}"
+    device = select_best_gpu()
     print(f"Loading policy from {args.checkpoint} on {device} ...")
     policy = get_policy(args.checkpoint, device=device, config_name=args.model)
     print("Policy loaded.\n")

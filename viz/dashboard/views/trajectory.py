@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 
 import cv2
 import matplotlib.gridspec as gridspec
@@ -44,6 +45,87 @@ DEFAULT_LAYERS = [1, 4, 5, 7, 10]
 THUMB_SIZE = 72   # px for thumbnail strip
 MAX_FRAMES_WARN = 16  # warn if more frames selected
 CHUNK_SIZE = 8   # frames per row in thumbnail strip and trajectory figures
+
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+
+
+# ── MP4 export ─────────────────────────────────────────────────────────────────
+
+def _export_mp4(
+    selected_frames: list[int],
+    selected_layers: list[int],
+    t2i_data: dict[tuple[int, int], np.ndarray | None],
+    imgs_by_frame: dict[int, np.ndarray | None],
+    tok_idx: int | None,
+    selected_label: str,
+    camera_key: str,
+    agg: str,
+    agg_fn,
+    outcome: str,
+    episode: str,
+    instruction: str,
+    fps: int = 8,
+) -> str:
+    """Render each episode frame as a video frame and save to attn_traj/.
+
+    Each video frame is a single-column trajectory figure (rows = layers)
+    for that episode frame, so the MP4 shows attention evolving over time.
+    """
+    def _slug(s: str, maxlen: int = 40) -> str:
+        return re.sub(r"[^a-zA-Z0-9_-]", "_", s)[:maxlen].strip("_")
+
+    out_dir = os.path.join(_PROJECT_ROOT, "attn_traj")
+    os.makedirs(out_dir, exist_ok=True)
+
+    instr_slug  = _slug(instruction, 40) or "noinstr"
+    layers_str  = "-".join(str(l) for l in selected_layers)
+    tok_slug    = _slug(selected_label, 20) or "all"
+    agg_slug    = _slug(agg, 15)
+    ep_slug     = _slug(episode, 20)
+    filename = (
+        f"{outcome}_{instr_slug}_{camera_key}_{agg_slug}"
+        f"_L{layers_str}_{tok_slug}_{ep_slug}_{len(selected_frames)}f.mp4"
+    )
+    out_path = os.path.join(out_dir, filename)
+
+    # Render the first frame to get stable video dimensions
+    first_fig = _build_trajectory_figure(
+        frames=[selected_frames[0]],
+        layers=selected_layers,
+        t2i_data=t2i_data,
+        imgs=imgs_by_frame,
+        tok_idx=tok_idx,
+        camera=camera_key,
+        agg_fn=agg_fn,
+    )
+    first_bytes = _fig_to_bytes(first_fig)  # also closes the figure
+    probe = cv2.imdecode(np.frombuffer(first_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+    h, w = probe.shape[:2]
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(out_path, fourcc, float(fps), (w, h))
+
+    # Write first frame (already rendered)
+    writer.write(probe)
+
+    # Render remaining frames
+    for frame in selected_frames[1:]:
+        fig = _build_trajectory_figure(
+            frames=[frame],
+            layers=selected_layers,
+            t2i_data=t2i_data,
+            imgs=imgs_by_frame,
+            tok_idx=tok_idx,
+            camera=camera_key,
+            agg_fn=agg_fn,
+        )
+        frame_bytes = _fig_to_bytes(fig)
+        img_bgr = cv2.imdecode(np.frombuffer(frame_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if img_bgr is not None:
+            writer.write(img_bgr)
+
+    writer.release()
+    return out_path
 
 
 # ── Figure builder ─────────────────────────────────────────────────────────────
@@ -622,6 +704,48 @@ def render(
             )
             caption = f'Trajectory — "{selected_label}" — {camera} — {agg}' if chunk_idx == 0 else None
             st.image(_fig_to_bytes(fig), caption=caption, use_container_width=True)
+
+    # ── Export MP4 ────────────────────────────────────────────────────────────
+    st.markdown("---")
+    exp_c1, exp_c2, _ = st.columns([2, 2, 6])
+    with exp_c1:
+        export_fps = st.number_input(
+            "FPS", min_value=1, max_value=30, value=8, step=1, key="traj_export_fps"
+        )
+    with exp_c2:
+        do_export = st.button("Export MP4", key="traj_export_mp4", type="primary")
+
+    if do_export:
+        with st.spinner(f"Rendering {len(selected_frames)}-frame MP4…"):
+            mp4_path = _export_mp4(
+                selected_frames=selected_frames,
+                selected_layers=selected_layers,
+                t2i_data=t2i_data,
+                imgs_by_frame=imgs_by_frame,
+                tok_idx=tok_idx,
+                selected_label=selected_label,
+                camera_key=camera_key,
+                agg=agg,
+                agg_fn=agg_fn,
+                outcome=outcome,
+                episode=episode,
+                instruction=meta.get("instruction", ""),
+                fps=int(export_fps),
+            )
+        st.session_state["traj_mp4_path"] = mp4_path
+        st.success(f"Saved: `{mp4_path}`")
+
+    if "traj_mp4_path" in st.session_state:
+        _mp4_path = st.session_state["traj_mp4_path"]
+        if os.path.exists(_mp4_path):
+            with open(_mp4_path, "rb") as _f:
+                st.download_button(
+                    "Download MP4",
+                    data=_f.read(),
+                    file_name=os.path.basename(_mp4_path),
+                    mime="video/mp4",
+                    key="traj_dl_mp4",
+                )
 
     # ── Action Token Temporal Analysis ───────────────────────────────────────
     _render_action_temporal(

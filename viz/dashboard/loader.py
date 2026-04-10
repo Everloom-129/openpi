@@ -123,6 +123,67 @@ def has_full_matrix(path: str, layer: int) -> bool:
         return f"prefix/layer_{layer}/full" in f
 
 
+@st.cache_data(ttl=300)
+def load_suffix_denoising(path: str, layer: int) -> dict | None:
+    """Load per-NFE-step denoising attention for one layer.
+
+    Written by pipeline.py via ``suffix_steps_buffer`` → ``/suffix_denoising/``.
+
+    Returns dict with:
+      n_steps            int
+      action_to_img_steps  float32(n_steps, 8_action, 512_patches)  — mean over heads
+      group_masses         float32(n_steps, 4)  — [ext, wrist, text, action_self]
+    Returns None if the file has no denoising data (pre-dates this feature).
+    """
+    if not os.path.exists(path):
+        return None
+    with h5py.File(path, "r") as f:
+        grp_key = f"suffix_denoising/layer_{layer}"
+        if grp_key not in f:
+            return None
+        n_steps = int(f["suffix_denoising/n_steps"][()])
+        return {
+            "n_steps":              n_steps,
+            "action_to_img_steps":  f[f"{grp_key}/action_to_img_steps"][()].astype(np.float32),
+            "group_masses":         f[f"{grp_key}/group_masses"][()].astype(np.float32),
+        }
+
+
+@st.cache_data(ttl=300)
+def load_suffix_denoising_trajectory(
+    paths: tuple[str, ...],
+    layer: int,
+) -> dict | None:
+    """Load group_masses across multiple frames (a trajectory) for one layer.
+
+    Returns dict with:
+      frame_indices  list[int]          — frames that had denoising data
+      group_masses   float32(F, S, 4)   — F frames, S denoising steps, 4 groups
+      n_steps        int
+    """
+    all_masses = []
+    frame_indices = []
+    n_steps = None
+
+    for path in paths:
+        d = load_suffix_denoising(path, layer)
+        if d is None:
+            continue
+        all_masses.append(d["group_masses"])     # (n_steps, 4)
+        frame_indices.append(path)
+        if n_steps is None:
+            n_steps = d["n_steps"]
+
+    if not all_masses:
+        return None
+
+    return {
+        "frame_paths":  frame_indices,
+        "group_masses": np.stack(all_masses, axis=0),   # (F, n_steps, 4)
+        "n_steps":      n_steps,
+    }
+
+
 # ── Cached loaders ─────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=300)

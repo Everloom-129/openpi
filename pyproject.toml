@@ -38,6 +38,13 @@ dependencies = [
     "rich>=14.0.0",
     "polars>=1.30.0",
     "ultralytics>=8.3.240",
+    "tensorflow>=2.15.0",
+    "tensorflow-cpu>=2.15.0",
+    "tensorflow-datasets>=4.9.9",
+    "h5py>=3.13.0",
+    "google-genai>=1.0.0",
+    "sam-2",
+    "openpyxl>=3.1.5",
 ]
 
 
@@ -69,6 +76,7 @@ override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74", "av==13.1.0"
 openpi-client = { workspace = true }
 lerobot = { git = "https://github.com/huggingface/lerobot", rev = "0cf864870cf29f4738d3ade893e6fd13fbd7cdb5" }
 dlimp = { git = "https://github.com/kvablack/dlimp", rev = "ad72ce3a9b414db2185bc0b38461d4101a65477a" }
+sam-2 = { path = "third_party/sam2" }
 
 [tool.uv.workspace]
 members = ["packages/*"]

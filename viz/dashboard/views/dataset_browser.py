@@ -1,8 +1,10 @@
 """Dataset browser for Online (Dataset) mode.
 
-Scans a DATA_ROOT directory (toy-cube-benchmark / DROID format), renders an
-interactive episode grid and per-episode keyframe strip, and triggers online
-inference when the user clicks a keyframe thumbnail.
+Three-page navigation driven by st.session_state["ds_page"]:
+
+    "grid"      → episode card grid (5/row)
+    "keyframes" → keyframe strip for selected episode (8/row)
+    "results"   → back-navigation bar; app.py renders the attention tabs below
 
 Expected DATA_ROOT layout:
     DATA_ROOT/{success,failure}/{date}/{episode}/
@@ -21,17 +23,17 @@ import numpy as np
 import streamlit as st
 
 OPEN_LOOP_HORIZON = 8
-THUMB_W,  THUMB_H  = 160, 120   # episode card thumbnail
-KF_W,     KF_H     = 112,  84   # keyframe strip thumbnail
-EP_COLS   = 5                    # episode cards per row
-KF_COLS   = 8                    # keyframe thumbnails per row
+THUMB_W, THUMB_H = 160, 120   # episode card thumbnail
+KF_W,    KF_H    = 120,  90   # keyframe strip thumbnail
+EP_COLS  = 5                   # episode cards per row
+KF_COLS  = 8                   # keyframe thumbnails per row
 
 
-# ── Cached data helpers ────────────────────────────────────────────────────────
+# ── Cached helpers ─────────────────────────────────────────────────────────────
 
 @st.cache_data(show_spinner=False)
 def _scan_episodes(data_root: str) -> list[dict]:
-    """Scan DATA_ROOT for all episodes. Result is cached per path."""
+    """Scan DATA_ROOT for all episodes. Cached per path."""
     root = Path(data_root)
     episodes: list[dict] = []
     for outcome in ("success", "failure"):
@@ -52,22 +54,22 @@ def _scan_episodes(data_root: str) -> list[dict]:
                     data_dir / "recordings" / "frames" / "varied_camera_2" / "00000.jpg"
                 )
                 episodes.append({
-                    "outcome":    outcome,
-                    "date":       date_dir.name,
-                    "episode_id": data_dir.name,
-                    "data_dir":   str(data_dir),
+                    "outcome":     outcome,
+                    "date":        date_dir.name,
+                    "episode_id":  data_dir.name,
+                    "data_dir":    str(data_dir),
                     "instruction": instruction,
-                    "n_frames":   n_frames,
+                    "n_frames":    n_frames,
                     "n_keyframes": len(keyframes),
-                    "keyframes":  keyframes,
-                    "thumb_path": str(thumb_path),
+                    "keyframes":   keyframes,
+                    "thumb_path":  str(thumb_path),
                 })
     return episodes
 
 
 @st.cache_data(show_spinner=False)
 def _load_thumb(path: str, w: int, h: int) -> np.ndarray | None:
-    """Load and resize one thumbnail. Cached per (path, w, h)."""
+    """Load and resize a thumbnail. Cached per (path, w, h)."""
     from PIL import Image as _PIL
     try:
         img = _PIL.open(path).convert("RGB").resize((w, h), _PIL.BILINEAR)
@@ -76,18 +78,20 @@ def _load_thumb(path: str, w: int, h: int) -> np.ndarray | None:
         return None
 
 
-# ── Inference helper ───────────────────────────────────────────────────────────
+# ── Navigation helpers ─────────────────────────────────────────────────────────
 
-def _run_inference(
-    ep: dict,
-    frame_idx: int,
-    checkpoint_path: str,
-    gpu_device: str,
-) -> None:
-    """Load example from trajectory.h5, run inference, store in session state."""
-    project_root = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "../../..")
-    )
+def _go(page: str, **extra) -> None:
+    """Set ds_page and any extra session state keys, then rerun."""
+    st.session_state["ds_page"] = page
+    for k, v in extra.items():
+        st.session_state[k] = v
+    st.rerun()
+
+
+# ── Inference ──────────────────────────────────────────────────────────────────
+
+def _run_inference(ep: dict, frame_idx: int, checkpoint_path: str, gpu_device: str) -> None:
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
     for p in [project_root, os.path.join(project_root, "src"),
               os.path.join(project_root, "viz")]:
         if p not in sys.path:
@@ -106,26 +110,18 @@ def _run_inference(
     else:
         gpu = gpu_device
 
-    example = _load_example(
-        data_dir=Path(ep["data_dir"]), index=frame_idx, camera="right"
-    )
+    example = _load_example(data_dir=Path(ep["data_dir"]), index=frame_idx, camera="right")
     example["prompt"] = ep["instruction"]
-
     policy = _inf.load_model(checkpoint_path, device=gpu)
     result = _inf.run_inference(policy, example)
-
-    st.session_state["online_data"]      = result
+    st.session_state["online_data"]       = result
     st.session_state["ds_selected_frame"] = frame_idx
 
 
-# ── UI rendering ───────────────────────────────────────────────────────────────
+# ── Page renderers ─────────────────────────────────────────────────────────────
 
-def render(data_root: str, checkpoint_path: str, gpu_device: str) -> None:
-    """Main entry point: episode grid → keyframe strip → inference."""
-    if not os.path.isdir(data_root):
-        st.warning(f"DATA_ROOT not found: `{data_root}`")
-        return
-
+def _page_grid(data_root: str) -> None:
+    """Page 1: episode card grid."""
     with st.spinner("Scanning episodes…"):
         episodes = _scan_episodes(data_root)
 
@@ -133,13 +129,12 @@ def render(data_root: str, checkpoint_path: str, gpu_device: str) -> None:
         st.warning(f"No episodes found in `{data_root}`")
         return
 
-    selected_ep    = st.session_state.get("ds_selected_episode")
-    selected_frame = st.session_state.get("ds_selected_frame")
-
-    # ── Episode grid ─────────────────────────────────────────────────────────
     n_success = sum(1 for e in episodes if e["outcome"] == "success")
     n_failure = len(episodes) - n_success
-    st.subheader(f"Episodes — {len(episodes)} total  ({n_success} ✅ success · {n_failure} ❌ failure)")
+    st.subheader(
+        f"Episodes — {len(episodes)} total  "
+        f"({n_success} ✅ success · {n_failure} ❌ failure)"
+    )
 
     for row_start in range(0, len(episodes), EP_COLS):
         row_eps = episodes[row_start : row_start + EP_COLS]
@@ -155,68 +150,103 @@ def render(data_root: str, checkpoint_path: str, gpu_device: str) -> None:
                 badge = "✅" if ep["outcome"] == "success" else "❌"
                 instr = ep["instruction"]
                 label = (instr[:48] + "…") if len(instr) > 48 else (instr or "*(no instruction)*")
-                st.caption(f"{badge} {label}")
-                st.caption(f"🎞 {ep['n_keyframes']} keyframes")
+                st.markdown(f"**{badge} {label}**")
+                st.markdown(f"🎞 **{ep['n_keyframes']}** keyframes")
 
-                is_sel = (
-                    selected_ep is not None
-                    and selected_ep["data_dir"] == ep["data_dir"]
-                )
                 if st.button(
-                    "▶ Selected" if is_sel else "Select",
+                    "Select →",
                     key=f"ds_ep_{ep['outcome']}_{ep['date']}_{ep['episode_id']}",
                     use_container_width=True,
-                    type="primary" if is_sel else "secondary",
                 ):
-                    if not is_sel:
-                        st.session_state["ds_selected_episode"] = ep
-                        st.session_state.pop("ds_selected_frame", None)
-                        st.session_state.pop("online_data", None)
-                    st.rerun()
+                    st.session_state.pop("ds_selected_frame", None)
+                    st.session_state.pop("online_data", None)
+                    _go("keyframes", ds_selected_episode=ep)
 
-    if selected_ep is None:
-        st.info("Click an episode above to browse its keyframes.")
+
+def _page_keyframes(checkpoint_path: str, gpu_device: str) -> None:
+    """Page 2: keyframe strip for the selected episode."""
+    ep = st.session_state.get("ds_selected_episode")
+    if ep is None:
+        _go("grid")
         return
 
-    # ── Keyframe strip ────────────────────────────────────────────────────────
-    st.divider()
-    instr_display = selected_ep["instruction"] or "*(no instruction)*"
-    st.subheader(f"Keyframes — `{selected_ep['episode_id']}`")
-    st.caption(
-        f"📋 **{instr_display}** · "
-        f"{selected_ep['n_keyframes']} keyframes · "
-        f"{selected_ep['n_frames']} total frames"
+    # ── Back button ──────────────────────────────────────────────────────────
+    if st.button("← Back to episodes", key="ds_back_to_grid"):
+        _go("grid")
+
+    st.subheader(f"Keyframes — `{ep['episode_id']}`")
+    instr_display = ep["instruction"] or "*(no instruction)*"
+    st.markdown(
+        f"📋 **{instr_display}** &nbsp;·&nbsp; "
+        f"**{ep['n_keyframes']}** keyframes &nbsp;·&nbsp; "
+        f"{ep['n_frames']} total frames"
     )
 
-    keyframes = selected_ep["keyframes"]
+    keyframes = ep["keyframes"]
     for row_start in range(0, len(keyframes), KF_COLS):
         row_kf = keyframes[row_start : row_start + KF_COLS]
         cols   = st.columns(KF_COLS)
         for j, frame_idx in enumerate(row_kf):
             with cols[j]:
                 kf_path = str(
-                    Path(selected_ep["data_dir"]) / "recordings" / "frames"
+                    Path(ep["data_dir"]) / "recordings" / "frames"
                     / "varied_camera_2" / f"{frame_idx:05d}.jpg"
                 )
                 kf_thumb = _load_thumb(kf_path, KF_W, KF_H)
                 if kf_thumb is not None:
                     st.image(kf_thumb, use_container_width=True)
-
-                is_sel = selected_frame == frame_idx
-                st.caption(f"{'▶ ' if is_sel else ''}f{frame_idx:05d}")
+                st.markdown(f"f{frame_idx:05d}")
 
                 if st.button(
-                    "✓ Done" if is_sel else "▶ Run",
+                    "▶ Run",
                     key=f"ds_kf_{row_start + j}",
                     use_container_width=True,
-                    type="primary" if is_sel else "secondary",
                 ):
                     with st.spinner(f"Running inference on frame {frame_idx}…"):
                         try:
-                            _run_inference(
-                                selected_ep, frame_idx, checkpoint_path, gpu_device
-                            )
+                            _run_inference(ep, frame_idx, checkpoint_path, gpu_device)
                         except Exception as e:
                             st.error(f"Inference failed: {e}")
                             import traceback; traceback.print_exc()
-                    st.rerun()
+                            return
+                    _go("results")
+
+
+def _page_results(ep: dict, frame_idx: int) -> None:
+    """Page 3: navigation bar shown above the attention tabs (rendered by app.py)."""
+    col_back, col_info = st.columns([2, 8])
+    with col_back:
+        if st.button("← Back to keyframes", key="ds_back_to_kf"):
+            st.session_state.pop("online_data", None)
+            _go("keyframes")
+    with col_info:
+        badge = "✅" if ep.get("outcome") == "success" else "❌"
+        st.markdown(
+            f"{badge} **{ep.get('episode_id', '')}** &nbsp;·&nbsp; "
+            f"frame **{frame_idx:05d}** &nbsp;·&nbsp; "
+            f"_{ep.get('instruction', '')}_"
+        )
+    st.divider()
+
+
+# ── Public entry point ─────────────────────────────────────────────────────────
+
+def render(data_root: str, checkpoint_path: str, gpu_device: str) -> None:
+    """Dispatch to the correct page based on ds_page session state."""
+    if not os.path.isdir(data_root):
+        st.warning(f"DATA_ROOT not found: `{data_root}`")
+        return
+
+    page = st.session_state.get("ds_page", "grid")
+
+    if page == "grid":
+        _page_grid(data_root)
+
+    elif page == "keyframes":
+        _page_keyframes(checkpoint_path, gpu_device)
+
+    elif page == "results":
+        ep        = st.session_state.get("ds_selected_episode", {})
+        frame_idx = st.session_state.get("ds_selected_frame", 0)
+        _page_results(ep, frame_idx)
+        # app.py renders attention tabs below this point

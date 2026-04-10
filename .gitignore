@@ -9,6 +9,7 @@ attn/
 attn_*/
 CIS700-Explaining-Attention-of-VLAs/
 viz/s
+third_party/sam2.1_hiera_large.pt
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

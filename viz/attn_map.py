@@ -504,15 +504,15 @@ def select_best_gpu():
 
     selected_device = f"cuda:{best_gpu}"
     print(f"Auto-selected {selected_device} with {max_free_memory / 1e9:.2f} GB free")
-    return best_gpu
+    return selected_device
 
 
 if __name__ == "__main__":
     checkpoint_dir = "./checkpoints/viz/pi05_droid_pytorch"
 
     # Auto-select GPU with most free memory
-    device_id = select_best_gpu()
-    device = f"cuda:{device_id}"
+    device = select_best_gpu()
+    device_id = device.split(":")[1]
 
     policy = get_policy(checkpoint_dir, device=device)
     print(f"Policy loaded on device: {device}")
