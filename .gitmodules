@@ -7,3 +7,7 @@
 [submodule "third_party/sam2"]
 	path = third_party/sam2
 	url = https://github.com/facebookresearch/sam2.git
+[submodule "third_party/lerobot_explain_vla"]
+	path = third_party/lerobot_explain_vla
+	url = https://github.com/farazsrahman/lerobot.git
+	branch = explain-vla
