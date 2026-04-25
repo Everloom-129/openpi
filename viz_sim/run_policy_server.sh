@@ -18,9 +18,11 @@ if [ ! -d "${CKPT}" ]; then
 fi
 
 cd "${REPO_ROOT}"
-exec uv run scripts/serve_policy.py \
+# Use the attention-capturing wrapper so the websocket response includes
+# text→image attention alongside actions. Falls back gracefully if the
+# buffer is empty.
+exec uv run viz_sim/serve_policy_attn.py \
     --port="${PORT}" \
     --default_prompt="pick up the cube" \
-    policy:checkpoint \
-    --policy.config=pi05_droid \
-    --policy.dir="${CKPT}"
+    --config=pi05_droid \
+    --dir="${CKPT}"

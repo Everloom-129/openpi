@@ -33,10 +33,18 @@ from openpi_client.websocket_client_policy import WebsocketClientPolicy
 OPEN_LOOP_HORIZON = 8
 
 
-def build_env(task: str, render_camera: str = "agentview"):
+SIM_VIEW_SIZE = 448  # third-person sim panel
+TILE_SIZE = 224      # ext / wrist / attn tiles
+
+
+def build_env(task: str):
     """Create a robosuite env with JOINT_VELOCITY arm control on a Panda.
 
     Action layout: [arm_qvel(7), gripper(1)] — matches DROID 8-dim output.
+
+    Renders ext + wrist at 224 (policy input) and a third-person `frontview`
+    at SIM_VIEW_SIZE (composited UI panel). No on-screen GLFW window — we
+    composite everything into a single cv2 canvas instead.
     """
     controller_cfg = load_composite_controller_config(robot="Panda")
     # After loading, robosuite flattens body_parts.arms.right -> body_parts.right.
@@ -53,32 +61,105 @@ def build_env(task: str, render_camera: str = "agentview"):
         "gripper": {"type": "GRIP"},
     }
 
+    # Per-camera sizes: frontview large, the two policy-input cams at 224.
     return robosuite.make(
         env_name=task,
         robots="Panda",
         controller_configs=controller_cfg,
-        has_renderer=True,
+        has_renderer=False,
         has_offscreen_renderer=True,
         use_camera_obs=True,
-        camera_names=["agentview", "robot0_eye_in_hand"],
-        camera_heights=224,
-        camera_widths=224,
-        render_camera=render_camera,
+        camera_names=["frontview", "agentview", "robot0_eye_in_hand"],
+        camera_heights=[SIM_VIEW_SIZE, TILE_SIZE, TILE_SIZE],
+        camera_widths=[SIM_VIEW_SIZE, TILE_SIZE, TILE_SIZE],
         ignore_done=True,
         control_freq=20,
     )
 
 
-def to_uint8_rgb(img) -> np.ndarray:
-    """Robosuite returns float[0,1] BGR-ish images flipped vertically. Normalize."""
+def to_uint8_rgb(img, size: int | None = TILE_SIZE) -> np.ndarray:
+    """Robosuite returns float[0,1] BGR-ish images flipped vertically. Normalize.
+
+    If `size` is provided and the image isn't already that size, resize to (size, size).
+    Pass `size=None` to keep the camera's native resolution.
+    """
     arr = np.asarray(img)
     if np.issubdtype(arr.dtype, np.floating):
         arr = (arr * 255.0).clip(0, 255).astype(np.uint8)
-    # Robosuite renders top-down flipped; the dashboard expects upright RGB.
     arr = np.ascontiguousarray(arr[::-1])
-    if arr.shape[:2] != (224, 224):
-        arr = cv2.resize(arr, (224, 224), interpolation=cv2.INTER_AREA)
+    if size is not None and arr.shape[:2] != (size, size):
+        arr = cv2.resize(arr, (size, size), interpolation=cv2.INTER_AREA)
     return arr
+
+
+def placeholder_attn(size: int = TILE_SIZE) -> np.ndarray:
+    """Stand-in attention tile when no attention is available."""
+    tile = np.full((size, size, 3), 40, dtype=np.uint8)
+    cv2.putText(tile, "no attn", (size // 2 - 40, size // 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1, cv2.LINE_AA)
+    return tile
+
+
+def attn_overlay(img: np.ndarray, attn_256: np.ndarray, *,
+                 alpha: float = 0.45, size: int = TILE_SIZE) -> np.ndarray:
+    """Reshape (256,) → 16×16, upsample to `size`, jet-blend onto `img` (RGB).
+
+    Per-camera min/max normalization (matches viz/dashboard/views/grid_heatmap.py).
+    Returns RGB uint8 of shape (size, size, 3).
+    """
+    grid = np.asarray(attn_256, dtype=np.float32).reshape(16, 16)
+    up = cv2.resize(grid, (size, size), interpolation=cv2.INTER_LINEAR)
+    lo, hi = float(up.min()), float(up.max())
+    norm = (up - lo) / (hi - lo + 1e-8)
+    color = cv2.applyColorMap((norm * 255).astype(np.uint8), cv2.COLORMAP_JET)
+    color = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
+    base = img if img.shape[:2] == (size, size) else cv2.resize(img, (size, size))
+    return cv2.addWeighted(base, 1 - alpha, color, alpha, 0)
+
+
+def label(tile: np.ndarray, text: str) -> np.ndarray:
+    """Draw a small label in the top-left corner of an RGB tile (in-place safe copy)."""
+    out = tile.copy()
+    cv2.rectangle(out, (0, 0), (max(80, 8 * len(text)), 18), (0, 0, 0), -1)
+    cv2.putText(out, text, (4, 13), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                (255, 255, 255), 1, cv2.LINE_AA)
+    return out
+
+
+PROMPT_STRIP_HEIGHT = 36
+
+
+def prompt_strip(width: int, text: str) -> np.ndarray:
+    """Render a full-width caption bar showing the current instruction."""
+    strip = np.full((PROMPT_STRIP_HEIGHT, width, 3), 20, dtype=np.uint8)
+    if not text:
+        return strip
+    # Truncate if it would overflow the strip.
+    max_chars = max(10, width // 11)
+    shown = text if len(text) <= max_chars else text[: max_chars - 1] + "…"
+    (tw, th), _ = cv2.getTextSize(shown, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+    cv2.putText(strip, shown, ((width - tw) // 2, (PROMPT_STRIP_HEIGHT + th) // 2 - 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+    return strip
+
+
+def compose_canvas(sim: np.ndarray, ext: np.ndarray, wrist: np.ndarray,
+                   ext_attn: np.ndarray, wrist_attn: np.ndarray,
+                   prompt: str = "") -> np.ndarray:
+    """Build the unified UI canvas.
+
+    Layout:
+        [ sim view (448x448) ] [ ext (224)   | ext_attn (224)   ]
+        [                    ] [ wrist (224) | wrist_attn (224) ]
+        [               instruction strip (full width)          ]
+    Total: 896 wide x (448 + PROMPT_STRIP_HEIGHT) tall.
+    """
+    sim = label(sim, "sim (frontview)")
+    right_top = np.hstack([label(ext, "ext"), label(ext_attn, "ext attn")])
+    right_bot = np.hstack([label(wrist, "wrist"), label(wrist_attn, "wrist attn")])
+    right = np.vstack([right_top, right_bot])  # 448 x 448
+    grid = np.hstack([sim, right])              # 448 x 896
+    return np.vstack([grid, prompt_strip(grid.shape[1], prompt)])
 
 
 def make_droid_obs(env_obs: dict, prompt: str) -> dict:
@@ -119,6 +200,7 @@ def main():
 
     t0 = time.time()
     n_infer = 0
+    last_attn: np.ndarray | None = None  # (512,) text→image attention from last infer
     for step in range(args.steps):
         # Query the policy for a fresh action chunk every `horizon` steps.
         if step % args.horizon == 0:
@@ -126,6 +208,9 @@ def main():
             result = policy.infer(droid_obs)
             chunk = np.asarray(result["actions"])  # (N, 8)
             n_infer += 1
+            attn_field = result.get("text_to_img_attn")
+            if attn_field is not None:
+                last_attn = np.asarray(attn_field, dtype=np.float32)
 
         action = chunk[step % args.horizon]
         # Defensive: pad/truncate to env.action_dim in case action_dim != 8.
@@ -135,13 +220,21 @@ def main():
             action = a
 
         obs, _reward, _done, _info = env.step(action)
-        env.render()
 
+        sim = to_uint8_rgb(obs["frontview_image"], size=SIM_VIEW_SIZE)
         ext = to_uint8_rgb(obs["agentview_image"])
         wrist = to_uint8_rgb(obs["robot0_eye_in_hand_image"])
-        cv2.imshow("ext", cv2.cvtColor(ext, cv2.COLOR_RGB2BGR))
-        cv2.imshow("wrist", cv2.cvtColor(wrist, cv2.COLOR_RGB2BGR))
-        cv2.waitKey(1)
+        if last_attn is not None and last_attn.shape == (512,):
+            ext_attn = attn_overlay(ext, last_attn[:256])
+            wrist_attn = attn_overlay(wrist, last_attn[256:])
+        else:
+            ext_attn = placeholder_attn()
+            wrist_attn = placeholder_attn()
+
+        canvas = compose_canvas(sim, ext, wrist, ext_attn, wrist_attn, prompt=args.prompt)
+        cv2.imshow("openpi sim", cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
 
     dt = time.time() - t0
     print(f"Done. {args.steps} sim steps, {n_infer} policy queries in {dt:.1f}s.")
