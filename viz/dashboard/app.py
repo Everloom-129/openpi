@@ -212,19 +212,39 @@ with st.sidebar:
         # Auto-detect episode structure and metadata
         _ep_dir = os.path.join(_EXAMPLE_DIR, online_episode)
         _has_recordings = os.path.isdir(os.path.join(_ep_dir, "recordings", "frames"))
-        _frames_root = os.path.join(_ep_dir, "recordings", "frames") if _has_recordings else os.path.join(_ep_dir, "frames")
-        _hand_dir = os.path.join(_frames_root, "hand_camera")
-        _n_frames = len([f for f in os.listdir(_hand_dir) if f.endswith(".jpg")]) if os.path.isdir(_hand_dir) else 1
-        _max_frame = max(0, _n_frames - 1)
-        # Clamp to trajectory.h5 length when present (images may outnumber traj rows)
-        _traj_path = os.path.join(_ep_dir, "trajectory.h5")
-        if _has_recordings and os.path.exists(_traj_path):
-            import h5py as _h5py
-            with _h5py.File(_traj_path, "r") as _f:
-                _traj_len = _f["observation/robot_state/joint_positions"].shape[0]
-            _max_frame = min(_max_frame, _traj_len - 1)
-        _instr_path = os.path.join(_ep_dir, "instruction.txt")
-        _default_instr = open(_instr_path).read().strip() if os.path.exists(_instr_path) else ""
+        _has_lerobot = os.path.isfile(os.path.join(_ep_dir, "meta", "info.json"))
+
+        _lerobot_ep_idx = 0  # default; overridden below for LeRobot
+        if _has_lerobot:
+            # ── LeRobot format (RoboCasa) ─────────────────────────────────
+            import sys as _sys
+            _sys.path.insert(0, os.path.join(_PROJECT_ROOT, "viz"))
+            from robocasa_loader import load_episode_metadata as _load_ep_meta
+            _lr_episodes = _load_ep_meta(_ep_dir)
+            _lr_ep_labels = [
+                f"ep {e['episode_index']}: {e.get('tasks', [''])[0][:60]}"
+                for e in _lr_episodes
+            ]
+            _lr_sel = st.selectbox("LeRobot episode", _lr_ep_labels, key="lr_episode")
+            _lerobot_ep_idx = _lr_episodes[_lr_ep_labels.index(_lr_sel)]["episode_index"]
+            _lr_ep_info = next(e for e in _lr_episodes if e["episode_index"] == _lerobot_ep_idx)
+            _max_frame = max(0, _lr_ep_info["length"] - 1)
+            _default_instr = _lr_ep_info.get("tasks", [""])[0]
+        else:
+            # ── DROID / duck format ───────────────────────────────────────
+            _frames_root = os.path.join(_ep_dir, "recordings", "frames") if _has_recordings else os.path.join(_ep_dir, "frames")
+            _hand_dir = os.path.join(_frames_root, "hand_camera")
+            _n_frames = len([f for f in os.listdir(_hand_dir) if f.endswith(".jpg")]) if os.path.isdir(_hand_dir) else 1
+            _max_frame = max(0, _n_frames - 1)
+            # Clamp to trajectory.h5 length when present (images may outnumber traj rows)
+            _traj_path = os.path.join(_ep_dir, "trajectory.h5")
+            if _has_recordings and os.path.exists(_traj_path):
+                import h5py as _h5py
+                with _h5py.File(_traj_path, "r") as _f:
+                    _traj_len = _f["observation/robot_state/joint_positions"].shape[0]
+                _max_frame = min(_max_frame, _traj_len - 1)
+            _instr_path = os.path.join(_ep_dir, "instruction.txt")
+            _default_instr = open(_instr_path).read().strip() if os.path.exists(_instr_path) else ""
 
         instruction_text = st.text_input(
             "Instruction", value=_default_instr, key="online_instruction",
@@ -250,7 +270,16 @@ with st.sidebar:
                 import sys as _sys
                 _sys.path.insert(0, os.path.join(_PROJECT_ROOT, "viz"))
                 from pathlib import Path as _Path
-                if _has_recordings:
+                if _has_lerobot:
+                    # LeRobot format (RoboCasa)
+                    from robocasa_loader import load_robocasa_example as _load_rc
+                    example = _load_rc(
+                        lerobot_root=_Path(_ep_dir),
+                        episode_index=_lerobot_ep_idx,
+                        frame_index=online_frame,
+                        ext_camera=online_camera,
+                    )
+                elif _has_recordings:
                     # DROID format: recordings/frames/{camera}/
                     from pipeline import load_example as _load_example
                     example = _load_example(
