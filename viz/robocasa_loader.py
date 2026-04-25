@@ -34,15 +34,16 @@ def extract_frame(
 ) -> np.ndarray:
     """Extract a single RGB frame from an MP4 video using ffmpeg.
 
-    Uses input-level seeking (``-ss`` before ``-i``) with a ``select`` filter
-    for frame-exact extraction from H.264 streams.
+    Uses input-level seeking (``-ss`` before ``-i``) followed by ``-frames:v 1``.
+    The previous ``select=eq(n\\,N)`` filter was wrong: ``-ss`` resets ffmpeg's
+    frame counter, so ``n`` in the filter no longer matches the original index
+    and seeks past the first GOP return 0 bytes.
     """
     seek_time = frame_index / fps
     cmd = [
         "ffmpeg",
         "-ss", f"{seek_time:.6f}",
         "-i", str(video_path),
-        "-vf", f"select=eq(n\\,{frame_index})",
         "-frames:v", "1",
         "-f", "rawvideo",
         "-pix_fmt", "rgb24",

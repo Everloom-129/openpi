@@ -56,6 +56,78 @@ uv run python viz/pipeline.py <DATA_ROOT> <RESULTS_ROOT>
 bash viz/start_app.sh
 ```
 
+### RoboCasa Support
+
+This repo supports attention visualization on [RoboCasa](https://robocasa.ai/) datasets in addition to DROID. RoboCasa data is consumed in **LeRobot format** — the same schema used by the HuggingFace `lerobot` library.
+
+#### Offline batch pipeline (current)
+
+Download a RoboCasa LeRobot dataset, then run the batch attention pipeline:
+
+```bash
+# Download datasets (requires a separate Python 3.11 env — see below)
+/tmp/rc_dl/bin/python -m robocasa.scripts.download_datasets --all
+
+# Run batch attention pipeline on one task
+uv run python viz/robocasa_pipeline.py \
+    --lerobot-root /mnt/sda/edward/projects/toy_cube_benchmark/v1.0/target/atomic/<TaskName>/<date>/lerobot \
+    --output-dir /mnt/sda/edward/projects/pi05_vis/robocasa_<task>_action/left \
+    --episodes all \
+    --no-counterfactual
+```
+
+Output path convention matches the DROID pipeline:
+```
+/mnt/sda/edward/projects/pi05_vis/robocasa_<task>_action/<camera>/
+    episode_000000/
+        00000/00000.h5
+        00008/00008.h5
+        ...
+```
+
+Browse results in the dashboard with **Results (Benchmark)** mode, pointing `RESULTS_ROOT` to the output directory.
+
+#### Dashboard Online mode
+
+Place (or symlink) a LeRobot dataset root under `data/example/`:
+```bash
+ln -s /mnt/sda/edward/projects/toy_cube_benchmark/v1.0/target/atomic/<TaskName>/<date>/lerobot \
+      data/example/robocasa_<task>
+uv run streamlit run viz/dashboard/app.py
+```
+The dashboard auto-detects LeRobot format via `meta/info.json` and shows an episode/frame selector in **Online** mode.
+
+#### RoboCasa download environment setup
+
+The robocasa download script requires `mujoco==3.3.1` and `numpy==2.2.5`, which conflict with the main project venv. Use a dedicated environment:
+
+```bash
+# Create once
+/home/edward/projects/openpi_vis/.venv/bin/python3.11 -m venv /tmp/rc_dl
+/tmp/rc_dl/bin/pip install mujoco==3.3.1 "numpy==2.2.5" termcolor tqdm requests
+/tmp/rc_dl/bin/pip install -e third_party/robosuite
+/tmp/rc_dl/bin/pip install -e third_party/robocasa
+```
+
+`DATASET_BASE_PATH` is configured in `third_party/robocasa/robocasa/macros_private.py`.
+
+#### TODO — Pipeline cleanup
+
+- [ ] Align `viz/robocasa_pipeline.py` output structure with DROID convention (`RESULTS_ROOT/{camera}/{success,failure}/{date}/{episode}/{frame:05d}/`) so Dashboard **Results (Benchmark)** mode can browse robocasa runs without changes
+- [ ] Plumb `gt_action` from parquet `action` column into the HDF5 (currently `None`); needed for Action view and Trajectory benchmark
+- [ ] Add multi-GPU variant `viz/robocasa_pipeline_mp.py` mirroring `pipeline_mp.py`
+
+#### TODO — Simulator integration (proposed)
+
+The current pipeline runs on **pre-recorded videos**. The next step is closed-loop policy evaluation inside the robocasa MuJoCo simulator:
+
+- [ ] `viz/robocasa_eval.py` — run pi0/pi0.5 in closed loop inside a robocasa `gym` environment; capture attention at every step and save to `RESULTS_ROOT` with same HDF5 schema
+- [ ] Success/failure ground truth from the simulator `done` signal — populate `RESULTS_ROOT/{left,right}/{success,failure}/...` automatically
+- [ ] Batch eval across tasks and episodes; report success rate alongside attention statistics
+- [ ] Dashboard **Trajectory** tab support for sim-collected episodes (sim provides ground-truth actions natively)
+- [ ] Compare attention patterns between offline (recorded demos) and online (closed-loop sim) rollouts on the same task
+- [ ] Resolve env conflict: robocasa requires `mujoco==3.3.1` + `numpy==2.2.5`, while openpi requires `numpy<2.0.0` (JAX constraint). Options: (a) run simulator in a subprocess with separate venv, communicating via policy server; (b) pin a mujoco/numpy combination that satisfies both; (c) drop JAX from the sim loop and use only the PyTorch policy path
+
 ---
 
 ## Downloading Checkpoints for Visualization

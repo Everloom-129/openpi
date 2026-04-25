@@ -8,9 +8,15 @@ This repo is a fork/extension of the [openpi](https://github.com/Physical-Intell
 
 Models supported: **π₀** (flow-based), **π₀-FAST** (autoregressive + FAST tokenizer), **π₀.₅** (upgraded generalization).
 
+## Testing PRs
+
+When helping test a PR, always use **real data** from the PR author's intended data source (HuggingFace, a provided dataset path, the project's download scripts, etc.). **Never propose synthetic/fake data** as a substitute — it only validates that Python runs, not that the actual data pipeline works correctly.
+
 ## Package Manager
 
 This project uses **uv** exclusively. Always prefix Python commands with `uv run`.
+
+> **Important**: `uv run python` and `uv pip` both resolve to the conda Python 3.7 environment on this machine, NOT the project's `.venv` (Python 3.11). Use `.venv/bin/python` directly when you need to bypass this. Never run `uv pip install -e .` (dot) as it installs into conda Python 3.7.
 
 ```bash
 # Install dependencies
