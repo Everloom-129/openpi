@@ -4,7 +4,7 @@ Architecture
 ------------
 * This script runs in the `robocasa_sim` conda env (mujoco 3.3.1, numpy 2.x).
 * The pi0.5 policy runs in the openpi `.venv` and is exposed by
-  `viz_sim/run_policy_server.sh` as a websocket server on localhost:8000.
+  `viz_sim/run_pi0_policy_server.sh` as a websocket server on localhost:8000.
 * We open a `Panda` arm in robosuite with the JOINT_VELOCITY arm controller
   so the env's action space is exactly [joint_vel × 7, gripper × 1] — the
   same 8-dim layout as the DROID checkpoint output. No remapping needed.
@@ -14,7 +14,7 @@ Architecture
 
 Run (after the policy server is up):
     conda activate robocasa_sim
-    python viz_sim/run_policy_sim.py --task Lift --prompt "pick up the cube"
+    python viz_sim/run_pi0_policy_sim.py --task Lift --prompt "pick up the cube"
 """
 
 from __future__ import annotations
@@ -198,9 +198,32 @@ def main():
     print(f"Env action_dim={env.action_dim}  (expecting 8: 7 qvel + 1 gripper)")
     obs = env.reset()
 
+    # Live attention controls: trackbars on the cv2 window let you scrub
+    # layer (0..L-1) and head-aggregation (avg/min/max) without restarting.
+    WINDOW = "openpi sim"
+    cv2.namedWindow(WINDOW, cv2.WINDOW_AUTOSIZE)
+    head_modes = ["avg", "min", "max"]
+    state = {"layer": 7, "head_mode": 0, "n_layers": 18, "n_heads": 8}
+    cv2.createTrackbar("layer", WINDOW, state["layer"], state["n_layers"] - 1,
+                       lambda v: state.update(layer=v))
+    cv2.createTrackbar("head: 0=avg 1=min 2=max", WINDOW, state["head_mode"],
+                       len(head_modes) - 1, lambda v: state.update(head_mode=v))
+
+    def reduce_attn(stack: np.ndarray) -> np.ndarray:
+        """stack: (L, H, 512) → (512,) using current trackbar state."""
+        L, H, _ = stack.shape
+        layer = min(state["layer"], L - 1)
+        heads = stack[layer]  # (H, 512)
+        mode = head_modes[state["head_mode"]]
+        if mode == "avg":
+            return heads.mean(axis=0)
+        if mode == "min":
+            return heads.min(axis=0)
+        return heads.max(axis=0)
+
     t0 = time.time()
     n_infer = 0
-    last_attn: np.ndarray | None = None  # (512,) text→image attention from last infer
+    last_stack: np.ndarray | None = None  # (L, H, 512) attention from last infer
     for step in range(args.steps):
         # Query the policy for a fresh action chunk every `horizon` steps.
         if step % args.horizon == 0:
@@ -210,7 +233,15 @@ def main():
             n_infer += 1
             attn_field = result.get("text_to_img_attn")
             if attn_field is not None:
-                last_attn = np.asarray(attn_field, dtype=np.float32)
+                arr = np.asarray(attn_field, dtype=np.float32)
+                if arr.ndim == 3:  # (L, H, 512) — current server format
+                    last_stack = arr
+                    L, H = arr.shape[:2]
+                    if L != state["n_layers"] or H != state["n_heads"]:
+                        state["n_layers"], state["n_heads"] = L, H
+                        cv2.setTrackbarMax("layer", WINDOW, L - 1)
+                elif arr.ndim == 1 and arr.shape[0] == 512:  # legacy (512,)
+                    last_stack = arr[None, None]
 
         action = chunk[step % args.horizon]
         # Defensive: pad/truncate to env.action_dim in case action_dim != 8.
@@ -224,15 +255,20 @@ def main():
         sim = to_uint8_rgb(obs["frontview_image"], size=SIM_VIEW_SIZE)
         ext = to_uint8_rgb(obs["agentview_image"])
         wrist = to_uint8_rgb(obs["robot0_eye_in_hand_image"])
-        if last_attn is not None and last_attn.shape == (512,):
-            ext_attn = attn_overlay(ext, last_attn[:256])
-            wrist_attn = attn_overlay(wrist, last_attn[256:])
+        if last_stack is not None:
+            reduced = reduce_attn(last_stack)
+            ext_attn = attn_overlay(ext, reduced[:256])
+            wrist_attn = attn_overlay(wrist, reduced[256:])
         else:
             ext_attn = placeholder_attn()
             wrist_attn = placeholder_attn()
 
-        canvas = compose_canvas(sim, ext, wrist, ext_attn, wrist_attn, prompt=args.prompt)
-        cv2.imshow("openpi sim", cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
+        prompt_with_state = (
+            f"{args.prompt}   [layer {state['layer']}/{state['n_layers']-1}, "
+            f"head={head_modes[state['head_mode']]}]"
+        )
+        canvas = compose_canvas(sim, ext, wrist, ext_attn, wrist_attn, prompt=prompt_with_state)
+        cv2.imshow(WINDOW, cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 

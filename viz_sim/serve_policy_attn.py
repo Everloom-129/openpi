@@ -3,21 +3,21 @@
 Wraps `scripts/serve_policy.py`'s checkpoint-loading path with an
 `AttnCapturingPolicy` that arms the in-RAM attention buffer in
 `gemma_pytorch` around each `infer()` call, reduces the captured tensor to
-a compact `(512,)` float32 (256 ext patches + 256 wrist patches), and
-ships it back in the websocket response under the key
-`text_to_img_attn`.
+a compact `(L, H, 512)` float32 (L=18 layers, H=8 heads, 256 ext + 256
+wrist patches per head), and ships it back in the websocket response
+under the key `text_to_img_attn`. The client picks layer + head-aggregation
+mode at display time.
 
-The reduction:
-    - pick `--attn_layer` (default 7, mid-network — most spatially meaningful)
-    - mean over heads
+The reduction (per layer, per head):
     - mean over the *real* text tokens (mask-aware, via the policy's own
-      input-transform tokenization)
+      input-transform tokenization) → (512,)
+    - heads kept separate so the client can switch min/max/avg live
 
 If the buffer is empty (e.g. JAX backend), the field is simply omitted —
 clients should fall back to a placeholder.
 
 Run inside the openpi `.venv`:
-    bash viz_sim/run_policy_server.sh
+    bash viz_sim/run_pi0_policy_server.sh
 """
 from __future__ import annotations
 
@@ -48,9 +48,8 @@ TOTAL_IMAGE_TOKENS = 512
 class AttnCapturingPolicy(_base_policy.BasePolicy):
     """Wraps a Policy and adds `text_to_img_attn` to each infer() result."""
 
-    def __init__(self, inner: _base_policy.BasePolicy, *, layer: int = 7):
+    def __init__(self, inner: _base_policy.BasePolicy):
         self._inner = inner
-        self._layer = layer
         # Lazy-import to avoid loading torch in the wrong process.
         from openpi.models_pytorch import gemma_pytorch as _gpt
         self._gpt = _gpt
@@ -70,8 +69,8 @@ class AttnCapturingPolicy(_base_policy.BasePolicy):
         except Exception:
             return None
 
-    def _reduce(self, attn: np.ndarray, n_real_text: int | None, seq_len: int) -> np.ndarray:
-        """attn: (1, n_heads, seq, seq) → (512,) float32."""
+    def _reduce_layer(self, attn: np.ndarray, n_real_text: int | None, seq_len: int) -> np.ndarray:
+        """attn: (1, n_heads, seq, seq) → (n_heads, 512) float32. Heads kept separate."""
         if attn.ndim == 4:
             attn = attn[0]                              # (n_heads, seq, seq)
         if n_real_text and n_real_text > 0:
@@ -79,8 +78,8 @@ class AttnCapturingPolicy(_base_policy.BasePolicy):
             t2i = attn[:, TEXT_START_IDX:t_end, :TOTAL_IMAGE_TOKENS]   # (h, n_text, 512)
         else:
             t2i = attn[:, TEXT_START_IDX:seq_len, :TOTAL_IMAGE_TOKENS]
-        # mean over heads then over text tokens
-        return t2i.mean(axis=0).mean(axis=0).astype(np.float32)         # (512,)
+        # mean over the real text tokens; keep heads.
+        return t2i.mean(axis=1).astype(np.float32)                     # (n_heads, 512)
 
     def infer(self, obs: dict) -> dict:
         self._gpt.enable_attn_buffer()
@@ -90,23 +89,24 @@ class AttnCapturingPolicy(_base_policy.BasePolicy):
         finally:
             self._gpt.clear_attn_buffer()
 
-        if buf and self._layer in buf:
+        if buf:
             try:
-                attn = buf[self._layer]
-                seq_len = int(attn.shape[-1])
+                layers = sorted(buf.keys())
+                seq_len = int(buf[layers[0]].shape[-1])
                 n_real = self._real_text_count(obs)
-                result["text_to_img_attn"] = self._reduce(attn, n_real, seq_len)
+                stacked = np.stack(
+                    [self._reduce_layer(buf[i], n_real, seq_len) for i in layers],
+                    axis=0,
+                )  # (L, H, 512)
+                result["text_to_img_attn"] = stacked
                 result["text_to_img_meta"] = {
-                    "layer": self._layer,
+                    "layers": layers,
+                    "n_heads": int(stacked.shape[1]),
                     "seq_len": seq_len,
                     "n_real_text": int(n_real or 0),
                 }
             except Exception as e:  # fail-soft
                 logging.warning("attn reduction failed: %s", e)
-        elif buf:
-            logging.warning(
-                "attn layer %d not in buffer (have: %s)", self._layer, sorted(buf.keys())
-            )
         return result
 
 
@@ -116,7 +116,6 @@ class Args:
     dir: str = "checkpoints/viz/pi05_droid_pytorch"
     port: int = 8000
     default_prompt: str | None = "pick up the cube"
-    attn_layer: int = 7
 
 
 def main(args: Args) -> None:
@@ -127,11 +126,11 @@ def main(args: Args) -> None:
     inner = _policy_config.create_trained_policy(
         train_cfg, args.dir, default_prompt=args.default_prompt
     )
-    policy = AttnCapturingPolicy(inner, layer=args.attn_layer)
+    policy = AttnCapturingPolicy(inner)
 
     hostname = socket.gethostname()
-    logging.info("Serving %s from %s on :%d (attn layer=%d)",
-                 args.config, args.dir, args.port, args.attn_layer)
+    logging.info("Serving %s from %s on :%d (returning all-layer/all-head text→img attn)",
+                 args.config, args.dir, args.port)
     logging.info("Hostname: %s", hostname)
 
     server = websocket_policy_server.WebsocketPolicyServer(

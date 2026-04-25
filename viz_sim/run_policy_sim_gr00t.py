@@ -1,6 +1,6 @@
 """Closed-loop GR00T-N1.7 inference inside a robosuite/robocasa MuJoCo sim.
 
-Companion to `run_policy_sim.py` (which targets pi0.5-DROID over websocket).
+Companion to `run_pi0_policy_sim.py` (which targets pi0.5/pi0 over websocket).
 Differences:
 
 * Server: GR00T `gr00t/eval/run_gr00t_server.py` on ZMQ REP, default port 5555.
@@ -58,7 +58,7 @@ DROID_EEF_ROTATION_CORRECT = np.array(
     dtype=np.float64,
 )
 
-# Display layout (same as run_policy_sim.py).
+# Display layout (same as run_pi0_policy_sim.py).
 SIM_VIEW_SIZE = 448
 TILE_SIZE = 224
 PROMPT_STRIP_HEIGHT = 36
@@ -191,7 +191,7 @@ def make_gr00t_obs(frame_buf: deque, video_deltas: list[int], env_obs: dict,
     }
 
 
-# ---------- canvas helpers (lifted from run_policy_sim.py) ----------
+# ---------- canvas helpers (lifted from run_pi0_policy_sim.py) ----------
 
 def _label(tile: np.ndarray, text: str) -> np.ndarray:
     out = tile.copy()
