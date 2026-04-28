@@ -46,11 +46,31 @@ CONFIG=pi05_libero PROMPT="pick up the alphabet soup" \
     bash viz_sim/run_pi0_policy_server.sh
 ```
 
-Note: `run_pi0_policy_sim.py` is still wired to the DROID obs/action layout
-(JOINT_VELOCITY, 8-dim action, DROID-flat obs dict). Non-DROID configs serve
-fine, but matching sim-side adapters are TODO.
+Pass `--config` to `run_pi0_policy_sim.py` so the sim-side obs and action
+layout match the served checkpoint. Currently supported:
+
+| `--config`     | Controller       | Action            | Obs keys                                                                    |
+|----------------|------------------|-------------------|-----------------------------------------------------------------------------|
+| `pi05_droid`   | `JOINT_VELOCITY` | `qvel(7)+grip(1)` | `observation/{exterior_image_1_left,wrist_image_left,joint_position,gripper_position}` |
+| `pi0_droid`    | `JOINT_VELOCITY` | `qvel(7)+grip(1)` | same as `pi05_droid`                                                        |
+| `pi05_libero`  | `OSC_POSE`       | `dpose(6)+grip(1)`| `observation/{image,wrist_image,state}` (state = `[eef_pos(3), eef_axisangle(3), gripper_qpos(2)]`) |
+
+Gripper is auto-remapped per config: DROID outputs `[0,1]` and is binarized
+to `±1` for robosuite GRIP; LIBERO already outputs `[-1,1]` and passes through.
+
+```bash
+# pi05-libero example (server side already running with CONFIG=pi05_libero):
+python viz_sim/run_pi0_policy_sim.py --config pi05_libero --prompt "pick up the alphabet soup"
+```
 
 ### pi0.5-DROID — attention overlay
+
+![pi0.5-DROID attention overlay](pi05_droid_attn_overlay.png)
+
+Single cv2 canvas: sim frontview (left) + `ext`/`wrist` raw tiles and
+`ext attn`/`wrist attn` heatmap overlays (right), with the prompt and current
+`[layer N/L, head=...]` selection in the bottom strip. The two trackbars below
+the strip control layer and head-aggregation mode live.
 
 Server captures **per-layer / per-head text→image attention** in addition to
 actions. Reduction (`serve_policy_attn.py`):
@@ -83,9 +103,20 @@ python viz_sim/run_pi0_policy_sim.py --task Lift --prompt "pick up the red cube"
 
 Action layout: `[joint_velocity × 7, gripper × 1]` — 8-dim, identical to
 the DROID checkpoint output. Robosuite controller is `JOINT_VELOCITY` so
-no remap is needed. Obs is the flat DROID dict (`observation/exterior_image_1_left`,
-`observation/wrist_image_left`, `observation/joint_position`,
-`observation/gripper_position`, `prompt`).
+no remap is needed for the qvel dims. Obs is the flat DROID dict
+(`observation/exterior_image_1_left`, `observation/wrist_image_left`,
+`observation/joint_position`, `observation/gripper_position`, `prompt`).
+
+**Gripper convention — must remap.** pi0/pi0.5-DROID outputs `gripper ∈ [0, 1]`
+(0=open, 1=close), matching the DROID dataset (see `examples/droid/main.py`
+and `src/openpi/policies/droid_policy.py`). LIBERO and robosuite's `GRIP`
+controller expect `[-1, 1]` (-1=open, +1=close). `run_pi0_policy_sim.py`
+binarizes at 0.5 and remaps to `±1` before `env.step`; without the remap,
+values in `[0, 1]` never command "open" and the gripper stays closed.
+Each step prints `[step N] qvel=... grip_raw=... grip_cmd=...` to stdout for
+debugging. (For `CONFIG=pi05_libero`, the policy already outputs `[-1, 1]`
+and 7-dim actions — the current sim adapter targets DROID and would need a
+LIBERO-shaped variant; TODO.)
 
 ## GR00T-N1.7-DROID
 
@@ -135,6 +166,27 @@ Notes:
 - `install_gr00t_client_in_sim_env.sh` — installs ZMQ/msgpack/scipy/Pillow.
 - `setup_robocasa_env.sh` — first-time conda env setup for the sim side.
 - `test_viewer.py` — minimal canvas/camera smoke test.
+- `eval_runner.py` — headless eval client. Writes `ep_NNN.npz` per episode and
+  `_summary.json` per (model, task) under `/mnt/sda/edward/projects/robocasa_365/`.
+  At the end of each run it calls `render_example_video.render_for_task(task)` so
+  the comparison animation is updated automatically.
+- `build_combined_viz.py` — aggregates `ep_NNN.npz` across all (model, task) into
+  `results/combined_summary.json`, per-task PNGs (`combined_{task}.png`), and
+  `combined.html`. Runs at the end of orchestration scripts.
+- `render_example_video.py` — builds 5 animated WebPs, one per task, with 3
+  ckpt columns (ext + wrist + attention overlay). Writes `results/video/{task}.webp`.
+  Called automatically by `eval_runner.py`; can also be invoked standalone:
+  `uv run python viz_sim/render_example_video.py [--task Lift]`.
+
+## Eval data layout & post-eval auto-render
+
+Per-episode rollouts live at `/mnt/sda/edward/projects/robocasa_365/{model}/{task}/ep_NNN.npz`.
+Each npz contains `success`, `final_reward`, `steps`, `prompt`, plus subsampled
+`attn_stacks` (40, 18, 8, 512), `ext_frames`, `wrist_frames`. After every
+`eval_runner.py` invocation the `_summary.json` is written and then
+`render_example_video.render_for_task(args.task)` rebuilds
+`results/video/{task}.webp` (3 ckpt columns × ext/wrist rows). Missing ckpts
+render as a blank panel, so the file is useful even mid-sweep.
 
 ## When you edit anything here
 

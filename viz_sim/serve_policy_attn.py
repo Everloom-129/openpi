@@ -82,12 +82,23 @@ class AttnCapturingPolicy(_base_policy.BasePolicy):
         return t2i.mean(axis=1).astype(np.float32)                     # (n_heads, 512)
 
     def infer(self, obs: dict) -> dict:
+        # Pop perturbation request (if any) before forwarding to the inner
+        # policy — avoids unknown-key errors in the input transform.
+        perturb = obs.pop("_perturb", None) if isinstance(obs, dict) else None
+        if perturb is not None:
+            self._gpt.set_perturbation(
+                mode=perturb.get("mode"),
+                camera=perturb.get("camera"),
+                layer=int(perturb.get("layer", 7)),
+            )
         self._gpt.enable_attn_buffer()
         try:
             result = self._inner.infer(obs)
             buf = self._gpt.get_attn_buffer() or {}
         finally:
             self._gpt.clear_attn_buffer()
+            if perturb is not None:
+                self._gpt.clear_perturbation()
 
         if buf:
             try:

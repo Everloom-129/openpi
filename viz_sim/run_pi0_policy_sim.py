@@ -25,6 +25,7 @@ import time
 import cv2
 import numpy as np
 import robosuite
+from tqdm import tqdm
 from robosuite.controllers import load_composite_controller_config
 
 from openpi_client.websocket_client_policy import WebsocketClientPolicy
@@ -37,18 +38,8 @@ SIM_VIEW_SIZE = 448  # third-person sim panel
 TILE_SIZE = 224      # ext / wrist / attn tiles
 
 
-def build_env(task: str):
-    """Create a robosuite env with JOINT_VELOCITY arm control on a Panda.
-
-    Action layout: [arm_qvel(7), gripper(1)] — matches DROID 8-dim output.
-
-    Renders ext + wrist at 224 (policy input) and a third-person `frontview`
-    at SIM_VIEW_SIZE (composited UI panel). No on-screen GLFW window — we
-    composite everything into a single cv2 canvas instead.
-    """
-    controller_cfg = load_composite_controller_config(robot="Panda")
-    # After loading, robosuite flattens body_parts.arms.right -> body_parts.right.
-    controller_cfg["body_parts"]["right"] = {
+def _droid_arm_cfg() -> dict:
+    return {
         "type": "JOINT_VELOCITY",
         "input_max": 1,
         "input_min": -1,
@@ -60,6 +51,49 @@ def build_env(task: str):
         "ramp_ratio": 0.2,
         "gripper": {"type": "GRIP"},
     }
+
+
+def _libero_arm_cfg() -> dict:
+    # OSC_POSE — LIBERO's default Panda controller. Action layout is
+    # [dx, dy, dz, droll, dpitch, dyaw], all in [-1, 1] (output limits below
+    # match LIBERO's robosuite defaults).
+    return {
+        "type": "OSC_POSE",
+        "input_max": 1,
+        "input_min": -1,
+        "output_max": [0.05, 0.05, 0.05, 0.5, 0.5, 0.5],
+        "output_min": [-0.05, -0.05, -0.05, -0.5, -0.5, -0.5],
+        "kp": 150,
+        "damping_ratio": 1,
+        "impedance_mode": "fixed",
+        "kp_limits": [0, 300],
+        "damping_ratio_limits": [0, 10],
+        "position_limits": None,
+        "orientation_limits": None,
+        "uncouple_pos_ori": True,
+        "control_delta": True,
+        "interpolation": None,
+        "ramp_ratio": 0.2,
+        "gripper": {"type": "GRIP"},
+    }
+
+
+def build_env(task: str, config: str):
+    """Create a robosuite Panda env with the right controller for `config`.
+
+    - pi0/pi0.5-DROID  → JOINT_VELOCITY, action [qvel(7), gripper(1)]   (8-dim)
+    - pi0.5-LIBERO     → OSC_POSE,       action [dpose(6), gripper(1)]  (7-dim)
+
+    Renders ext + wrist at 224 (policy input) and a third-person `frontview`
+    at SIM_VIEW_SIZE (composited UI panel). No on-screen GLFW window — we
+    composite everything into a single cv2 canvas instead.
+    """
+    controller_cfg = load_composite_controller_config(robot="Panda")
+    # After loading, robosuite flattens body_parts.arms.right -> body_parts.right.
+    if config == "pi05_libero":
+        controller_cfg["body_parts"]["right"] = _libero_arm_cfg()
+    else:
+        controller_cfg["body_parts"]["right"] = _droid_arm_cfg()
 
     # Per-camera sizes: frontview large, the two policy-input cams at 224.
     return robosuite.make(
@@ -162,6 +196,39 @@ def compose_canvas(sim: np.ndarray, ext: np.ndarray, wrist: np.ndarray,
     return np.vstack([grid, prompt_strip(grid.shape[1], prompt)])
 
 
+def _quat2axisangle(quat: np.ndarray) -> np.ndarray:
+    """Mirror examples/libero/main.py:_quat2axisangle (xyzw → 3-vec)."""
+    quat = np.asarray(quat, dtype=np.float64)
+    # robosuite returns xyzw; clip w for numerical stability.
+    w = float(np.clip(quat[3], -1.0, 1.0))
+    den = float(np.sqrt(1.0 - w * w))
+    if den < 1e-8:
+        return np.zeros(3, dtype=np.float32)
+    angle = 2.0 * np.arccos(w)
+    return (quat[:3] / den * angle).astype(np.float32)
+
+
+def make_libero_obs(env_obs: dict, prompt: str) -> dict:
+    """Map a robosuite obs dict to the LIBERO input format expected by pi0.5-libero.
+
+    State is 8-dim: [eef_pos(3), eef_axisangle(3), gripper_qpos(2)] — matches
+    examples/libero/main.py.
+    """
+    base = to_uint8_rgb(env_obs["agentview_image"])
+    wrist = to_uint8_rgb(env_obs["robot0_eye_in_hand_image"])
+    state = np.concatenate([
+        np.asarray(env_obs["robot0_eef_pos"], dtype=np.float32),
+        _quat2axisangle(env_obs["robot0_eef_quat"]),
+        np.asarray(env_obs["robot0_gripper_qpos"], dtype=np.float32),
+    ]).astype(np.float32)
+    return {
+        "observation/image": base,
+        "observation/wrist_image": wrist,
+        "observation/state": state,
+        "prompt": prompt,
+    }
+
+
 def make_droid_obs(env_obs: dict, prompt: str) -> dict:
     """Map a robosuite obs dict to the DROID input format expected by pi0.5."""
     ext = to_uint8_rgb(env_obs["agentview_image"])
@@ -188,14 +255,19 @@ def main():
     ap.add_argument("--steps", type=int, default=2000)
     ap.add_argument("--horizon", type=int, default=OPEN_LOOP_HORIZON,
                     help="how many actions from each chunk to execute before re-querying")
+    ap.add_argument("--config", default="pi05_droid",
+                    choices=["pi05_droid", "pi0_droid", "pi05_libero"],
+                    help="must match the policy server's CONFIG; controls obs/action layout")
     args = ap.parse_args()
 
-    print(f"Connecting to policy at ws://{args.host}:{args.port} ...")
+    is_libero = args.config == "pi05_libero"
+    print(f"Connecting to policy at ws://{args.host}:{args.port} ... (config={args.config})")
     policy = WebsocketClientPolicy(host=args.host, port=args.port)
     print("Connected. Server metadata:", policy.get_server_metadata())
 
-    env = build_env(args.task)
-    print(f"Env action_dim={env.action_dim}  (expecting 8: 7 qvel + 1 gripper)")
+    env = build_env(args.task, args.config)
+    expected = 7 if is_libero else 8
+    print(f"Env action_dim={env.action_dim}  (expecting {expected})")
     obs = env.reset()
 
     # Live attention controls: trackbars on the cv2 window let you scrub
@@ -224,12 +296,13 @@ def main():
     t0 = time.time()
     n_infer = 0
     last_stack: np.ndarray | None = None  # (L, H, 512) attention from last infer
-    for step in range(args.steps):
+    pbar = tqdm(range(args.steps), desc="sim", dynamic_ncols=True)
+    for step in pbar:
         # Query the policy for a fresh action chunk every `horizon` steps.
         if step % args.horizon == 0:
-            droid_obs = make_droid_obs(obs, args.prompt)
-            result = policy.infer(droid_obs)
-            chunk = np.asarray(result["actions"])  # (N, 8)
+            policy_obs = make_libero_obs(obs, args.prompt) if is_libero else make_droid_obs(obs, args.prompt)
+            result = policy.infer(policy_obs)
+            chunk = np.asarray(result["actions"])  # (N, 7) libero, (N, 8) droid
             n_infer += 1
             attn_field = result.get("text_to_img_attn")
             if attn_field is not None:
@@ -243,12 +316,33 @@ def main():
                 elif arr.ndim == 1 and arr.shape[0] == 512:  # legacy (512,)
                     last_stack = arr[None, None]
 
-        action = chunk[step % args.horizon]
+        action = chunk[step % args.horizon].astype(np.float32, copy=True)
         # Defensive: pad/truncate to env.action_dim in case action_dim != 8.
         if action.shape[0] != env.action_dim:
             a = np.zeros(env.action_dim, dtype=np.float32)
             a[: min(len(action), env.action_dim)] = action[: env.action_dim]
             action = a
+
+        # Gripper convention remap.
+        # - pi0/pi0.5-DROID outputs gripper in [0, 1] (0=open, 1=close); see
+        #   examples/droid/main.py and src/openpi/policies/droid_policy.py.
+        # - pi0.5-LIBERO outputs gripper already in [-1, 1] (-1=open, +1=close)
+        #   so it can pass through robosuite's GRIP controller untouched.
+        raw_gripper = float(action[-1])
+        if is_libero:
+            action[-1] = raw_gripper  # already in [-1, 1]
+        else:
+            action[-1] = 1.0 if raw_gripper > 0.5 else -1.0
+        action = np.clip(action, -1.0, 1.0)
+
+        arm_label = "dpose" if is_libero else "qvel"
+        arm_str = np.array2string(
+            action[:-1], precision=3, suppress_small=True, separator=" "
+        )
+        pbar.set_postfix_str(
+            f"step={step} {arm_label}={arm_str} grip_raw={raw_gripper:+.3f} grip_cmd={action[-1]:+.2f}",
+            refresh=False,
+        )
 
         obs, _reward, _done, _info = env.step(action)
 

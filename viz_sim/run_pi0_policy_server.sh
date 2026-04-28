@@ -17,10 +17,13 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONFIG="${CONFIG:-pi05_droid}"
+CONFIG="pi05_libero"  # pi05_libero, pi0_droid, pi0_aloha_towel, etc.
 CKPT="${CKPT:-${REPO_ROOT}/checkpoints/viz/${CONFIG}_pytorch}"
 PORT="${PORT:-8000}"
 PROMPT="${PROMPT:-pick up the cube}"
+
+echo -e "\033[1;33mServing ${CONFIG} from ${CKPT} on port ${PORT} with prompt: ${PROMPT}\033[0m"
+read -p "Press Enter to continue"
 
 if [ ! -d "${CKPT}" ]; then
     echo "Checkpoint not found at ${CKPT}"
