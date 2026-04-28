@@ -23,7 +23,7 @@ for _p in [_PROJECT_ROOT, os.path.join(_PROJECT_ROOT, "src")]:
 
 from viz.dashboard import loader as _loader
 from viz.dashboard import loader_results as _rl
-from viz.dashboard.views import action_view, attn_matrix, cag_view, ckpt_compare, comparison, counterfactual, dataset_browser, denoising_view, grid_heatmap, image_heatmap, image_saliency, trajectory
+from viz.dashboard.views import action_view, attn_matrix, cag_view, ckpt_compare, comparison, counterfactual, dataset_browser, denoising_view, episode_compare, grid_heatmap, image_heatmap, image_saliency, trajectory
 
 
 def _save_online_h5(slice_dict: dict, h5_path: str) -> None:
@@ -90,7 +90,7 @@ with st.sidebar:
     st.title("🧠 Pi0.5 Attention")
     st.markdown("---")
 
-    mode = st.radio("Mode", ["Offline (HDF5)", "Results (Benchmark)", "Online (Inference)", "Online (Upload)", "Online (Dataset)", "Compare (Online)"], index=0)
+    mode = st.radio("Mode", ["Offline (HDF5)", "Results (Benchmark)", "Compare Episodes", "Online (Inference)", "Online (Upload)", "Online (Dataset)", "Compare (Online)"], index=0)
 
     if mode == "Offline (HDF5)":
         checkpoints = _loader.list_checkpoints(ATTN_H5_ROOT)
@@ -180,6 +180,54 @@ with st.sidebar:
         st.caption(f"Camera: **{res_camera}** · `{res_outcome}/{res_date}/{res_episode}`")
         if res_cf_slugs:
             st.caption(f"CF variants: {', '.join(f'`{s}`' for s in res_cf_slugs)}")
+
+    elif mode == "Compare Episodes":
+        # Dataset selector: same logic as Results mode
+        _res_parent = os.path.dirname(RESULTS_ROOT)
+        _default_ds = os.path.basename(RESULTS_ROOT)
+        _available_ds = []
+        if os.path.isdir(_res_parent):
+            for _d in sorted(os.listdir(_res_parent)):
+                _dp = os.path.join(_res_parent, _d)
+                if os.path.isdir(_dp) and any(
+                    os.path.isdir(os.path.join(_dp, c)) for c in ("left", "right")
+                ):
+                    _available_ds.append(_d)
+        _ds_idx = _available_ds.index(_default_ds) if _default_ds in _available_ds else 0
+        cmp_dataset = st.selectbox("Dataset", _available_ds or [_default_ds],
+                                   index=_ds_idx, key="cmp_ep_dataset")
+        _cmp_effective_root = os.path.join(_res_parent, cmp_dataset)
+
+        _cmp_cameras = [c for c in ("right", "left")
+                        if os.path.isdir(os.path.join(_cmp_effective_root, c))]
+        if not _cmp_cameras:
+            st.error(f"No camera data found in `{_cmp_effective_root}`.")
+            st.stop()
+        cmp_camera_ep = st.radio("Camera", _cmp_cameras, horizontal=True, key="cmp_ep_camera")
+        _cmp_root = os.path.join(_cmp_effective_root, cmp_camera_ep)
+
+        _cmp_outcomes = _rl.list_outcomes(_cmp_root)
+        if not _cmp_outcomes:
+            st.error(f"No data found in `{_cmp_root}`.")
+            st.stop()
+
+        # Date selector spans union of dates across outcomes
+        _all_dates: set[str] = set()
+        for _oc in _cmp_outcomes:
+            _all_dates.update(_rl.list_dates(_cmp_root, _oc))
+        _dates_sorted = sorted(_all_dates, reverse=True)
+        if not _dates_sorted:
+            st.error("No dated runs found.")
+            st.stop()
+        cmp_ep_date = st.selectbox("Date", _dates_sorted, key="cmp_ep_date")
+
+        # Outcome filter (multi)
+        cmp_ep_outcome_sel = st.multiselect(
+            "Outcomes", _cmp_outcomes, default=_cmp_outcomes, key="cmp_ep_outcomes",
+        )
+
+        st.markdown("---")
+        st.caption(f"Camera: **{cmp_camera_ep}** · `{cmp_dataset}` · `{cmp_ep_date}`")
 
     elif mode == "Online (Inference)":
         from viz.dashboard import inference as _inf
@@ -730,6 +778,17 @@ elif mode == "Results (Benchmark)":
             all_frame_paths=_all_res_h5,
             frame_labels=[str(f) for f in res_all_frames],
         )
+
+elif mode == "Compare Episodes":
+    st.header(f"🆚 Compare Episodes — `{cmp_dataset}` · {cmp_camera_ep} · {cmp_ep_date}")
+    if not cmp_ep_outcome_sel:
+        st.info("Select at least one outcome (success / failure) in the sidebar.")
+        st.stop()
+    episode_compare.render(
+        root=_cmp_root,
+        date=cmp_ep_date,
+        outcomes=cmp_ep_outcome_sel,
+    )
 
 elif mode == "Online (Inference)":
     st.header("Online Inference Mode")
