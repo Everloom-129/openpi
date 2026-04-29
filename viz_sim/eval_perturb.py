@@ -40,6 +40,16 @@ TASK_PROMPT = {
     "PickPlaceCan": "pick up the can and place it in the bin",
     "NutAssemblySquare": "put the square nut onto the peg",
 }
+# Per-task rollout horizon, chosen to roughly match robocasa target horizons
+# (200 / 300 / 400 / 500 / 600). Robosuite's own default is 1000, but our
+# horizon=200 was too short and capped every baseline at succ=0.
+TASK_HORIZON = {
+    "Lift": 200,
+    "Door": 300,
+    "Stack": 400,
+    "PickPlaceCan": 500,
+    "NutAssemblySquare": 600,
+}
 
 CONDITIONS = {
     "baseline":              {"mode": None,             "camera": None},
@@ -59,22 +69,68 @@ def to_uint8_rgb(img):
     return np.ascontiguousarray(arr[::-1])
 
 
-def make_droid_obs(env_obs, prompt):
-    grip = np.asarray(env_obs["robot0_gripper_qpos"], dtype=np.float32)
+def _resize_with_pad(img, size=TILE):
+    import cv2
+    h, w = img.shape[:2]
+    if (h, w) == (size, size):
+        return img
+    scale = min(size / h, size / w)
+    nh, nw = max(1, int(round(h * scale))), max(1, int(round(w * scale)))
+    resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
+    out = np.zeros((size, size, 3), dtype=resized.dtype)
+    top = (size - nh) // 2
+    left = (size - nw) // 2
+    out[top:top + nh, left:left + nw] = resized
+    return out
+
+
+def make_robocasa_obs(env_obs, prompt):
+    """16-D state in upstream order: [eef_pos_rel(3), eef_rot_rel(4 quat),
+    base_pos(3), base_rot(4 quat), gripper_qpos(2)]; cameras use
+    `robot0_agentview_left` if available (training distribution),
+    else `agentview` fallback."""
+    ext_key = "robot0_agentview_left_image" if "robot0_agentview_left_image" in env_obs else "agentview_image"
+    ext = _resize_with_pad(to_uint8_rgb(env_obs[ext_key]))
+    wrist = _resize_with_pad(to_uint8_rgb(env_obs["robot0_eye_in_hand_image"]))
+    state = np.concatenate([
+        np.asarray(env_obs["robot0_base_to_eef_pos"], dtype=np.float32).reshape(-1),
+        np.asarray(env_obs["robot0_base_to_eef_quat"], dtype=np.float32).reshape(-1),
+        np.asarray(env_obs["robot0_base_pos"], dtype=np.float32).reshape(-1),
+        np.asarray(env_obs["robot0_base_quat"], dtype=np.float32).reshape(-1),
+        np.asarray(env_obs["robot0_gripper_qpos"], dtype=np.float32).reshape(-1),
+    ]).astype(np.float32)
     return {
-        "observation/exterior_image_1_left": to_uint8_rgb(env_obs["agentview_image"]),
-        "observation/wrist_image_left": to_uint8_rgb(env_obs["robot0_eye_in_hand_image"]),
-        "observation/joint_position": np.asarray(env_obs["robot0_joint_pos"], dtype=np.float32),
-        "observation/gripper_position": np.array([grip[0] - grip[1]], dtype=np.float32),
+        "observation/image": ext,
+        "observation/wrist_image": wrist,
+        "observation/state": state,
         "prompt": prompt,
     }
 
 
-def adapt_action(action, env_action_dim):
+def adapt_action(action, env_action_dim, block_base: bool = False):
+    """Map 12-D model output (layout B) to robosuite PandaOmron's actual
+    composite-controller layout `[arm 6, torso 1, base 3, right_gripper 1, cmode 1]`.
+    The gripper-name append in robosuite/robots/robot.py:957 puts
+    `right_gripper` AFTER base, so `env[10]` is gripper, not env[6].
+    """
     a = np.zeros(env_action_dim, dtype=np.float32)
-    n = min(len(action), env_action_dim)
-    a[:n] = action[:n]
-    a[-1] = 1.0 if a[-1] > 0.5 else -1.0
+    if env_action_dim != 12 or len(action) < 12:
+        # Non-PandaOmron fallback: naive copy + binarize last dim.
+        n = min(len(action), env_action_dim)
+        a[:n] = action[:n]
+        a[-1] = 1.0 if a[-1] > 0.5 else -1.0
+        return np.clip(a, -1.0, 1.0)
+    a[0:6] = action[0:6]               # arm OSC_POSE
+    if block_base:
+        a[6]    = 0.0                  # torso
+        a[7:10] = 0.0                  # base x/y/yaw
+        a[10]   = float(action[6])     # right_gripper ← model gripper
+        a[11]   = -1.0                 # arm-only mode
+    else:
+        a[6]    = float(action[10])    # torso          ← base_motion[3]
+        a[7:10] = action[7:10]         # base x/y/yaw   ← base_motion[0:3]
+        a[10]   = float(action[6])     # right_gripper  ← gripper
+        a[11]   = float(action[11])    # control_mode
     return np.clip(a, -1.0, 1.0)
 
 
@@ -82,27 +138,33 @@ def build_env(task: str, seed: int):
     import robosuite
     from robosuite.controllers import load_composite_controller_config
 
-    ctrl = load_composite_controller_config(robot="Panda")
-    ctrl["body_parts"]["right"] = {
-        "type": "JOINT_VELOCITY",
-        "input_max": 1, "input_min": -1,
-        "output_max": 0.5, "output_min": -0.5,
-        "kp": 3.0,
-        "velocity_limits": [-1, 1],
-        "interpolation": None, "ramp_ratio": 0.2,
-        "gripper": {"type": "GRIP"},
-    }
-    return robosuite.make(
-        env_name=task, robots="Panda", controller_configs=ctrl,
-        has_renderer=False, has_offscreen_renderer=True,
-        use_camera_obs=True,
-        camera_names=["agentview", "robot0_eye_in_hand"],
-        camera_heights=TILE, camera_widths=TILE,
-        ignore_done=True, control_freq=20, seed=seed,
-    )
+    # PandaOmron + the default HYBRID_MOBILE_BASE composite (arm OSC_POSE +
+    # torso JOINT_POSITION + base JOINT_VELOCITY + cmode = 12-D action).
+    ctrl = load_composite_controller_config(robot="PandaOmron")
+
+    cam_names = ["agentview", "robot0_eye_in_hand"]
+    cam_h = [TILE, TILE]
+    cam_w = [TILE, TILE]
+
+    def _make(extra):
+        return robosuite.make(
+            env_name=task, robots="PandaOmron", controller_configs=ctrl,
+            has_renderer=False, has_offscreen_renderer=True,
+            use_camera_obs=True,
+            camera_names=cam_names + extra,
+            camera_heights=cam_h + [TILE] * len(extra),
+            camera_widths=cam_w + [TILE] * len(extra),
+            ignore_done=True, control_freq=20, seed=seed,
+        )
+    try:
+        return _make(["robot0_agentview_left"])
+    except ValueError as e:
+        if "robot0_agentview_left" in str(e):
+            return _make([])
+        raise
 
 
-def run_episode(env, policy, prompt, perturb_payload, max_steps=200):
+def run_episode(env, policy, prompt, perturb_payload, max_steps=200, *, block_base=False):
     obs = env.reset()
     success = False
     last_attn_stack = None
@@ -111,9 +173,13 @@ def run_episode(env, policy, prompt, perturb_payload, max_steps=200):
     pred_chunks = []
     chunk = None
 
+    ext_obs_key = None  # resolved on first obs
     for step in range(max_steps):
+        if ext_obs_key is None:
+            ext_obs_key = ("robot0_agentview_left_image"
+                           if "robot0_agentview_left_image" in obs else "agentview_image")
         if step % OPEN_LOOP_HORIZON == 0:
-            policy_obs = make_droid_obs(obs, prompt)
+            policy_obs = make_robocasa_obs(obs, prompt)
             if perturb_payload is not None:
                 policy_obs["_perturb"] = perturb_payload
             result = policy.infer(policy_obs)
@@ -123,7 +189,8 @@ def run_episode(env, policy, prompt, perturb_payload, max_steps=200):
             if attn is not None:
                 last_attn_stack = np.asarray(attn, dtype=np.float32)
 
-        action = adapt_action(chunk[step % OPEN_LOOP_HORIZON], env.action_dim)
+        action = adapt_action(chunk[step % OPEN_LOOP_HORIZON],
+                              env.action_dim, block_base=block_base)
         obs, reward, _done, _info = env.step(action)
 
         eef_traj.append(np.asarray(obs["robot0_eef_pos"], dtype=np.float32))
@@ -136,7 +203,7 @@ def run_episode(env, policy, prompt, perturb_payload, max_steps=200):
         if step % ATTN_SUBSAMPLE == 0 and last_attn_stack is not None:
             attn_snaps.append((step, last_attn_stack.copy()))
             frames.append((step,
-                           to_uint8_rgb(obs["agentview_image"]),
+                           to_uint8_rgb(obs[ext_obs_key]),
                            to_uint8_rgb(obs["robot0_eye_in_hand_image"])))
 
     reward_arr = np.asarray(reward_traj, dtype=np.float32)
@@ -167,12 +234,16 @@ def main():
     ap.add_argument("--condition", required=True, choices=list(CONDITIONS.keys()))
     ap.add_argument("--episodes", type=int, default=10)
     ap.add_argument("--seed_base", type=int, default=0)
-    ap.add_argument("--max_steps", type=int, default=200)
+    ap.add_argument("--max_steps", type=int, default=None,
+                    help="Override per-task horizon; default uses TASK_HORIZON[task].")
     ap.add_argument("--host", default="localhost")
     ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--block_base", action="store_true",
+                    help="zero torso/base and force arm-only mode (gripper still active).")
     args = ap.parse_args()
 
     prompt = TASK_PROMPT[args.task]
+    max_steps = args.max_steps if args.max_steps is not None else TASK_HORIZON[args.task]
     perturb = CONDITIONS[args.condition]
     perturb_payload = (
         {"mode": perturb["mode"], "camera": perturb["camera"], "layer": 7}
@@ -185,7 +256,7 @@ def main():
     from openpi_client.websocket_client_policy import WebsocketClientPolicy
     policy = WebsocketClientPolicy(host=args.host, port=args.port)
     print(f"[perturb] {args.task}/{args.condition}: connecting {args.host}:{args.port}")
-    print(f"[perturb] payload={perturb_payload}  prompt={prompt!r}")
+    print(f"[perturb] payload={perturb_payload}  prompt={prompt!r}  max_steps={max_steps}")
 
     summary = []
     for ep in range(args.episodes):
@@ -198,7 +269,8 @@ def main():
         env = build_env(args.task, seed=seed)
         t0 = time.time()
         try:
-            data = run_episode(env, policy, prompt, perturb_payload, max_steps=args.max_steps)
+            data = run_episode(env, policy, prompt, perturb_payload,
+                                max_steps=max_steps, block_base=args.block_base)
         except Exception as e:
             import traceback
             print(f"[perturb] ep {ep:03d} ERROR: {e}\n{traceback.format_exc()}")

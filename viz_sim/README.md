@@ -49,14 +49,26 @@ CONFIG=pi05_libero PROMPT="pick up the alphabet soup" \
 Pass `--config` to `run_pi0_policy_sim.py` so the sim-side obs and action
 layout match the served checkpoint. Currently supported:
 
-| `--config`     | Controller       | Action            | Obs keys                                                                    |
-|----------------|------------------|-------------------|-----------------------------------------------------------------------------|
-| `pi05_droid`   | `JOINT_VELOCITY` | `qvel(7)+grip(1)` | `observation/{exterior_image_1_left,wrist_image_left,joint_position,gripper_position}` |
-| `pi0_droid`    | `JOINT_VELOCITY` | `qvel(7)+grip(1)` | same as `pi05_droid`                                                        |
-| `pi05_libero`  | `OSC_POSE`       | `dpose(6)+grip(1)`| `observation/{image,wrist_image,state}` (state = `[eef_pos(3), eef_axisangle(3), gripper_qpos(2)]`) |
+| `--config` | Robot | Controller | Model dims used | Obs builder | Gripper |
+|---|---|---|---|---|---|
+| `pi05_droid` / `pi0_droid` | Panda (fixed) | `JOINT_POSITION` delta (kp=50, ±0.3 rad) | 8: `[Δjoint(7), grip(1)]` | `make_droid_obs` (`{exterior_image_1_left, wrist_image_left, joint_position, gripper_position}`) | DROID `[0,1]` → binarize at 0.5 |
+| `pi05_libero` | Panda (fixed) | `OSC_POSE` delta | 7: `[Δeef_pos(3), Δeef_rot(3), grip(1)]` | `make_libero_obs` (state = `[eef_pos(3), eef_axisangle(3), gripper_qpos(2)]`) | passthrough (`±1`) |
+| `pi05_robocasa365` | **PandaOmron** (mobile base) | `OSC_POSE` arm + composite base (HYBRID_MOBILE_BASE) | 12: `[eef_pos(3), eef_rot(3), grip(1), base_motion(4), control_mode(1)]` | `make_robocasa_obs` (state = `[eef_pos_rel(3), eef_rot_rel(4), base_pos(3), base_rot(4), gripper_qpos(2)]`; ext = `robot0_agentview_left` w/ fallback to `agentview`) | passthrough |
 
-Gripper is auto-remapped per config: DROID outputs `[0,1]` and is binarized
-to `±1` for robosuite GRIP; LIBERO already outputs `[-1,1]` and passes through.
+**Important**: prior versions of `pi05_droid` / `pi0_droid` used
+`JOINT_VELOCITY` — that was incorrect. DROID training defaults to
+`action_dict.joint_position` (see `src/openpi/training/droid_rlds_dataset.py:34`),
+so the 7 arm dims are *delta joint positions* in radians, not velocities.
+
+For `pi05_robocasa365`: the model was trained on robocasa kitchen tasks
+(PandaOmron + 4-DoF mobile base + 12-D composite action), but
+`serve_policy_attn.py` is launched with `--config=pi05_droid`, so it slices
+to 8 dims and ships DROID-format obs. We use those first 8 dims as
+`[Δeef_pos, Δeef_rot, gripper, base_x]` and run on a PandaOmron in robosuite
+single-arm tasks. This is **for visualization only** — the obs/action
+mismatch means the policy won't behave intelligently, but the robot will
+move so you can scrub attention overlays. See
+`docs/0428-robocasa-actionspace.md` for the full action-spec analysis.
 
 ```bash
 # pi05-libero example (server side already running with CONFIG=pi05_libero):

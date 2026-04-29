@@ -7,6 +7,7 @@ LOG=${REPO}/results/_logs
 PY=/home/edward/miniconda3/envs/robocasa_sim/bin/python
 EPISODES=${EPISODES:-10}
 SEED_BASE=${SEED_BASE:-1000}
+BLOCK_BASE=${BLOCK_BASE:-0}   # set to 1 to zero torso/base, force arm-only
 
 mkdir -p "${LOG}"
 
@@ -19,7 +20,7 @@ sleep 3
 
 echo "[perturb-orch] starting pi05_robocasa365 server on GPU 2"
 (cd "${REPO}" && CUDA_VISIBLE_DEVICES=2 uv run viz_sim/serve_policy_attn.py \
-    --port=8000 --config=pi05_droid \
+    --port=8000 --config=pi05_robocasa365 \
     --dir="${REPO}/checkpoints/viz/pi05_robocasa365_pytorch" \
     > "${LOG}/perturb_server.log" 2>&1) &
 SERVER_PID=$!
@@ -39,9 +40,12 @@ echo "[perturb-orch] server up; running $((${#TASKS[@]} * ${#CONDITIONS[@]})) ce
 for task in "${TASKS[@]}"; do
     for cond in "${CONDITIONS[@]}"; do
         echo "[perturb-orch] === ${task} / ${cond} ==="
+        EXTRA_ARGS=()
+        [ "${BLOCK_BASE}" = "1" ] && EXTRA_ARGS+=(--block_base)
         "${PY}" "${REPO}/viz_sim/eval_perturb.py" \
             --task "${task}" --condition "${cond}" \
             --episodes "${EPISODES}" --seed_base "${SEED_BASE}" \
+            "${EXTRA_ARGS[@]}" \
             > "${LOG}/perturb_${task}_${cond}.log" 2>&1 \
             || echo "[perturb-orch] ${task}/${cond} errored, see log"
     done

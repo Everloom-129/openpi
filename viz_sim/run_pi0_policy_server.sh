@@ -17,7 +17,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONFIG="pi05_libero"  # pi05_libero, pi0_droid, pi0_aloha_towel, etc.
+CONFIG="pi05_robocasa365"  # pi05_libero, pi0_droid, pi0_aloha_towel, etc.
 CKPT="${CKPT:-${REPO_ROOT}/checkpoints/viz/${CONFIG}_pytorch}"
 PORT="${PORT:-8000}"
 PROMPT="${PROMPT:-pick up the cube}"

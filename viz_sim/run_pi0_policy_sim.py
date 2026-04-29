@@ -39,16 +39,29 @@ TILE_SIZE = 224      # ext / wrist / attn tiles
 
 
 def _droid_arm_cfg() -> dict:
+    """JOINT_POSITION delta controller for pi0/pi0.5-DROID.
+
+    The DROID checkpoints train on `action_dict.joint_position` (per
+    `src/openpi/training/droid_rlds_dataset.py:34` — "We default to joint
+    position actions, since they allow policy evaluation in simulation").
+    Norm stats confirm: action[0:7] mean≈0, std≈0.15–0.30 — these are
+    *delta* joint positions in radians per chunk step, not velocities.
+
+    We map the policy's [-1, 1] output range to ±0.3 rad delta per step.
+    The previous JOINT_VELOCITY config was incorrect and produced systematic
+    drift: it interpreted radians as rad/s and integrated them at 20Hz.
+    """
     return {
-        "type": "JOINT_VELOCITY",
+        "type": "JOINT_POSITION",
         "input_max": 1,
         "input_min": -1,
-        "output_max": 0.5,
-        "output_min": -0.5,
-        "kp": 3.0,
-        "velocity_limits": [-1, 1],
+        "output_max": 0.3,
+        "output_min": -0.3,
+        "kp": 50,
+        "velocity_limits": [-2, 2],
         "interpolation": None,
         "ramp_ratio": 0.2,
+        "control_delta": True,
         "gripper": {"type": "GRIP"},
     }
 
@@ -78,37 +91,131 @@ def _libero_arm_cfg() -> dict:
     }
 
 
-def build_env(task: str, config: str):
-    """Create a robosuite Panda env with the right controller for `config`.
+def _robocasa_arm_cfg() -> dict:
+    """OSC_POSE delta arm controller for pi0.5-robocasa365.
 
-    - pi0/pi0.5-DROID  → JOINT_VELOCITY, action [qvel(7), gripper(1)]   (8-dim)
-    - pi0.5-LIBERO     → OSC_POSE,       action [dpose(6), gripper(1)]  (7-dim)
+    pi05_robocasa365 was trained on robocasa target tasks (PandaOmron + 4-DoF
+    mobile base + composite controller; 12-D action, 16-D state).
+
+    There are TWO different 12-dim layouts in the robocasa codebase:
+
+    A. **LeRobot dataset layout** (`convert_hdf5_lerobot.py` + the
+       `PandaOmron_modality.json` key map):
+           action[0:4]   base_motion          (4 dims)
+           action[4]     control_mode        (1)
+           action[5:8]   end_effector_position (3)
+           action[8:11]  end_effector_rotation (3)
+           action[11]    gripper_close       (1)
+       state (16): [base_pos(3), base_rot(4 quat), eef_pos_rel(3),
+                    eef_rot_rel(4 quat), gripper_qpos(2)].
+
+    B. **Gym-wrapper layout** (`robocasa/utils/env_utils.py:134 convert_action`):
+           action[0:3]   end_effector_position
+           action[3:6]   end_effector_rotation
+           action[6]     gripper_close
+           action[7:11]  base_motion
+           action[11]    control_mode
+
+    The pi05_robocasa365 *checkpoint's* `norm_stats.json` matches **layout B**:
+    eef_pos has uniform std ≈ 0.32 in dims 0–2; eef_rot has std ≈ 0.10 in
+    dims 3–5; the [-1,+1] gripper sits at dim 6 with std ≈ 0.99 (perfect
+    Bernoulli signature); base motion in dims 7–10 (3 active + 1 zero);
+    control_mode at dim 11 (std ≈ 0.70). So we trust the checkpoint and
+    decode model output as layout B.
+
+    `serve_policy_attn.py` runs with `--config=pi05_droid`, so `DroidOutputs`
+    slices to the first 8 dims — under layout B these are exactly
+    `[Δeef_pos(3), Δeef_rot(3), gripper(1), base_x(1)]`. The other 3 base
+    dims and the control_mode flag are dropped.
+    """
+    return {
+        "type": "OSC_POSE",
+        "input_max": 1,
+        "input_min": -1,
+        "output_max": [0.05, 0.05, 0.05, 0.5, 0.5, 0.5],
+        "output_min": [-0.05, -0.05, -0.05, -0.5, -0.5, -0.5],
+        "kp": 150,
+        "damping_ratio": 1,
+        "impedance_mode": "fixed",
+        "kp_limits": [0, 300],
+        "damping_ratio_limits": [0, 10],
+        "position_limits": None,
+        "orientation_limits": None,
+        "uncouple_pos_ori": True,
+        "control_delta": True,
+        "interpolation": None,
+        "ramp_ratio": 0.2,
+        "gripper": {"type": "GRIP"},
+    }
+
+
+def build_env(task: str, config: str):
+    """Create a robosuite env with the right robot + controller for `config`.
+
+    - pi0/pi0.5-DROID    → Panda + JOINT_POSITION delta (8-dim action)
+    - pi0.5-LIBERO       → Panda + OSC_POSE delta (7-dim action)
+    - pi0.5-ROBOCASA365  → PandaOmron + OSC_POSE arm + composite mobile base
+                           (uses first 8 dims of robocasa's 12-dim layout)
 
     Renders ext + wrist at 224 (policy input) and a third-person `frontview`
     at SIM_VIEW_SIZE (composited UI panel). No on-screen GLFW window — we
     composite everything into a single cv2 canvas instead.
     """
-    controller_cfg = load_composite_controller_config(robot="Panda")
-    # After loading, robosuite flattens body_parts.arms.right -> body_parts.right.
-    if config == "pi05_libero":
-        controller_cfg["body_parts"]["right"] = _libero_arm_cfg()
+    if config == "pi05_robocasa365":
+        # PandaOmron: 7-DoF Panda mounted on a 4-DoF mobile base. The default
+        # composite controller for PandaOmron exposes the base as a separate
+        # body_part — env.action_dim is correspondingly larger than 8.
+        # We override the arm with OSC_POSE delta; the base controller is
+        # left at its default so the model's base-motion dim still actuates
+        # the mobile platform.
+        controller_cfg = load_composite_controller_config(robot="PandaOmron")
+        controller_cfg["body_parts"]["right"] = _robocasa_arm_cfg()
+        robot_name = "PandaOmron"
     else:
-        controller_cfg["body_parts"]["right"] = _droid_arm_cfg()
+        controller_cfg = load_composite_controller_config(robot="Panda")
+        if config == "pi05_libero":
+            controller_cfg["body_parts"]["right"] = _libero_arm_cfg()
+        else:
+            controller_cfg["body_parts"]["right"] = _droid_arm_cfg()
+        robot_name = "Panda"
 
     # Per-camera sizes: frontview large, the two policy-input cams at 224.
-    return robosuite.make(
-        env_name=task,
-        robots="Panda",
-        controller_configs=controller_cfg,
-        has_renderer=False,
-        has_offscreen_renderer=True,
-        use_camera_obs=True,
-        camera_names=["frontview", "agentview", "robot0_eye_in_hand"],
-        camera_heights=[SIM_VIEW_SIZE, TILE_SIZE, TILE_SIZE],
-        camera_widths=[SIM_VIEW_SIZE, TILE_SIZE, TILE_SIZE],
-        ignore_done=True,
-        control_freq=20,
-    )
+    # robocasa365 was trained on `robot0_agentview_left` (a robot-mounted side
+    # view that follows PandaOmron's mobile base). That camera is registered
+    # by robocasa envs; for plain-robosuite tasks (e.g. PickPlaceSingle) we
+    # fall back to `agentview` so env creation doesn't error out.
+    cam_names = ["frontview", "agentview", "robot0_eye_in_hand"]
+    cam_heights = [SIM_VIEW_SIZE, TILE_SIZE, TILE_SIZE]
+    cam_widths = [SIM_VIEW_SIZE, TILE_SIZE, TILE_SIZE]
+
+    def _make(extra_cams: list[str]):
+        names = cam_names + extra_cams
+        heights = cam_heights + [TILE_SIZE] * len(extra_cams)
+        widths = cam_widths + [TILE_SIZE] * len(extra_cams)
+        return robosuite.make(
+            env_name=task,
+            robots=robot_name,
+            controller_configs=controller_cfg,
+            has_renderer=False,
+            has_offscreen_renderer=True,
+            use_camera_obs=True,
+            camera_names=names,
+            camera_heights=heights,
+            camera_widths=widths,
+            ignore_done=True,
+            control_freq=20,
+        )
+
+    if config == "pi05_robocasa365":
+        try:
+            return _make(["robot0_agentview_left"])
+        except ValueError as e:
+            if "robot0_agentview_left" in str(e):
+                print(f"[build_env] task '{task}' has no robot0_agentview_left camera; "
+                      f"falling back to agentview (training-distribution camera unavailable)")
+            else:
+                raise
+    return _make([])
 
 
 def to_uint8_rgb(img, size: int | None = TILE_SIZE) -> np.ndarray:
@@ -229,6 +336,55 @@ def make_libero_obs(env_obs: dict, prompt: str) -> dict:
     }
 
 
+def _resize_with_pad(img: np.ndarray, size: int = TILE_SIZE) -> np.ndarray:
+    """Aspect-preserving resize with zero-padding to (size, size). Matches
+    `openpi_client.image_tools.resize_with_pad` used in upstream robocasa eval."""
+    h, w = img.shape[:2]
+    if (h, w) == (size, size):
+        return img
+    scale = min(size / h, size / w)
+    nh, nw = max(1, int(round(h * scale))), max(1, int(round(w * scale)))
+    resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
+    out = np.zeros((size, size, 3), dtype=resized.dtype)
+    top = (size - nh) // 2
+    left = (size - nw) // 2
+    out[top:top + nh, left:left + nw] = resized
+    return out
+
+
+def make_robocasa_obs(env_obs: dict, prompt: str) -> dict:
+    """Mirror of upstream `examples/robocasa/main.py`.
+
+    State is a single 16-D vector concatenated as
+        [eef_pos_rel(3), eef_rot_rel(4 quat xyzw),
+         base_pos(3),    base_rot(4 quat xyzw),
+         gripper_qpos(2)]
+    Cameras are `robot0_agentview_left` (robot-mounted, follows the mobile
+    base) and `robot0_eye_in_hand`, both letterboxed to 224×224 with
+    `_resize_with_pad`.
+    """
+    ext_key = ("robot0_agentview_left_image"
+               if "robot0_agentview_left_image" in env_obs
+               else "agentview_image")
+    ext_raw = to_uint8_rgb(env_obs[ext_key], size=None)
+    wrist_raw = to_uint8_rgb(env_obs["robot0_eye_in_hand_image"], size=None)
+    ext = _resize_with_pad(ext_raw, TILE_SIZE)
+    wrist = _resize_with_pad(wrist_raw, TILE_SIZE)
+    state = np.concatenate([
+        np.asarray(env_obs["robot0_base_to_eef_pos"], dtype=np.float32).reshape(-1),
+        np.asarray(env_obs["robot0_base_to_eef_quat"], dtype=np.float32).reshape(-1),
+        np.asarray(env_obs["robot0_base_pos"], dtype=np.float32).reshape(-1),
+        np.asarray(env_obs["robot0_base_quat"], dtype=np.float32).reshape(-1),
+        np.asarray(env_obs["robot0_gripper_qpos"], dtype=np.float32).reshape(-1),
+    ]).astype(np.float32)
+    return {
+        "observation/image": ext,
+        "observation/wrist_image": wrist,
+        "observation/state": state,
+        "prompt": prompt,
+    }
+
+
 def make_droid_obs(env_obs: dict, prompt: str) -> dict:
     """Map a robosuite obs dict to the DROID input format expected by pi0.5."""
     ext = to_uint8_rgb(env_obs["agentview_image"])
@@ -256,18 +412,49 @@ def main():
     ap.add_argument("--horizon", type=int, default=OPEN_LOOP_HORIZON,
                     help="how many actions from each chunk to execute before re-querying")
     ap.add_argument("--config", default="pi05_droid",
-                    choices=["pi05_droid", "pi0_droid", "pi05_libero"],
+                    choices=["pi05_droid", "pi0_droid", "pi05_libero", "pi05_robocasa365"],
                     help="must match the policy server's CONFIG; controls obs/action layout")
+    ap.add_argument("--diag_dir", default="viz_sim/results/action_diag",
+                    help="where to save the per-dim action diagnostic plot/npz on exit")
+    ap.add_argument("--no_diag", action="store_true",
+                    help="skip writing the action diagnostic on exit")
+    ap.add_argument("--block_base", action="store_true",
+                    help="(robocasa only) zero env_action[7:11] (torso + base x/y/yaw) and "
+                         "force control_mode=-1 so only the arm + gripper are driven. "
+                         "Use to isolate manipulator behavior from mobile-base / torso noise.")
     args = ap.parse_args()
 
     is_libero = args.config == "pi05_libero"
+    is_robocasa = args.config == "pi05_robocasa365"
     print(f"Connecting to policy at ws://{args.host}:{args.port} ... (config={args.config})")
     policy = WebsocketClientPolicy(host=args.host, port=args.port)
     print("Connected. Server metadata:", policy.get_server_metadata())
 
     env = build_env(args.task, args.config)
-    expected = 7 if is_libero else 8
-    print(f"Env action_dim={env.action_dim}  (expecting {expected})")
+    if is_robocasa and args.block_base:
+        print("[robocasa] --block_base: torso + base will be pinned to 0, "
+              "control_mode forced to -1 (arm-only)")
+    if is_robocasa:
+        # Dump the composite controller's action layout so we can verify how
+        # robosuite slices our 12-D action across body parts (arm/gripper/
+        # torso/base/...). The training-side layout is layout B
+        # [eef(6), grip(1), base(4), control_mode(1)] from
+        # robocasa.utils.env_utils.convert_action — but raw robosuite (no
+        # gym wrapper) uses whatever order the body_parts dict yields.
+        try:
+            split = env.robots[0].composite_controller._action_split_indexes
+            print("[robocasa] composite action layout:",
+                  ", ".join(f"{k}=[{v[0]}:{v[1]}]" for k, v in split.items()))
+        except Exception as e:
+            print("[robocasa] could not inspect composite action layout:", e)
+        expected_model_dims = 12          # server returns full robocasa 12-D action
+    elif is_libero:
+        expected_model_dims = 7
+    else:
+        expected_model_dims = 8
+    print(f"Env action_dim={env.action_dim}  (model returns {expected_model_dims} dims)")
+    if is_robocasa and env.action_dim < 12:
+        print(f"WARN: env.action_dim={env.action_dim} < 12; some robocasa action dims will be dropped")
     obs = env.reset()
 
     # Live attention controls: trackbars on the cv2 window let you scrub
@@ -296,13 +483,62 @@ def main():
     t0 = time.time()
     n_infer = 0
     last_stack: np.ndarray | None = None  # (L, H, 512) attention from last infer
+    recorded_actions: list[np.ndarray] = []  # per-step model_action (post-unnorm, pre-clip)
     pbar = tqdm(range(args.steps), desc="sim", dynamic_ncols=True)
+    interrupted = False
+
+    def _save_action_diag():
+        if args.no_diag or not recorded_actions:
+            return
+        from datetime import datetime
+        from pathlib import Path
+        try:
+            from viz_sim.diagnose_actions import plot_action_timeseries
+        except ImportError:
+            import sys as _sys
+            _sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from diagnose_actions import plot_action_timeseries  # type: ignore
+        arr = np.stack(recorded_actions, axis=0)
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        stem = f"{args.config}_{args.task}_{ts}"
+        out_dir = Path(args.diag_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        npz_path = out_dir / f"{stem}.npz"
+        png_path = out_dir / f"{stem}.png"
+        np.savez_compressed(npz_path, actions=arr, prompt=args.prompt, task=args.task,
+                            config=args.config)
+        # Find norm_stats.json next to the ckpt for training-distribution overlay.
+        repo_root = Path(__file__).resolve().parents[1]
+        norm_path = repo_root / "checkpoints" / "viz" / f"{args.config}_pytorch" / "assets" / "droid" / "norm_stats.json"
+        plot_action_timeseries(
+            arr, png_path, config=args.config,
+            norm_stats_path=norm_path if norm_path.exists() else None,
+            title=f"{args.config} | {args.task} | {arr.shape[0]} steps",
+        )
+
+    import signal as _signal
+
+    def _on_sigint(signum, frame):
+        nonlocal interrupted
+        interrupted = True
+    _signal.signal(_signal.SIGINT, _on_sigint)
+
     for step in pbar:
         # Query the policy for a fresh action chunk every `horizon` steps.
         if step % args.horizon == 0:
-            policy_obs = make_libero_obs(obs, args.prompt) if is_libero else make_droid_obs(obs, args.prompt)
+            # Obs format follows the server's `--config`. Each builder ships
+            # the exact keys that config's input transform expects:
+            #   pi05_libero       → libero 8-D state
+            #   pi05_robocasa365  → robocasa 16-D state (base + base→eef + gripper)
+            #   pi0/pi0.5-droid   → DROID joint-position state
+            if is_libero:
+                policy_obs = make_libero_obs(obs, args.prompt)
+            elif is_robocasa:
+                policy_obs = make_robocasa_obs(obs, args.prompt)
+            else:
+                policy_obs = make_droid_obs(obs, args.prompt)
             result = policy.infer(policy_obs)
-            chunk = np.asarray(result["actions"])  # (N, 7) libero, (N, 8) droid
+            chunk = np.asarray(result["actions"])  # (N, 7) libero, (N, 8) droid/robocasa365
             n_infer += 1
             attn_field = result.get("text_to_img_attn")
             if attn_field is not None:
@@ -316,35 +552,80 @@ def main():
                 elif arr.ndim == 1 and arr.shape[0] == 512:  # legacy (512,)
                     last_stack = arr[None, None]
 
-        action = chunk[step % args.horizon].astype(np.float32, copy=True)
-        # Defensive: pad/truncate to env.action_dim in case action_dim != 8.
-        if action.shape[0] != env.action_dim:
-            a = np.zeros(env.action_dim, dtype=np.float32)
-            a[: min(len(action), env.action_dim)] = action[: env.action_dim]
-            action = a
+        model_action = chunk[step % args.horizon].astype(np.float32, copy=True)
+        recorded_actions.append(model_action.copy())
 
-        # Gripper convention remap.
-        # - pi0/pi0.5-DROID outputs gripper in [0, 1] (0=open, 1=close); see
-        #   examples/droid/main.py and src/openpi/policies/droid_policy.py.
-        # - pi0.5-LIBERO outputs gripper already in [-1, 1] (-1=open, +1=close)
-        #   so it can pass through robosuite's GRIP controller untouched.
-        raw_gripper = float(action[-1])
-        if is_libero:
-            action[-1] = raw_gripper  # already in [-1, 1]
+        # Per-config routing into the env's flat action vector.
+        env_action = np.zeros(env.action_dim, dtype=np.float32)
+        if is_robocasa:
+            # Model layout (robocasa gym-wrapper layout B):
+            #   [eef_pos(3), eef_rot(3), gripper(1), base_motion(4), control_mode(1)]
+            # where base_motion = [base_x, base_y, base_yaw, torso_z]
+            # (see robocasa/wrappers/gym_wrapper.py:121-124).
+            #
+            # Raw robosuite PandaOmron HYBRID_MOBILE_BASE layout. Iteration
+            # order over part_controller_config is `[right, torso, base,
+            # right_gripper]` because robot.py:957-958 *appends* "right_gripper"
+            # AFTER the body_parts dict has been flattened. Plus 1 cmode dim
+            # at the end for HYBRID_MOBILE_BASE:
+            #   env[0:6]  arm OSC_POSE
+            #   env[6]    torso
+            #   env[7:10] base (x, y, yaw)
+            #   env[10]   right_gripper
+            #   env[11]   control_mode
+            env_action[0:6] = model_action[0:6]            # arm
+            if args.block_base:
+                # Pin torso + base to 0 and force arm-only mode. Keep gripper
+                # passthrough so manipulation is still observable.
+                env_action[6]    = 0.0                     # torso
+                env_action[7:10] = 0.0                     # base
+                env_action[10]   = float(model_action[6])  # right_gripper ← model gripper
+                env_action[11]   = -1.0                    # arm-only mode
+            else:
+                env_action[6]    = float(model_action[10]) # torso        ← base_motion[3]
+                env_action[7:10] = model_action[7:10]      # base x,y,yaw ← base_motion[0:3]
+                env_action[10]   = float(model_action[6])  # right_gripper ← gripper
+                env_action[11]   = float(model_action[11]) # control_mode
+            raw_gripper = float(model_action[6])
+            arm_label = "Δpose"
+        elif is_libero:
+            # OSC_POSE Panda; gripper passthrough (already ∈ [-1, +1]).
+            n = min(len(model_action), env.action_dim)
+            env_action[:n] = model_action[:n]
+            raw_gripper = float(env_action[-1])
+            arm_label = "Δpose"
         else:
-            action[-1] = 1.0 if raw_gripper > 0.5 else -1.0
-        action = np.clip(action, -1.0, 1.0)
+            # JOINT_POSITION delta Panda; DROID gripper [0,1] → binarize ±1.
+            n = min(len(model_action), env.action_dim)
+            env_action[:n] = model_action[:n]
+            raw_gripper = float(env_action[-1])
+            env_action[-1] = 1.0 if raw_gripper > 0.5 else -1.0
+            arm_label = "Δjoint"
 
-        arm_label = "dpose" if is_libero else "qvel"
-        arm_str = np.array2string(
-            action[:-1], precision=3, suppress_small=True, separator=" "
-        )
-        pbar.set_postfix_str(
-            f"step={step} {arm_label}={arm_str} grip_raw={raw_gripper:+.3f} grip_cmd={action[-1]:+.2f}",
-            refresh=False,
-        )
+        env_action = np.clip(env_action, -1.0, 1.0)
 
-        obs, _reward, _done, _info = env.step(action)
+        # Pretty-print: arm slice + gripper + (optional) base slice.
+        if is_robocasa:
+            def _fmt(v):
+                return ",".join(f"{x:+.2f}" for x in v)
+            pos_str = _fmt(env_action[:3])
+            rot_str = _fmt(env_action[3:6])
+            torso = float(env_action[6])  if env.action_dim > 6 else float("nan")
+            base_str = _fmt(env_action[7:10]) if env.action_dim > 9 else ""
+            grip_cmd = float(env_action[10]) if env.action_dim > 10 else float("nan")
+            cmode = float(env_action[11])    if env.action_dim > 11 else float("nan")
+            pbar.set_postfix_str(
+                f"s={step} p={pos_str}|r={rot_str} t={torso:+.2f} b={base_str} g={grip_cmd:+.1f} m={cmode:+.1f}",
+                refresh=False,
+            )
+        else:
+            arm_str = np.array2string(env_action[:-1], precision=3, suppress_small=True, separator=" ")
+            pbar.set_postfix_str(
+                f"step={step} {arm_label}={arm_str} grip_raw={raw_gripper:+.3f} grip_cmd={env_action[-1]:+.2f}",
+                refresh=False,
+            )
+
+        obs, _reward, _done, _info = env.step(env_action)
 
         sim = to_uint8_rgb(obs["frontview_image"], size=SIM_VIEW_SIZE)
         ext = to_uint8_rgb(obs["agentview_image"])
@@ -365,9 +646,13 @@ def main():
         cv2.imshow(WINDOW, cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
+        if interrupted:
+            print("\n[run] SIGINT received — finishing up...")
+            break
 
     dt = time.time() - t0
-    print(f"Done. {args.steps} sim steps, {n_infer} policy queries in {dt:.1f}s.")
+    print(f"Done. {step + 1} sim steps, {n_infer} policy queries in {dt:.1f}s.")
+    _save_action_diag()
     env.close()
     cv2.destroyAllWindows()
 
