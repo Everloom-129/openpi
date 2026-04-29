@@ -4,6 +4,8 @@
 **Branch**: tony/visualize_attention
 **Reference**: https://github.com/LisavilaLee/li/openpi_with_subtask (commit `99c738a`)
 
+`claude --resume 114b62be-d709-4b08-b2d4-6bb99066df35`
+
 ---
 
 ## Context
