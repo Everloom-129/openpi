@@ -56,7 +56,13 @@ kill -TERM ${SERVER_PID} 2>/dev/null || true
 sleep 3
 pkill -f 'serve_policy_attn' 2>/dev/null || true
 
-echo "[perturb-orch] rendering 5 videos + report"
+echo "[perturb-orch] rendering ep_000 comparison videos + per-task report"
 cd "${REPO}" && uv run python viz_sim/render_perturb_video.py 2>&1 | tail -20
 cd "${REPO}" && uv run python viz_sim/build_perturb_report.py 2>&1 | tail -20
+
+echo "[perturb-orch] rendering attention videos for SUCCESSFUL episodes"
+cd "${REPO}" && uv run python viz_sim/render_perturb_success.py 2>&1 | tail -40
+
+echo "[perturb-orch] building A+B summary heatmap (results/perturb_summary.png)"
+cd "${REPO}" && uv run python viz_sim/build_perturb_summary_fig.py 2>&1 | tail -10
 echo "[perturb-orch] DONE"
