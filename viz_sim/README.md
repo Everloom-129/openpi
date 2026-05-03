@@ -177,32 +177,106 @@ mirrors `gr00t/policy/server_client.py:PolicyClient` (REQ/REP socket,
 numpy via `np.save`/`np.load`).
 
 ```bash
-# Terminal 1 — server (Isaac-GR00T uv venv). Defaults to nvidia/GR00T-N1.7-DROID.
-bash viz_sim/run_gr00t_server.sh
+# Terminal 1 — server (Isaac-GR00T uv venv). Defaults to nvidia/GR00T-N1.7-DROID
+# with TAG=OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT.
+CUDA_VISIBLE_DEVICES=0 bash viz_sim/run_gr00t_server.sh
 
 # Terminal 2 — sim (robocasa_sim conda)
 conda activate robocasa_sim
-python viz_sim/run_policy_sim_gr00t.py --task Lift --prompt "pick up the red cube"
+
+# Panda + DROID-style task (model's training distribution)
+python viz_sim/run_policy_sim_gr00t.py --robot Panda \
+    --task Lift --prompt "pick up the red cube"
+
+# PandaOmron + robocasa mobile-manipulator task (base/torso pinned)
+python viz_sim/run_policy_sim_gr00t.py --robot PandaOmron \
+    --task PnPCounterToCab --prompt "pick up the can and place it in the cabinet"
 ```
 
-Notes:
+### Action space — the "RELATIVE" gotcha
 
-- Robosuite controller is `JOINT_POSITION` with `input_max=output_max=3.14`,
-  `input_min=output_min=-3.14` for identity passthrough.
-- Images are resized to **180×320** with `resize_with_pad` (vs. 224×224 for
+> **Despite the embodiment tag name `OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT`,
+> `action/joint_position` is in ABSOLUTE joint angles (radians).** Verified
+> against the model's bundled `statistics.json`:
+> `action/joint_position/mean ≈ Panda home pose`, `min/max ≈ Panda joint
+> limits`. The "RELATIVE" prefix only describes the EEF representation. The
+> separate `relative_action/joint_position` key in the stats file (range
+> ~±0.35 rad) confirms what real deltas look like — the runtime
+> `joint_position` output is not in that space.
+
+Earlier versions of this script anchored deltas at chunk start
+(`current_qpos + Δ`) on the assumption that the README's "relative joint
+positions (7D)" wording matched the runtime tensor. It does not. The
+client now sends `target_qpos = action[:7]` directly.
+
+### Robosuite controller — `input_type` matters
+
+The `JointPositionController` defaults to **`input_type="delta"`** (see
+`third_party/robocasa/robosuite/.../parts/generic/joint_pos.py:107`),
+which interprets the action as a delta added to current qpos every tick.
+Sending GR00T's absolute targets in delta mode caused the runaway
+"position fed in as velocity" symptom (continuous arm rotation, no
+stable pose, joint-rate saturation).
+
+Our `_droid_arm_cfg()` now sets:
+
+```python
+{
+    "type": "JOINT_POSITION",
+    "input_type": "absolute",      # ← key fix
+    "impedance_mode": "fixed",     # required by absolute mode
+    "input_max": 3.14, "input_min": -3.14,
+    "output_max": 3.14, "output_min": -3.14,
+    "kp": 50, "damping_ratio": 1,
+    "gripper": {"type": "GRIP"},
+}
+```
+
+In absolute mode `set_goal()` does `self.goal_qpos = action` directly
+(`joint_pos.py:227-228`) — no `scale_action`, no current+Δ accumulation.
+The PD law `τ = Kp·(action − qpos) + Kd·(−qvel)` then servoes to the
+target.
+
+### Sim configurations
+
+| `--robot` | Robot | Controller | Drives | Notes |
+|---|---|---|---|---|
+| `Panda` | Panda (fixed) | `JOINT_POSITION` absolute (kp=50, ±π rad identity) | 7 arm joints + gripper | DROID training distribution |
+| `PandaOmron` | PandaOmron (mobile) | same on arm; default composite for torso/base | 7 arm joints + gripper only | torso/base/cmode pinned to 0/-1 (GR00T has no base head) |
+
+Action chunk:
+- `joint_position` (T, 7) — **absolute joint targets in radians**, sent
+  directly to the JOINT_POSITION controller.
+- `gripper_position` (T, 1) — absolute in [0, 1], 1=closed; binarized at
+  0.5 → GRIP `±1`.
+- `eef_9d` — ignored at runtime (we drive the arm via joints). State-side
+  use applies the DROID rotation correction
+  (`R @ DROID_EEF_ROTATION_CORRECT`, top 2 rows = 6D rep).
+
+### Other notes
+
+- **`control_freq=15`** matches `DROID_CONTROL_FREQUENCY` in upstream
+  `examples/DROID/main_gr00t.py`. Earlier 20 Hz over-consumed each chunk
+  by 33%.
+- Images resized to **180×320** with `resize_with_pad` (not 224×224 like
   pi0.5). Obs is nested:
   `{video.{exterior_image_1_left, wrist_image_left}, state.{eef_9d, gripper_position, joint_position}, language.annotation.language.language_instruction}`.
+- Camera key falls back: `robot0_agentview_left → agentview` if the task
+  doesn't register the robot-mounted camera.
 - The script queries `policy.get_modality_config()` at startup and adapts
-  `video.delta_indices` (N1.7-DROID actually uses `[0]`, registry default
-  was `[-15, 0]`). Frame buffer is sized accordingly.
-- Action chunk: `joint_position` (T, 7) is **relative**, applied as
-  `target_qpos = current_qpos + Δ` anchored at chunk start. `gripper_position`
-  (T, 1) is absolute in [0, 1] and binarized to GRIP `±1`.
-- `eef_9d` uses the DROID rotation correction
-  (`R @ DROID_EEF_ROTATION_CORRECT`, then top 2 rows = 6D rep). World-frame
-  match to DROID is approximate.
-- No live attention overlay yet (the GR00T server doesn't expose it); the
-  attention plumbing is pi0.5-specific for now.
+  `video.delta_indices` (N1.7-DROID uses `[0]`, registry default was
+  `[-15, 0]`). Frame buffer is sized accordingly.
+- **Action diagnostic** mirrors the pi0.5 path: every run records
+  `model_action` per step and saves `.npz + .png` to `--diag_dir` on any
+  exit path. Use `--no_diag` to skip.
+- **OOD caveat (same as `pi05_robocasa365`)**: GR00T-DROID was trained
+  on real DROID Panda data. On native robosuite tasks the cameras and
+  scene are out of distribution; on robocasa tasks without
+  `gym.make("robocasa/...")` the training-distribution camera
+  `robot0_agentview_left` may not register. Expect plausible arm motion,
+  low task-success baseline.
+- **No live attention overlay yet** — the GR00T server doesn't expose
+  attention; the canvas shows a "no attn (gr00t)" placeholder.
 
 ## Files
 

@@ -284,12 +284,158 @@ def _placeholder(text: str = "no attn (gr00t)", size: int = TILE_SIZE) -> np.nda
     return tile
 
 
+# ---------- attention overlay helpers ----------
+
+def _agg_heads(layer_attn: np.ndarray, mode: str) -> np.ndarray:
+    """layer_attn: (H, seq, seq) → (seq, seq) reduced over heads."""
+    if mode == "max":
+        return layer_attn.max(axis=0)
+    if mode == "min":
+        return layer_attn.min(axis=0)
+    return layer_attn.mean(axis=0)
+
+
+def _attn_overlay_for_image(img_uint8: np.ndarray, attn_1d: np.ndarray,
+                            grid_hw: tuple[int, int] | None,
+                            *, alpha: float = 0.45,
+                            size: int = TILE_SIZE) -> np.ndarray:
+    """attn_1d: (n_tokens,) per-image-token attention.
+
+    grid_hw: (H_patches, W_patches) if known (from image_grid_thw); else None
+    and we fall back to ⌈√n⌉×⌈n/⌈√n⌉⌉ which matches square images.
+    """
+    n = int(attn_1d.shape[0])
+    if grid_hw is not None and grid_hw[0] * grid_hw[1] == n:
+        h_p, w_p = grid_hw
+    else:
+        side = int(np.ceil(np.sqrt(max(n, 1))))
+        h_p, w_p = side, int(np.ceil(n / side))
+    grid = np.full((h_p * w_p,), float(attn_1d.min()), dtype=np.float32)
+    grid[:n] = attn_1d.astype(np.float32)
+    grid = grid.reshape(h_p, w_p)
+    up = cv2.resize(grid, (size, size), interpolation=cv2.INTER_LINEAR)
+    lo, hi = float(up.min()), float(up.max())
+    norm = (up - lo) / (hi - lo + 1e-8)
+    color = cv2.applyColorMap((norm * 255).astype(np.uint8), cv2.COLORMAP_JET)
+    color = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
+    base = img_uint8 if img_uint8.shape[:2] == (size, size) else cv2.resize(
+        img_uint8, (size, size), interpolation=cv2.INTER_AREA)
+    return cv2.addWeighted(base, 1 - alpha, color, alpha, 0)
+
+
+def parse_attn_payload(info: dict | None) -> dict:
+    """Pull info["attn"] into normalized shape: int layer keys + ndarrays.
+
+    Returns {"vlm": {layer_idx: (H, seq, seq)}, "image_mask": (seq,) bool,
+              "text_mask": (seq,) bool, "image_grid_thw": ndarray|None}
+    Empty dict when payload is missing or malformed.
+    """
+    if not isinstance(info, dict):
+        return {}
+    attn = info.get("attn") or {}
+    vlm_raw = attn.get("vlm") or {}
+    if not vlm_raw:
+        return {}
+    vlm: dict[int, np.ndarray] = {}
+    for k, v in vlm_raw.items():
+        try:
+            arr = np.asarray(v, dtype=np.float32)
+        except Exception:
+            continue
+        if arr.ndim == 4:    # (B, H, seq, seq) → (H, seq, seq)
+            arr = arr[0]
+        vlm[int(k)] = arr
+    if not vlm:
+        return {}
+
+    meta = attn.get("vlm_meta") or {}
+    image_mask = np.asarray(meta.get("image_mask"), dtype=bool) if "image_mask" in meta else None
+    text_mask = None
+    if image_mask is not None and image_mask.ndim == 2:
+        image_mask = image_mask[0]
+    if "attention_mask" in meta:
+        am = np.asarray(meta["attention_mask"], dtype=bool)
+        if am.ndim == 2:
+            am = am[0]
+        text_mask = am & ~image_mask if image_mask is not None else am
+
+    grid_thw = meta.get("image_grid_thw")
+    if grid_thw is not None:
+        grid_thw = np.asarray(grid_thw)
+        if grid_thw.ndim == 1:
+            grid_thw = grid_thw.reshape(1, -1)
+
+    return {
+        "vlm":            vlm,
+        "image_mask":     image_mask,
+        "text_mask":      text_mask,
+        "image_grid_thw": grid_thw,
+    }
+
+
+def render_attn_tiles(parsed: dict, ext_img: np.ndarray, wrist_img: np.ndarray,
+                      layer_idx: int, head_mode: str) -> tuple[np.ndarray, np.ndarray]:
+    """From a parsed attn payload → ext_attn tile + wrist_attn tile."""
+    if not parsed:
+        return _placeholder("no attn (gr00t)"), _placeholder("no attn (gr00t)")
+    vlm = parsed["vlm"]
+    if not vlm:
+        return _placeholder("no attn (gr00t)"), _placeholder("no attn (gr00t)")
+
+    image_mask = parsed.get("image_mask")
+    text_mask = parsed.get("text_mask")
+    if image_mask is None or text_mask is None:
+        return _placeholder("missing mask"), _placeholder("missing mask")
+
+    layer_keys = sorted(vlm.keys())
+    layer_idx = max(0, min(layer_idx, len(layer_keys) - 1))
+    layer_attn = vlm[layer_keys[layer_idx]]                # (H, seq, seq)
+    attn_2d = _agg_heads(layer_attn, head_mode)            # (seq, seq)
+
+    img_idx = np.where(image_mask)[0]
+    txt_idx = np.where(text_mask)[0]
+    if img_idx.size == 0 or txt_idx.size == 0:
+        return _placeholder("empty t/i"), _placeholder("empty t/i")
+
+    # text rows × image cols → mean over text rows = (n_image,)
+    per_img = attn_2d[np.ix_(txt_idx, img_idx)].mean(axis=0)
+    n_image = per_img.shape[0]
+
+    # Split per-image attention into ext + wrist using image_grid_thw if
+    # available; otherwise assume 50/50 in the order we sent (ext first).
+    grid_thw = parsed.get("image_grid_thw")
+    if grid_thw is not None and grid_thw.shape[0] >= 2:
+        # Each row: (T, H, W). Token count per image: T * H * W (post-merge).
+        counts = (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]).astype(int)
+        if counts.sum() == n_image:
+            ext_count = int(counts[0])
+            ext_attn = per_img[:ext_count]
+            wrist_attn = per_img[ext_count : ext_count + int(counts[1])]
+            ext_grid = (int(grid_thw[0, 1]), int(grid_thw[0, 2]))
+            wrist_grid = (int(grid_thw[1, 1]), int(grid_thw[1, 2]))
+        else:
+            ext_attn, wrist_attn = per_img[: n_image // 2], per_img[n_image // 2:]
+            ext_grid = wrist_grid = None
+    else:
+        ext_attn, wrist_attn = per_img[: n_image // 2], per_img[n_image // 2:]
+        ext_grid = wrist_grid = None
+
+    ext_tile = _attn_overlay_for_image(ext_img, ext_attn, ext_grid)
+    wrist_tile = _attn_overlay_for_image(wrist_img, wrist_attn, wrist_grid)
+    return ext_tile, wrist_tile
+
+
 def compose_canvas(sim: np.ndarray, ext: np.ndarray, wrist: np.ndarray,
+                   ext_attn: np.ndarray | None = None,
+                   wrist_attn: np.ndarray | None = None,
                    prompt: str = "") -> np.ndarray:
     sim = _label(sim, "sim (frontview)")
-    pending = _placeholder()
-    right_top = np.hstack([_label(_to_tile(ext), "ext"), _label(pending, "—")])
-    right_bot = np.hstack([_label(_to_tile(wrist), "wrist"), _label(pending, "—")])
+    ext_attn_tile = ext_attn if ext_attn is not None else _placeholder()
+    wrist_attn_tile = wrist_attn if wrist_attn is not None else _placeholder()
+    right_top = np.hstack([_label(_to_tile(ext), "ext"),
+                           _label(_to_tile(ext_attn_tile), "ext attn")])
+    right_bot = np.hstack([_label(_to_tile(wrist), "wrist"),
+                           _label(_to_tile(wrist_attn_tile), "wrist attn")])
     right = np.vstack([right_top, right_bot])
     grid = np.hstack([sim, right])
     return np.vstack([grid, _prompt_strip(grid.shape[1], prompt)])
@@ -372,12 +518,22 @@ def main():
     WINDOW = "openpi sim (gr00t)"
     cv2.namedWindow(WINDOW, cv2.WINDOW_AUTOSIZE)
 
+    # Live attention controls (mirrors run_pi0_policy_sim.py).
+    head_modes = ["mean", "max", "min"]
+    state = {"layer": 0, "head_mode": 0, "n_layers": 1}
+    cv2.createTrackbar("layer", WINDOW, 0, max(1, state["n_layers"] - 1),
+                       lambda v: state.update(layer=v))
+    cv2.createTrackbar("head: 0=mean 1=max 2=min", WINDOW, 0, len(head_modes) - 1,
+                       lambda v: state.update(head_mode=v))
+
+    last_attn_payload: dict = {}  # parse_attn_payload result
+
     for step in pbar:
         frame_buf.append(_resize_pair(obs))
 
         if chunk is None or step % args.horizon == 0:
             request_obs = make_gr00t_obs(frame_buf, video_deltas, obs, args.prompt)
-            action_dict, _info = policy.get_action(request_obs)
+            action_dict, info = policy.get_action(request_obs)
             jp_rel = np.asarray(action_dict["joint_position"], dtype=np.float32)  # (T,7) Δ
             grip = np.asarray(action_dict["gripper_position"], dtype=np.float32)  # (T,1) abs
             if jp_rel.ndim == 3:
@@ -385,6 +541,17 @@ def main():
                 grip = grip[0]
             chunk = np.concatenate([jp_rel, grip], axis=1)  # (T, 8)
             n_infer += 1
+
+            # Refresh attention payload + retune layer trackbar to actual L.
+            last_attn_payload = parse_attn_payload(info)
+            if last_attn_payload.get("vlm"):
+                L = len(last_attn_payload["vlm"])
+                if L != state["n_layers"]:
+                    state["n_layers"] = L
+                    try:
+                        cv2.setTrackbarMax("layer", WINDOW, max(0, L - 1))
+                    except cv2.error:
+                        pass
 
         model_action = chunk[step % args.horizon].astype(np.float32, copy=True)
         recorded_actions.append(model_action.copy())
@@ -437,7 +604,26 @@ def main():
         ext = _normalize_robosuite_image(obs[_ext_image_key(obs)])
         wrist = _normalize_robosuite_image(obs["robot0_eye_in_hand_image"])
 
-        canvas = compose_canvas(sim_view, ext, wrist, prompt=args.prompt)
+        # Live attention: re-render every step using the most recent payload
+        # (refreshed every chunk = `args.horizon` sim steps). Trackbar state
+        # for layer/head_mode is read each frame so scrubbing is real-time.
+        if last_attn_payload.get("vlm"):
+            ext_attn_tile, wrist_attn_tile = render_attn_tiles(
+                last_attn_payload, ext, wrist,
+                layer_idx=state["layer"],
+                head_mode=head_modes[state["head_mode"]],
+            )
+        else:
+            ext_attn_tile = wrist_attn_tile = None
+
+        prompt_with_state = (
+            f"{args.prompt}   [layer {state['layer']}/{state['n_layers']-1}, "
+            f"head={head_modes[state['head_mode']]}]"
+        )
+        canvas = compose_canvas(sim_view, ext, wrist,
+                                ext_attn=ext_attn_tile,
+                                wrist_attn=wrist_attn_tile,
+                                prompt=prompt_with_state)
         cv2.imshow(WINDOW, cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break

@@ -30,6 +30,7 @@ MODEL="${MODEL:-nvidia/GR00T-N1.7-DROID}"
 TAG="${TAG:-OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT}"
 PORT="${PORT:-5555}"
 HOST="${HOST:-0.0.0.0}"
+ATTN="${ATTN:-1}"
 
 if [ ! -d "${GR00T_DIR}" ]; then
     echo "Isaac-GR00T checkout not found at ${GR00T_DIR}" >&2
@@ -40,11 +41,23 @@ fi
 echo "[gr00t-server] MODEL=${MODEL}"
 echo "[gr00t-server] TAG=${TAG}"
 echo "[gr00t-server] HOST=${HOST}  PORT=${PORT}"
+echo "[gr00t-server] ATTN=${ATTN}  (1 = attention-capture wrapper, 0 = upstream server)"
 echo "[gr00t-server] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset, all GPUs>}"
 
 cd "${GR00T_DIR}"
-exec uv run python gr00t/eval/run_gr00t_server.py \
-    --host "${HOST}" \
-    --port "${PORT}" \
-    --embodiment-tag "${TAG}" \
-    --model-path "${MODEL}"
+if [ "${ATTN}" = "1" ]; then
+    # Attention-capture variant: monkey-patches Qwen3Backbone.forward to
+    # populate viz/gr00t_attn.py buffers, attaches them to the get_action
+    # response info dict.
+    exec uv run python "${REPO_ROOT}/viz_sim/serve_gr00t_attn.py" \
+        --host "${HOST}" \
+        --port "${PORT}" \
+        --embodiment-tag "${TAG}" \
+        --model-path "${MODEL}"
+else
+    exec uv run python gr00t/eval/run_gr00t_server.py \
+        --host "${HOST}" \
+        --port "${PORT}" \
+        --embodiment-tag "${TAG}" \
+        --model-path "${MODEL}"
+fi
