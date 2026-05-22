@@ -24,12 +24,20 @@ ENV UV_PROJECT_ENVIRONMENT=/.venv
 
 # Install the project's dependencies using the lockfile and settings
 RUN uv venv --python 3.11.9 $UV_PROJECT_ENVIRONMENT
+# sam-2 is a viz-tooling dep that doesn't compile inside this CUDA-runtime image
+# (no nvcc) and isn't used by serve_policy.py. Strip it from pyproject.toml +
+# uv.lock for the in-container sync, then run unfrozen so deps re-resolve.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=bind,source=uv.lock,target=uv.lock \
-    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    --mount=type=bind,source=uv.lock,target=/tmp/uv.lock.src,rw=false \
+    --mount=type=bind,source=pyproject.toml,target=/tmp/pyproject.src.toml,rw=false \
     --mount=type=bind,source=packages/openpi-client/pyproject.toml,target=packages/openpi-client/pyproject.toml \
     --mount=type=bind,source=packages/openpi-client/src,target=packages/openpi-client/src \
-    GIT_LFS_SKIP_SMUDGE=1 uv sync --frozen --no-install-project --no-dev
+    cp /tmp/pyproject.src.toml /app/pyproject.toml && \
+    cp /tmp/uv.lock.src /app/uv.lock && \
+    sed -i '/^[[:space:]]*"sam-2",/d' /app/pyproject.toml && \
+    sed -i '/^sam-2 = { path = "third_party\/sam2" }/d' /app/pyproject.toml && \
+    GIT_LFS_SKIP_SMUDGE=1 uv sync --no-install-project --no-dev && \
+    rm -f /app/pyproject.toml /app/uv.lock
 
 # Copy transformers_replace files while preserving directory structure
 COPY src/openpi/models_pytorch/transformers_replace/ /tmp/transformers_replace/

@@ -432,6 +432,107 @@ class PI0Pytorch(nn.Module):
 
         return x_t
 
+    @torch.no_grad()
+    def sample_actions_cpg(
+        self,
+        device,
+        observation_pos,
+        observation_neg,
+        *,
+        cpg_w: float,
+        noise=None,
+        num_steps: int = 10,
+    ) -> Tensor:
+        """Contrastive Prompt Guidance sampling (DeLock, https://suninghuang19.github.io/delock_page/).
+
+        Forwards the same post-trained policy with both a positive (novel) prompt
+        ``observation_pos`` and a negative (trained) prompt ``observation_neg``.
+        At each Euler step:
+            v_cpg = v_neg + w * (v_pos - v_neg)
+            x_{t+dt} = x_t + dt * v_cpg
+
+        ``w == 1.0`` recovers vanilla positive-prompt sampling; ``w == 0.0``
+        reverts to the trained-prompt-only behaviour. Paper uses ``w > 1``
+        (extrapolation along the contrastive direction).
+
+        The two observations must share the same images, masks, and state
+        — only the tokenized prompt may differ. We assert this so that a
+        misconstructed pair fails loud rather than silently behaving like
+        an unguided forward.
+        """
+        bsize = observation_pos.state.shape[0]
+        if noise is None:
+            actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
+            noise = self.sample_noise(actions_shape, device)
+
+        images_p, img_masks_p, lang_tokens_p, lang_masks_p, state_p = self._preprocess_observation(
+            observation_pos, train=False
+        )
+        images_n, img_masks_n, lang_tokens_n, lang_masks_n, state_n = self._preprocess_observation(
+            observation_neg, train=False
+        )
+
+        # Guard A6: only the prompt may differ between the two forwards.
+        for ip, in_ in zip(images_p, images_n, strict=True):
+            assert torch.equal(ip, in_), "CPG: images must match between positive and negative observations"
+        for mp, mn in zip(img_masks_p, img_masks_n, strict=True):
+            assert torch.equal(mp, mn), "CPG: image masks must match"
+        assert torch.equal(state_p, state_n), "CPG: state must match between observations"
+
+        prefix_embs_p, prefix_pad_masks_p, prefix_att_masks_p = self.embed_prefix(
+            images_p, img_masks_p, lang_tokens_p, lang_masks_p
+        )
+        prefix_embs_n, prefix_pad_masks_n, prefix_att_masks_n = self.embed_prefix(
+            images_n, img_masks_n, lang_tokens_n, lang_masks_n
+        )
+
+        prefix_att_2d_masks_p = make_att_2d_masks(prefix_pad_masks_p, prefix_att_masks_p)
+        prefix_att_2d_masks_n = make_att_2d_masks(prefix_pad_masks_n, prefix_att_masks_n)
+        prefix_position_ids_p = torch.cumsum(prefix_pad_masks_p, dim=1) - 1
+        prefix_position_ids_n = torch.cumsum(prefix_pad_masks_n, dim=1) - 1
+
+        prefix_att_2d_masks_4d_p = self._prepare_attention_masks_4d(prefix_att_2d_masks_p)
+        prefix_att_2d_masks_4d_n = self._prepare_attention_masks_4d(prefix_att_2d_masks_n)
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+
+        _, past_kv_pos = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d_p,
+            position_ids=prefix_position_ids_p,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs_p, None],
+            use_cache=True,
+        )
+        _, past_kv_neg = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d_n,
+            position_ids=prefix_position_ids_n,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs_n, None],
+            use_cache=True,
+        )
+
+        dt = -1.0 / num_steps
+        dt = torch.tensor(dt, dtype=torch.float32, device=device)
+
+        # State is shared, but pick the positive view for downstream calls.
+        state = state_p
+
+        x_t = noise
+        time = torch.tensor(1.0, dtype=torch.float32, device=device)
+        while time >= -dt / 2:
+            expanded_time = time.expand(bsize)
+            v_pos = self.denoise_step(state, prefix_pad_masks_p, past_kv_pos, x_t, expanded_time)
+            v_neg = self.denoise_step(state, prefix_pad_masks_n, past_kv_neg, x_t, expanded_time)
+
+            v_cpg = v_neg + cpg_w * (v_pos - v_neg)
+
+            x_t = x_t + dt * v_cpg
+            time += dt
+
+            import openpi.models_pytorch.gemma_pytorch as _gpt
+            _gpt.append_action_traj(x_t[0].detach().cpu().numpy())
+
+        return x_t
+
     def denoise_step(
         self,
         state,

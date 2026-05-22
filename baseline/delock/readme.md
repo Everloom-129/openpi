@@ -435,12 +435,22 @@ docker compose -f examples/libero/compose.yml up --no-deps runtime --abort-on-co
 | Method | Suite total | Per-task (1..10) | Notes |
 |---|---|---|---|
 | `pi05_libero` (public ckpt, 30k bs=256) | **97.6 %** (488/500) | 100, 100, 100, 98, 90, 98, 100, 94, 98, 98 | matches paper's 98.8 % within noise |
-| `pi05_libero_delock` (this run, 10k bs=16, **JAX-direct serve**) | partial | task 1 first 9 trials → 7/9 (77.8 %) | run was stopped early; eps ~31 s like vanilla, model is responding correctly |
+| `pi05_libero_delock` (10k bs=16, λ=1e-4, **JAX-direct serve**) | **66.2 %** (331/500) | full per-task in `eval_delock_libero_spatial_full.log` | finished 2026-05-04 |
+| `pi05_libero_delock_lambda0` (10k bs=16, λ=0, **JAX-direct**) | **62.6 %** (313/500) | 84, 46, 94, 62, 80, 12, 56, 78, 60, 54 | finished 2026-05-08; isolates LoRA vs LoRA+vis-reg |
 | `pi05_libero_delock` via **PyTorch-converted ckpt** | **0 %** (0/175 across 4 tasks before stop) | 0, 0, 0, 0 | LoRA was dropped at conversion — was effectively evaluating `pi05_base`. Don't do this. |
 
 The 0 % run is preserved here as a cautionary tale, not a result. Read the
 LoRA-converter limitation above before drawing any conclusion from a low
 DeLock number obtained through the PyTorch conversion path.
+
+**Reading the LoRA-budget numbers.** DeLock (66.2 %) − λ=0 (62.6 %) ≈ +3.6 pp
+of vis-reg over LoRA-only. At n=500 per condition the binomial SE of the
+difference is ~3 pp, so this is ~1 σ — suggestive that vis-reg helps but not
+statistically conclusive. Both LoRA configs are far below vanilla 97.6 %,
+but they also saw 48× fewer training samples (160 k vs 7.68 M). The
+mechanism vs budget question is unresolved until the budget-matched
+vanilla baseline (`pi05_libero_budget_matched`, full-FT bs=16 × 10 k) is
+trained.
 
 ### Caveats on the apples-to-oranges in this comparison
 
@@ -460,6 +470,130 @@ effective compute**. So:
   hand-subsetted to a single concept/spatial variant (paper §C.2). The
   current `physical-intelligence/libero` mixture exercises generalization
   across the whole benchmark, not the narrow probe the paper studies.
+
+## Attention-capture (JAX, post-2026-05-04)
+
+The paper's central diagnostic is the text→image cross-attention shift
+under post-training (Fig 4a). The existing `viz/` pipeline runs through the
+*PyTorch* path, which silently drops LoRA at the JAX→PyTorch conversion,
+so it cannot be used to analyze a LoRA-trained DeLock checkpoint.
+
+A standalone JAX-side capture pipeline lives in `baseline/delock/attn/`:
+
+```
+baseline/delock/attn/
+├── dump_libero_observations.py  CPU; runs inside the libero docker image
+├── jax_attn_capture.py          GPU; per-ckpt × per-obs HDF5
+├── render_attn_entropy.py       per-layer entropy plot (figure E)
+├── render_attn_diff.py          layer-N attention diff overlays (figure B)
+├── dashboard.py                 streamlit, interactive multi-ckpt comparison
+└── run_capture_batch.sh         driver
+```
+
+How it works without modifying `Pi0`/`Policy`: `src/openpi/models/gemma.py`
+gained a `return_attn` class attribute on `Attention`/`Block`/`Module`.
+With `return_attn=True`, `Module.__call__` returns
+`(outputs, kv_cache, attn_probs_per_layer)` instead of `(outputs, kv_cache)`.
+The two modes have **identical param trees** — a single checkpoint loads into
+either. `jax_attn_capture.py` builds a fresh `gemma.Module(return_attn=True)`
+linen module, extracts params from the bridged production llm via
+`nnx.split(model.PaliGemma.llm)`, and calls `module.apply({"params": ...})`
+directly. Verified bit-identical to the production forward.
+
+Output schema (one HDF5 per `(ckpt, obs)` pair, ~3 MB each, gzip-4):
+
+```
+/meta                attrs: prefix_len, n_text_tokens, instruction,
+                            task_id, ckpt_dir, config_name
+/images              uint8 (2, 224, 224, 3)  — exterior, wrist
+/attn/text_to_img    float32 (n_layers, n_kv_heads*group, n_text, 512)
+                       cols: ext (0:256) + wrist (256:512)
+/text_positions      int32 (n_text,)  — absolute positions in the prefix
+                       (text is left-padded; valid text lives at the tail
+                       of the [512:768] slot for pi05/libero)
+/prefix_mask         bool (T,)
+```
+
+### Recipe
+
+```bash
+# 1) Dump t=0 obs per task (CPU, inside libero docker)
+docker run --rm -v $PWD:/app \
+    --entrypoint /bin/bash libero -c \
+    "source /.venv/bin/activate && python baseline/delock/attn/dump_libero_observations.py \
+        --task-suite libero_spatial --out-dir baseline/delock/results/obs"
+
+# 2) Capture attention for each ckpt (GPU, ~1 min/obs on TITAN X 12GB)
+for cfg_ckpt in \
+    "pi05_libero|/home/edward/.cache/openpi/openpi-assets/checkpoints/pi05_libero|vanilla" \
+    "pi05_libero_delock|/home/edward/projects/openpi_vis/checkpoints/pi05_libero_delock/delock_run0/9999|delock" \
+    "pi05_libero_delock_lambda0|/home/edward/projects/openpi_vis/checkpoints/pi05_libero_delock_lambda0/lambda0_run0/9999|lambda0"; do
+    IFS='|' read -r CONFIG CKPT LABEL <<< "$cfg_ckpt"
+    CONFIG=$CONFIG CKPT=$CKPT LABEL=$LABEL GPU=0 bash baseline/delock/attn/run_capture_batch.sh
+done
+
+# 3) Static figures
+.venv/bin/python baseline/delock/attn/render_attn_entropy.py \
+    --attn-root baseline/delock/results/attn \
+    --out baseline/delock/results/figures/entropy_per_layer.png
+.venv/bin/python baseline/delock/attn/render_attn_diff.py \
+    --a-dir baseline/delock/results/attn/vanilla \
+    --b-dir baseline/delock/results/attn/delock \
+    --a-label vanilla --b-label delock \
+    --layer 17 \
+    --out baseline/delock/results/figures/diff_layer17.png
+
+# 4) Interactive dashboard
+.venv/bin/python -m streamlit run baseline/delock/attn/dashboard.py \
+    --server.port 8503 --server.headless true
+```
+
+### Layout gotcha — text token positions
+
+The pi05 PaligemmaTokenizer pads the text block to a fixed 256-token slot
+between the wrist image (ends at 512) and the action expert region. Padding
+is **left-side**, so when prefix_mask reports 20 valid text tokens they live
+at absolute positions `[768..787]` of the 968-long sequence, *not* at
+`[512..531]`. `jax_attn_capture.py` uses `np.where(prefix_mask[512:])` to find
+the valid rows; an earlier version that hard-coded
+`[TOTAL_IMAGE_TOKENS : TOTAL_IMAGE_TOKENS + n_text]` produced uniform
+`1/968` softmax rows because it was slicing into the zero-padded region.
+Worth remembering if you build any other slicer against this schema.
+
+### Preliminary findings (2026-05-06, vanilla vs DeLock, n=10 obs)
+
+`entropy_per_layer.png` (figure E):
+- Layers 0–11 are nearly identical between vanilla and DeLock — early/middle
+  attention is unaffected by 10 k bs=16 LoRA training.
+- Layers 13–17 diverge: DeLock entropy is consistently *higher* than
+  vanilla, peaking at layer 17 (DeLock 1.34 vs vanilla 0.94 nats). DeLock
+  has less concentrated late-layer attention, broadly consistent with the
+  paper's claim that vis-reg prevents lock-in onto a narrow set of patches.
+
+`diff_layer7.png` was rendered but layer 7 is one of the most-identical
+layers; the diff is noise-dominated. The interesting layer for visual
+comparison is **17** (largest entropy gap).
+
+The dashboard (`baseline/delock/attn/dashboard.py`) is the right tool for
+the next round — it lets you sweep layer/head/text-token interactively
+across all three captured checkpoints (vanilla / delock / lambda0).
+
+## Open questions / next steps
+
+- **Budget-matched vanilla.** `pi05_libero_budget_matched` is registered
+  but not trained. Until it is, we can't claim DeLock's mechanism is or
+  isn't the cause of the gap to public vanilla.
+- **λ sweep.** Only λ ∈ {0, 1e-4} tested. The paper doesn't publish a
+  numeric λ; sweeping λ ∈ {1e-5, 1e-3, 1e-2} would tell us whether the
+  observed +3.6 pp from λ=1e-4 is near-optimal or random.
+- **Narrow-subset training.** The current runs train on full LIBERO. The
+  paper's lock-in regime needs single-concept-variant subsets of ~100
+  demos per task — which is the regime where DeLock's mechanism is
+  expected to *help*. Without that, DeLock has nothing to "unlock" here.
+- **CPG eval.** `Policy.infer_cpg_jax` is implemented + unit-tested but
+  never exercised in a real LIBERO rollout. Needs paired
+  (trained-prompt, novel-prompt) tasks — none of the 10 libero_spatial
+  tasks have a natural counterfactual prompt.
 
 ## Reference
 

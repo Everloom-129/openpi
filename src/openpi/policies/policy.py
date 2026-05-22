@@ -110,6 +110,112 @@ class Policy(BasePolicy):
     def metadata(self) -> dict[str, Any]:
         return self._metadata
 
+    def infer_cpg_jax(
+        self,
+        obs_pos: dict,
+        obs_neg: dict,
+        *,
+        cpg_w: float,
+        noise: np.ndarray | None = None,
+    ) -> dict:
+        """DeLock contrastive prompt guidance inference (JAX path).
+
+        Mirrors infer() but runs the input transform on both prompts (which
+        share images / state and only differ in the tokenized prompt) and
+        routes to ``model.sample_actions_cpg``. Returns the same output dict
+        shape as infer().
+        """
+        if self._is_pytorch_model:
+            raise NotImplementedError("Use infer_cpg() for the PyTorch path.")
+        inputs_pos = jax.tree.map(lambda x: x, obs_pos)
+        inputs_neg = jax.tree.map(lambda x: x, obs_neg)
+        inputs_pos = self._input_transform(inputs_pos)
+        inputs_neg = self._input_transform(inputs_neg)
+        inputs_pos = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs_pos)
+        inputs_neg = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs_neg)
+
+        sample_kwargs: dict[str, Any] = dict(self._sample_kwargs)
+        if noise is not None:
+            n = jnp.asarray(noise)
+            if n.ndim == 2:
+                n = n[None, ...]
+            sample_kwargs["noise"] = n
+        sample_kwargs["cpg_w"] = float(cpg_w)
+
+        observation_pos = _model.Observation.from_dict(inputs_pos)
+        observation_neg = _model.Observation.from_dict(inputs_neg)
+
+        self._rng, sub_rng = jax.random.split(self._rng)
+        start_time = time.monotonic()
+        # Note: not module_jit'd; CPG is opt-in and the dual-prefix path is rare
+        # enough that re-tracing each call is acceptable. If you sweep many w,
+        # the inner while_loop dominates compile cost is amortized inside it.
+        actions = self._model.sample_actions_cpg(sub_rng, observation_pos, observation_neg, **sample_kwargs)
+        outputs = {"state": inputs_pos["state"], "actions": actions}
+        model_time = time.monotonic() - start_time
+        outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
+        outputs = self._output_transform(outputs)
+        outputs["policy_timing"] = {"infer_ms": model_time * 1000}
+        return outputs
+
+    def infer_cpg(
+        self,
+        obs_pos: dict,
+        obs_neg: dict,
+        *,
+        cpg_w: float,
+        noise: np.ndarray | None = None,
+    ) -> dict:
+        """DeLock contrastive prompt guidance inference. PyTorch-only.
+
+        ``obs_pos`` / ``obs_neg`` are two raw observations that share images +
+        state, differing only in the ``"prompt"`` field. Both are run through
+        the same input transform (which tokenizes the prompt), then handed to
+        ``model.sample_actions_cpg`` which dual-forwards the prefix and
+        combines the per-step vector fields with weight ``cpg_w``.
+
+        ``cpg_w == 1.0`` is identical to ``infer(obs_pos)``; ``cpg_w == 0.0``
+        recovers ``infer(obs_neg)``. Paper uses ``cpg_w > 1`` (extrapolation).
+        """
+        if not self._is_pytorch_model:
+            raise NotImplementedError("CPG path is implemented only for the PyTorch model.")
+
+        inputs_pos = jax.tree.map(lambda x: x, obs_pos)
+        inputs_neg = jax.tree.map(lambda x: x, obs_neg)
+        inputs_pos = self._input_transform(inputs_pos)
+        inputs_neg = self._input_transform(inputs_neg)
+        inputs_pos = jax.tree.map(
+            lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs_pos
+        )
+        inputs_neg = jax.tree.map(
+            lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs_neg
+        )
+
+        sample_kwargs = dict(self._sample_kwargs)
+        if noise is not None:
+            noise_t = torch.from_numpy(noise).to(self._pytorch_device)
+            if noise_t.ndim == 2:
+                noise_t = noise_t[None, ...]
+            sample_kwargs["noise"] = noise_t
+
+        observation_pos = _model.Observation.from_dict(inputs_pos)
+        observation_neg = _model.Observation.from_dict(inputs_neg)
+
+        start_time = time.monotonic()
+        actions = self._model.sample_actions_cpg(
+            self._pytorch_device,
+            observation_pos,
+            observation_neg,
+            cpg_w=cpg_w,
+            **sample_kwargs,
+        )
+        outputs = {"state": inputs_pos["state"], "actions": actions}
+        model_time = time.monotonic() - start_time
+        outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
+        outputs = self._output_transform(outputs)
+        outputs["policy_timing"] = {"infer_ms": model_time * 1000}
+        return outputs
+
 
 class PolicyRecorder(_base_policy.BasePolicy):
     """Records the policy's behavior to disk."""

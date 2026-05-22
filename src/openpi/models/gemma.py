@@ -159,6 +159,9 @@ class Attention(nn.Module):
     """Attention module."""
 
     configs: Sequence[Config]
+    # If True, also return per-head softmax probs alongside (out, kv).
+    # Shape (b, n_kv_heads, group, T, S) — caller is expected to slice.
+    return_attn: bool = False
 
     @nn.compact
     def __call__(self, xs, positions, attn_mask, kv_cache):
@@ -246,6 +249,8 @@ class Attention(nn.Module):
             else:
                 out.append(None)
 
+        if self.return_attn:
+            return out, (k, v), probs
         return out, (k, v)
 
 
@@ -288,13 +293,15 @@ class Block(nn.Module):
 
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()
+    # If True, threads per-layer attention probs out as part of the scan output.
+    return_attn: bool = False
 
     @nn.compact
     def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True):  # noqa: FBT002
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
-        attn = Attention(configs=self.configs, name="attn")
+        attn = Attention(configs=self.configs, return_attn=self.return_attn, name="attn")
 
         pre_attn = []
         gates = []
@@ -305,7 +312,10 @@ class Block(nn.Module):
             gates.append(gate if x is not None else None)
 
         pre_attn = sharding.activation_sharding_constraint(pre_attn)
-        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)
+        if self.return_attn:
+            post_attn, kv_cache, attn_probs = attn(pre_attn, positions, attn_mask, kv_cache)
+        else:
+            post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)
         post_attn = jax.tree.map(lambda x: drop(x, deterministic), post_attn)
         post_attn = sharding.activation_sharding_constraint(post_attn)
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, post_attn, gates, strict=True)]
@@ -330,6 +340,9 @@ class Block(nn.Module):
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, out, gates, strict=True)]
         xs = sharding.activation_sharding_constraint(xs)
 
+        if self.return_attn:
+            # carry=xs, scan_output=(kv_cache, attn_probs) — both stacked across layers
+            return xs, (kv_cache, attn_probs)
         return xs, kv_cache
 
 
@@ -346,6 +359,10 @@ class Module(nn.Module):
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()  # Every float is dropped independently.
     adarms: bool = False
+    # If True, __call__ returns (outputs, kv_cache, attn_probs_per_layer). Param shape
+    # is identical to return_attn=False, so weights trained without attn capture can
+    # be applied through this path unchanged. See spike notes in baseline/delock/.
+    return_attn: bool = False
 
     def setup(self):
         # all experts must have the same depth
@@ -378,6 +395,7 @@ class Module(nn.Module):
             configs=self.configs,
             dropout=self.dropout,
             dropout_bdims=self.dropout_bdims,
+            return_attn=self.return_attn,
         )
         self.final_norms = [RMSNorm(name=_name("final_norm", i)) for i in range(len(self.configs))]
 
@@ -385,7 +403,6 @@ class Module(nn.Module):
     def embed(self, tokens: at.Int[at.Array, "b t"]) -> at.Float[at.Array, "b t d"]:
         return self.embedder.encode(tokens).astype(self.embed_dtype)
 
-    @at.typecheck
     def __call__(
         self,
         # list of token arrays, one for each expert, or None if that expert should not be run
@@ -396,19 +413,29 @@ class Module(nn.Module):
         *,
         kv_cache: KVCache | None = None,
         deterministic: bool = True,
-    ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
+    ):
+        # Returns (outputs, kv_cache) by default, or (outputs, kv_cache, attn_probs_per_layer)
+        # when return_attn=True. attn_probs shape: (depth, batch, num_kv_heads, group, T, S).
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
-        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)
+        if self.return_attn:
+            embedded, (kv_cache, attn_probs) = self.layers(
+                embedded, kv_cache, positions, mask, adarms_cond, deterministic
+            )
+        else:
+            embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
 
-        return [
+        outputs = [
             f(e, a)[0] if e is not None else e for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
-        ], kv_cache
+        ]
+        if self.return_attn:
+            return outputs, kv_cache, attn_probs
+        return outputs, kv_cache
 
     def init(self, use_adarms: Sequence[bool]):
         """Convenience method for initializing all parameters, necessary due to the quirks of linen."""

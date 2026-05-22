@@ -314,6 +314,115 @@ Action chunk:
   ckpt columns (ext + wrist + attention overlay). Writes `results/video/{task}.webp`.
   Called automatically by `eval_runner.py`; can also be invoked standalone:
   `uv run python viz_sim/render_example_video.py [--task Lift]`.
+- `eval_robocasa365_gym.py` — headless eval that builds the env via
+  `gym.make("robocasa/<TASK>", split=..., camera_widths=224, camera_heights=224)`
+  (real kitchen scenes + `robot0_agentview_left` camera) and sends the
+  wrapper's 5-key dict action. Per-model obs/action adapters for
+  `pi05_robocasa365` / `pi05_libero` / `pi05_droid`. Output goes to
+  `/mnt/sda/edward/projects/robocasa_365_eval_gym/{model}/{task}/ep_NNN.npz`.
+- `robocasa365_gym_orch.sh` — orch for the above. 3 ckpts × 5 default
+  tasks × `EPISODES` episodes, brings the server up/down per ckpt so each
+  config's input transform loads correctly. Env vars: `EPISODES`,
+  `SEED_BASE`, `MAX_STEPS`, `SPLIT` (pretrain/target/test), `GPU`, `TASKS`,
+  `MODELS`.
+- `test_robocasa365_e2e.py` — single-episode smoke test for the
+  gym-wrapper path. Writes `attn_grid.png` + `rollout.webp` + `summary.json`
+  to `results/test_robocasa365_e2e/{task}/`. Use to verify the plumbing
+  before launching a full sweep.
+- `render_eval_gym.py` — reads npzs under `robocasa_365_eval_gym/` and
+  writes animated GIFs (default; `--format webp` for compact files) in
+  two modes: `successes/` (per-episode ext+wrist with attention overlay)
+  and `compare/` (3-model side-by-side per task).
+
+## Real-kitchen gym-wrapper eval (`eval_robocasa365_gym.py`)
+
+The original `eval_robocasa365.py` builds the env with raw
+`robosuite.make(task, robots="PandaOmron", ...)`, which is fine for native
+robosuite tasks (Lift / Stack / etc.) but **never registers the robocasa
+kitchen scenes or the `robot0_agentview_left` camera mount**. The
+gym-wrapper port closes that gap:
+
+- **Env**: `gym.make("robocasa/<TASK>", split="pretrain", seed=...,
+  camera_widths=224, camera_heights=224)` — registers all 396 robocasa
+  kitchen envs via `third_party/robocasa/robocasa/wrappers/gym_wrapper.py`
+  and exposes the training-distribution `robot0_agentview_left` camera.
+- **Obs**: `obs["video.robot0_agentview_left"]` (already RGB-flipped),
+  `obs["state.*"]` dict (eef-rel + base + gripper), and
+  `obs["annotation.human.task_description"]` (per-episode templated
+  language). DROID / LIBERO state vectors that need raw keys
+  (`robot0_joint_pos`, `robot0_eef_pos`) come from
+  `env.unwrapped._get_observations(force_update=False)`.
+- **Action**: send the wrapper's 5-key dict
+  (`action.{end_effector_position, end_effector_rotation, gripper_close,
+  base_motion, control_mode}`). The wrapper's `step()` rebuilds env_action
+  from the dict via `cc.part_controllers` ordering + appended
+  `right_gripper`, so the layout-B → env-slot remap from the raw path is
+  no longer needed.
+
+End-to-end smoke test (1 episode, attention diagram + animation):
+
+```bash
+bash viz_sim/run_pi0_policy_server.sh CONFIG=pi05_robocasa365 GPU=2 &
+# wait for "websockets.server:server listening"
+/home/edward/miniconda3/envs/robocasa_sim/bin/python \
+    viz_sim/test_robocasa365_e2e.py --task PickPlaceCounterToCabinet
+# → results/test_robocasa365_e2e/PickPlaceCounterToCabinet/{attn_grid.png,rollout.webp,summary.json}
+```
+
+Full sweep (3 ckpts × 5 tasks × N episodes, brings server up/down per
+ckpt so each config's input transform loads correctly):
+
+```bash
+bash viz_sim/robocasa365_gym_orch.sh                       # defaults: 20 eps, GPU=2, split=pretrain
+EPISODES=5 TASKS="CloseDrawer" bash viz_sim/robocasa365_gym_orch.sh
+SPLIT=target bash viz_sim/robocasa365_gym_orch.sh          # held-out scenes/objects
+```
+
+Output: `/mnt/sda/edward/projects/robocasa_365_eval_gym/{model}/{task}/ep_NNN.npz`
+plus `_summary.json`. Each npz: `success`, `final_reward`, `max_reward`,
+`steps`, `prompt`, `eef_traj`, `gripper_traj`, `reward_traj`,
+`action_taken (T, 12)`, `pred_chunks (n_chunks, 15, 12)`, `attn_steps`,
+`attn_stacks (k, 18, 8, 512)`, `frame_steps`, `ext_frames`, `wrist_frames`.
+
+### Sweep results (2026-05-10, split=pretrain, 20 eps/cell)
+
+3 models × 5 tasks × 20 episodes:
+
+| Model | PickPlaceCounterToStove | PickPlaceCounterToSink | OpenDrawer | CloseDrawer | TurnOnSinkFaucet |
+|---|---:|---:|---:|---:|---:|
+| **pi05_robocasa365** | 3/20 (`r̄_max` 0.15) | 9/20 (0.45) | 1/20 (0.05) | **18/20 (0.90)** | 1/20 (0.05) |
+| pi05_libero          | 0/20 (0.00) | 0/20 (0.00) | 0/20 (0.00) | 0/20 (0.00) | 0/20 (0.00) |
+| pi05_droid           | 0/20 (0.00) | 0/20 (0.00) | 0/20 (0.00) | 0/20 (0.00) | 0/20 (0.00) |
+
+Notes:
+- `pi05_robocasa365` is doing real work — CloseDrawer 90 %, Sink pick-and-place
+  45 %. Stove / OpenDrawer / Faucet are still hard (5–16 %).
+- `pi05_libero` / `pi05_droid` 0 % is expected: LIBERO's 7-D OSC_POSE+grip
+  has no robocasa base/torso/cmode head, and DROID's 7-D joint velocities
+  are routed into an OSC_POSE controller slot (incompatible). They're
+  recorded as a baseline / for the attention captures, not as a
+  realistic comparison.
+
+### Visualization (`render_eval_gym.py`)
+
+Reads the eval npzs and writes animated GIFs (phone-friendly default;
+`--format webp` for compact files):
+
+```bash
+.venv/bin/python viz_sim/render_eval_gym.py                   # both modes (default)
+.venv/bin/python viz_sim/render_eval_gym.py --mode successes  # per-success only
+.venv/bin/python viz_sim/render_eval_gym.py --mode compare    # 3-model per-task only
+.venv/bin/python viz_sim/render_eval_gym.py --task CloseDrawer
+```
+
+Outputs under `results/video_eval_gym/`:
+- `successes/{model}__{task}__epNNN.gif` — one row of ext + wrist with
+  layer-7 head-mean attention overlay (header: model / task / ep /
+  r_max / prompt).
+- `compare/{task}.gif` — 3 columns (one per ckpt) × 2 rows (ext / wrist)
+  with attention overlay; per-column header shows whether the chosen
+  episode succeeded. Picker prefers a successful episode per cell; falls
+  back to ep_000 when none exists.
 
 ## Eval data layout & post-eval auto-render
 
@@ -327,13 +436,13 @@ render as a blank panel, so the file is useful even mid-sweep.
 
 ## TODOs / known gaps
 
-- **robocasa365 OOD on native robosuite tasks.** The training distribution
-  is robocasa kitchen scenes + the PandaOmron-mounted `robot0_agentview_left`
-  camera, neither of which exists when we call `robosuite.make(env_name=...)`
-  directly. We fall back to `agentview` (world-fixed) and accept the OOD —
-  baseline success on Lift / PickPlaceSingle / Door / etc. is expected to
-  be near zero. Wiring `gym.make("robocasa/...")` is the proper fix
-  (tracked at [robocasa-benchmark/openpi#3](https://github.com/robocasa-benchmark/openpi/issues/3)).
+- ~~**robocasa365 OOD on native robosuite tasks.** Wiring
+  `gym.make("robocasa/...")` is the proper fix.~~ **Done** (2026-05-10).
+  See `eval_robocasa365_gym.py` + `robocasa365_gym_orch.sh` above — real
+  kitchen scenes + `robot0_agentview_left` camera now flow through.
+  Original `eval_robocasa365.py` (raw `robosuite.make`) is kept for native
+  robosuite-task baselines. Upstream issue:
+  [robocasa-benchmark/openpi#3](https://github.com/robocasa-benchmark/openpi/issues/3).
 - **Image rotation question.** Upstream `examples/robocasa/main.py` has a
   comment `IMPORTANT: rotate 180 degrees to match train preprocessing`
   but the code below it doesn't actually rotate. Unclear if rotation is

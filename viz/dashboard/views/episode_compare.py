@@ -163,12 +163,21 @@ def _render_selector(
 
     # Discover episodes across outcomes
     all_eps: list[tuple[str, str, str, dict]] = []  # (outcome, date, ep, info)
+    skipped: list[tuple[str, str]] = []  # (ep, error)
     with st.spinner(f"Loading episode previews for date `{date}`…"):
         for oc in outcomes:
             for ep in _rl.list_episodes(root, oc, date):
-                info = _episode_meta(root, oc, date, ep)
+                try:
+                    info = _episode_meta(root, oc, date, ep)
+                except Exception as e:
+                    skipped.append((ep, f"{type(e).__name__}: {e}"))
+                    continue
                 if info["frames"]:
                     all_eps.append((oc, date, ep, info))
+    if skipped:
+        with st.expander(f"⚠️ {len(skipped)} episode(s) failed to load preview", expanded=False):
+            for ep, err in skipped:
+                st.write(f"`{ep}`: {err}")
 
     if not all_eps:
         st.warning("No episodes found for this dataset/camera/date.")
@@ -298,19 +307,27 @@ def _aligned_indices(n_a: int, n_b: int, k: int) -> tuple[list[int], list[int]]:
 # ── Comparison renderer ───────────────────────────────────────────────────────
 
 def _render_comparison(
-    root: str,
-    a: tuple[str, str, str], b: tuple[str, str, str],
+    root_a: str,
+    a: tuple[str, str, str],
+    b: tuple[str, str, str],
+    root_b: str | None = None,
+    label_a: str | None = None,
+    label_b: str | None = None,
 ) -> None:
+    if root_b is None:
+        root_b = root_a
     oa, da, ep_a = a
     ob, db, ep_b = b
-    info_a = _episode_meta(root, oa, da, ep_a)
-    info_b = _episode_meta(root, ob, db, ep_b)
+    lbl_a = label_a or ep_a
+    lbl_b = label_b or ep_b
+    info_a = _episode_meta(root_a, oa, da, ep_a)
+    info_b = _episode_meta(root_b, ob, db, ep_b)
     frames_a, frames_b = info_a["frames"], info_b["frames"]
     if not frames_a or not frames_b:
         st.error("One of the selected episodes has no frames.")
         return
 
-    first_h5 = _rl.h5_path_results(root, oa, da, ep_a, frames_a[0])
+    first_h5 = _rl.h5_path_results(root_a, oa, da, ep_a, frames_a[0])
     all_layers = _loader.list_layers_in_h5(first_h5)
     if not all_layers:
         st.error("No attention data in episode A.")
@@ -357,7 +374,7 @@ def _render_comparison(
     if attn_type == "action":
         selected_tok_label = "action (mean over 8 steps)"
     else:
-        meta_a = _loader.load_meta(first_h5)
+        meta_a = _loader.load_meta(first_h5)  # uses root_a's first frame
         n_real = meta_a.get("n_real_tokens", len(meta_a.get("token_texts", [])))
         real_texts = meta_a.get("token_texts", [])[:n_real]
 
@@ -383,9 +400,9 @@ def _render_comparison(
     pack_b: dict[int, dict] = {}
     with st.spinner("Loading attention slices for both episodes…"):
         for layer in layers:
-            pack_a[layer] = _attn_per_frame(root, oa, da, ep_a, sample_a, layer, agg_fn,
+            pack_a[layer] = _attn_per_frame(root_a, oa, da, ep_a, sample_a, layer, agg_fn,
                                             tok_idx, camera, attn_type)
-            pack_b[layer] = _attn_per_frame(root, ob, db, ep_b, sample_b, layer, agg_fn,
+            pack_b[layer] = _attn_per_frame(root_b, ob, db, ep_b, sample_b, layer, agg_fn,
                                             tok_idx, camera, attn_type)
 
     # In action mode the t2i array is fake-length-1, so the renderer must
@@ -398,13 +415,13 @@ def _render_comparison(
         f'· *{attn_type_label}*'
     )
     g1, g2 = st.columns(2)
-    for col, oc, ep, sample, pack, info in (
-        (g1, oa, ep_a, sample_a, pack_a, info_a),
-        (g2, ob, ep_b, sample_b, pack_b, info_b),
+    for col, oc, ep, lbl, sample, pack, info in (
+        (g1, oa, ep_a, lbl_a, sample_a, pack_a, info_a),
+        (g2, ob, ep_b, lbl_b, sample_b, pack_b, info_b),
     ):
         with col:
             badge = "🟩 success" if oc == "success" else "🟥 failure"
-            st.markdown(f"**`{ep}`** · {badge} · {len(info['frames'])} frames total")
+            st.markdown(f"**`{lbl}`** · {badge} · {len(info['frames'])} frames total")
             st.caption(f"📝 {info['instruction']}")
             t2i_data = {(f, l): pack[l]["t2i"][(f, l)] for l in layers for f in sample}
             imgs = {f: pack[layers[0]]["imgs"][f] for f in sample}
@@ -433,9 +450,9 @@ def _render_comparison(
         subplot_titles=("Exterior half", "Wrist half"),
         horizontal_spacing=0.08,
     )
-    for ep, sample, pack, n_total, color in (
-        (ep_a, sample_a, pack_a, len(info_a["frames"]), "#4c9be8"),
-        (ep_b, sample_b, pack_b, len(info_b["frames"]), "#f0a500"),
+    for lbl, sample, pack, n_total, color in (
+        (lbl_a, sample_a, pack_a, len(info_a["frames"]), "#4c9be8"),
+        (lbl_b, sample_b, pack_b, len(info_b["frames"]), "#f0a500"),
     ):
         attn_d = pack[layer_for_stats]["attn"]
         ext_focus, wrist_focus, prog = [], [], []
@@ -448,10 +465,10 @@ def _render_comparison(
             prog.append(f / max(n_total - 1, 1))
         fig_focus.add_trace(go.Scatter(
             x=prog, y=ext_focus, mode="lines+markers",
-            name=f"{ep} ext", line=dict(color=color)), row=1, col=1)
+            name=f"{lbl} ext", line=dict(color=color)), row=1, col=1)
         fig_focus.add_trace(go.Scatter(
             x=prog, y=wrist_focus, mode="lines+markers",
-            name=f"{ep} wrist", line=dict(color=color, dash="dash")), row=1, col=2)
+            name=f"{lbl} wrist", line=dict(color=color, dash="dash")), row=1, col=2)
     fig_focus.update_layout(
         height=320, margin=dict(l=50, r=20, t=40, b=40),
         legend=dict(orientation="h", y=1.12),
@@ -463,9 +480,9 @@ def _render_comparison(
     # ── Head-aggregation sensitivity ──────────────────────────────────────
     st.markdown("#### Head-aggregation sensitivity")
     st.caption("Per layer: mean cosine distance between Mean- and Max-aggregated heads, averaged over sampled frames.")
-    sens: dict[str, list] = {ep_a: [], ep_b: []}
+    sens: dict[str, list] = {lbl_a: [], lbl_b: []}
     for layer in layers:
-        for ep, sample, pack in ((ep_a, sample_a, pack_a), (ep_b, sample_b, pack_b)):
+        for ep, sample, pack in ((lbl_a, sample_a, pack_a), (lbl_b, sample_b, pack_b)):
             ds = []
             for f in sample:
                 t2i_arr = pack[layer]["t2i"].get((f, layer))
@@ -483,10 +500,10 @@ def _render_comparison(
             sens[ep].append(float(np.mean(ds)) if ds else None)
 
     fig_sens = go.Figure()
-    fig_sens.add_trace(go.Scatter(x=layers, y=sens[ep_a], mode="lines+markers",
-                                  name=ep_a, line=dict(color="#4c9be8")))
-    fig_sens.add_trace(go.Scatter(x=layers, y=sens[ep_b], mode="lines+markers",
-                                  name=ep_b, line=dict(color="#f0a500")))
+    fig_sens.add_trace(go.Scatter(x=layers, y=sens[lbl_a], mode="lines+markers",
+                                  name=lbl_a, line=dict(color="#4c9be8")))
+    fig_sens.add_trace(go.Scatter(x=layers, y=sens[lbl_b], mode="lines+markers",
+                                  name=lbl_b, line=dict(color="#f0a500")))
     fig_sens.update_layout(
         height=280, margin=dict(l=50, r=20, t=20, b=40),
         xaxis_title="Layer", yaxis_title="1 − cos(Mean, Max)",
@@ -554,6 +571,20 @@ def render(root: str, date: str, outcomes: list[str]) -> None:
             st.markdown(f"### Comparing `{a[2]}` ({a[0]}) ↔ `{b[2]}` ({b[0]})")
         _render_comparison(root, a, b)
         return
+
+
+def render_checkpoint_compare(
+    root_a: str, root_b: str, label_a: str, label_b: str,
+    outcome: str, date: str, episode: str,
+) -> None:
+    """Compare the same episode across two checkpoints (separate roots)."""
+    st.markdown(
+        f"### Comparing `{episode}` — **{label_a}** ↔ **{label_b}**"
+    )
+    a = (outcome, date, episode)
+    _render_comparison(root_a, a, a, root_b=root_b,
+                       label_a=label_a, label_b=label_b)
+    return
 
     # ── Selection page ────────────────────────────────────────────────────
     selected = _render_selector(root, date, outcomes)

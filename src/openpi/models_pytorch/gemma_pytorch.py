@@ -159,6 +159,97 @@ def clear_action_traj_buffer() -> None:
     _ACTION_TRAJ_BUFFER = None
 
 
+# ── Image-token attention perturbation hook ──────────────────────────────────
+# After the prefix forward, identify the argmax/argmin image patch (per camera)
+# from layer L's text→image attention, then scale the prefix KV-cache *value*
+# at that position. The action expert (Case 2) attends to this modified cache.
+#
+# Image token layout in prefix sequence: [0:256]=ext, [256:512]=wrist.
+#
+# Modes:
+#   "zero_max"        — V[..., argmax_pos, :] *= 0     (remove top-attn patch)
+#   "strengthen_max"  — V[..., argmax_pos, :] *= 1.5   (amplify top-attn patch)
+#   "zero_min"        — V[..., argmin_pos, :] *= 0     (remove bottom-attn patch)
+#
+# Cameras: "ext" (0:256), "wrist" (256:512).
+
+_PERTURB_MODE: str | None = None
+_PERTURB_CAM: str | None = None
+_PERTURB_LAYER: int = 7
+_PERTURB_FACTOR_STRENGTHEN: float = 1.5
+_PERTURB_LAST_POS: int | None = None  # for diagnostics
+
+
+def set_perturbation(mode: str | None, camera: str | None, layer: int = 7) -> None:
+    global _PERTURB_MODE, _PERTURB_CAM, _PERTURB_LAYER
+    _PERTURB_MODE = mode
+    _PERTURB_CAM = camera
+    _PERTURB_LAYER = int(layer)
+
+
+def clear_perturbation() -> None:
+    global _PERTURB_MODE, _PERTURB_CAM
+    _PERTURB_MODE = None
+    _PERTURB_CAM = None
+
+
+def get_last_perturb_pos() -> int | None:
+    return _PERTURB_LAST_POS
+
+
+def _apply_prefix_perturbation(prefix_output) -> None:
+    """Modify prefix_output.past_key_values in-place at the configured layer.
+
+    Identifies argmax/argmin image position from layer-L text→image attention
+    (head-mean, text-row-mean), then scales V[..., pos, :] by the configured
+    factor. No-op if perturbation is unset or required fields are missing.
+    """
+    global _PERTURB_LAST_POS
+    if _PERTURB_MODE is None or _PERTURB_CAM is None:
+        return
+    if prefix_output.attentions is None:
+        return
+    if _PERTURB_LAYER < 0 or _PERTURB_LAYER >= len(prefix_output.attentions):
+        return
+
+    TEXT_START_IDX = 768
+    IMG_TOTAL = 512
+    layer_attn = prefix_output.attentions[_PERTURB_LAYER]  # (1, H, seq, seq)
+    seq = layer_attn.shape[-1]
+    if seq <= TEXT_START_IDX:
+        return
+    # text rows × image cols, head-mean → text-row-mean → (512,)
+    t2i = layer_attn[0, :, TEXT_START_IDX:seq, :IMG_TOTAL].mean(dim=0).mean(dim=0)
+    cam_off = 0 if _PERTURB_CAM == "ext" else 256
+    cam_attn = t2i[cam_off : cam_off + 256]
+    if _PERTURB_MODE == "zero_min":
+        pos = int(cam_attn.argmin().item()) + cam_off
+        factor = 0.0
+    elif _PERTURB_MODE == "zero_max":
+        pos = int(cam_attn.argmax().item()) + cam_off
+        factor = 0.0
+    elif _PERTURB_MODE == "strengthen_max":
+        pos = int(cam_attn.argmax().item()) + cam_off
+        factor = _PERTURB_FACTOR_STRENGTHEN
+    else:
+        return
+    _PERTURB_LAST_POS = pos
+
+    pkv = prefix_output.past_key_values
+    # Modern HF DynamicCache: .value_cache is list[Tensor] with shape
+    # (B, n_kv_heads, seq, head_dim). Older tuple-of-tuples (k, v) per layer.
+    try:
+        if hasattr(pkv, "value_cache"):
+            v = pkv.value_cache[_PERTURB_LAYER]
+            v[..., pos, :] *= factor
+        else:
+            # tuple of (k, v) tensors per layer
+            _, v = pkv[_PERTURB_LAYER]
+            v[..., pos, :] *= factor
+    except Exception as e:
+        print(f"[perturb] skipped: {e}")
+
+
 class PaliGemmaWithExpertModel(nn.Module):
     def __init__(
         self,
@@ -267,6 +358,11 @@ class PaliGemmaWithExpertModel(nn.Module):
                     for i, layer_attn in enumerate(prefix_output.attentions):
                         _ATTN_BUFFER[i] = layer_attn.detach().cpu().to(torch.float32).numpy()
             # ----------------------------------------
+
+            # --- Optional prefix-V perturbation at configured layer (eval only) ---
+            if not self.training:
+                _apply_prefix_perturbation(prefix_output)
+            # ---------------------------------------------------------------------
 
             prefix_past_key_values = prefix_output.past_key_values
             prefix_output = prefix_output.last_hidden_state

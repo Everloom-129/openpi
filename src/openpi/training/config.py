@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.robocasa_policy as robocasa_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -519,6 +520,14 @@ class TrainConfig:
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None
 
+    # DeLock visual-encoder weight-drift regularization. When > 0, training adds
+    # `lambda * sum_p (p - p_pre)^2` over the visual-encoder subtree (matched by
+    # `vis_reg_path_regex`). λ in the paper is unspecified — see baseline/delock/readme.md.
+    vis_reg_lambda: float = 0.0
+    # Path-regex (as in nnx_utils.PathRegex) selecting the visual-encoder params to
+    # regularize. Default matches the SigLIP image tower under PaliGemma in pi0/pi0.5.
+    vis_reg_path_regex: str = ".*PaliGemma/img/.*"
+
     # If the value is greater than 1, FSDP will be enabled and shard across number of specified devices; overall
     # device memory will be reduced but training could potentially be slower.
     # eg. if total device is 4 and fsdp devices is 2; then the model will shard to 2 devices and run
@@ -625,6 +634,25 @@ _CONFIGS = [
             data_transforms=lambda model: _transforms.Group(
                 inputs=[droid_policy.DroidInputs(model_type=ModelType.PI05)],
                 outputs=[droid_policy.DroidOutputs()],
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+    ),
+    TrainConfig(
+        # robocasa365 multitask checkpoint (pi0.5 arch, action_dim=32, action_horizon=15).
+        # State is the 16-D robocasa schema (base + base→eef + gripper); action[:8]
+        # is layout B [eef_pos, eef_rot_axisangle, gripper, base_x]. Norm stats live
+        # under `assets/droid/` in the converted ckpt (asset_id kept as "droid" so
+        # `_checkpoints.load_norm_stats` finds them without renaming files).
+        name="pi05_robocasa365",
+        model=pi0_config.Pi0Config(action_horizon=15, pi05=True),
+        data=SimpleDataConfig(
+            assets=AssetsConfig(asset_id="droid"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[robocasa_policy.RobocasaInputs(model_type=ModelType.PI05)],
+                outputs=[robocasa_policy.RobocasaOutputs()],
             ),
             base_config=DataConfig(
                 prompt_from_task=True,
@@ -751,6 +779,134 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+    ),
+    #
+    # DeLock LIBERO post-training (https://suninghuang19.github.io/delock_page/).
+    # Matches paper Appendix B: pi0.5-BASE + LoRA on Gemma_2b VLM (r=16) + Gemma_300m
+    # action expert (r=32), batch 32, 10k steps, AdamW peak LR 5e-5 with cosine warmup
+    # 1000, EMA disabled, action horizon 10. Visual encoder L2 weight-drift
+    # regularization (vis_reg_lambda) preserves SigLIP grounding.
+    #
+    # Use this config end-to-end on JAX. Pair with test-time CPG (Algorithm 2 in
+    # the paper) — see Pi0.sample_actions_cpg and Policy.infer_cpg_jax for the
+    # inference path.
+    #
+    # The paper builds 4 LIBERO-based lock-in probe tasks (Mug-on-Plate [C],
+    # Block-Stacking [C], Open-Microwave [S], Mug-on-Plate [S]) with ~100 demos
+    # each. The reference physical-intelligence/libero LeRobot dataset covers all
+    # LIBERO tasks; for a faithful replication you should subset to a single
+    # narrow concept/spatial variant per task. See baseline/delock/readme.md.
+    TrainConfig(
+        name="pi05_libero_delock",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,  # paper Appendix B
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,   # paper: 1k warmup
+            peak_lr=5e-5,         # paper: peak LR 5e-5
+            decay_steps=50_000,   # paper: decay over 50k (constant after warmup over 10k horizon)
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,           # paper: EMA disabled
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        # Freeze: PaliGemma backbone + action expert base (LoRA adapters trainable),
+        # vis encoder remains trainable but is regularized via vis_reg_lambda.
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        num_train_steps=10_000,   # paper: 10k optimization steps
+        # DeLock vis-encoder weight-drift regularization. λ is unspecified in
+        # the paper — 1e-4 is a defensible starting point; tune by inspecting
+        # `loss_reg_scaled` vs `loss_bc` in wandb (see baseline/delock/readme.md).
+        vis_reg_lambda=1e-4,
+    ),
+    #
+    # DeLock ablation: λ=0 (LoRA only, no vis-reg).
+    # Identical to the actual pi05_libero_delock run (bs=16, 10k steps, cosine 1k warmup)
+    # but vis_reg_lambda=0.0.  Isolates LoRA capacity from LoRA+vis-reg.
+    #
+    # Usage: see Step 1 in baseline/delock/readme.md ablation sequence.
+    # After training, eval the JAX ckpt directly (do NOT use the PyTorch converter —
+    # it silently drops LoRA adapters).
+    TrainConfig(
+        name="pi05_libero_delock_lambda0",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=16,  # bs=32 OOMs on 3090; matches the actual delock_run0 batch size
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=50_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        num_train_steps=10_000,
+        vis_reg_lambda=0.0,  # ablation: λ=0 (LoRA only, no vis-reg)
+    ),
+    #
+    # Budget-matched vanilla baseline: full-FT pi05_base on LIBERO at the same
+    # effective compute as the DeLock run (10k steps × bs=16 = 160k samples).
+    # EMA disabled to match the DeLock training exactly on every axis except
+    # (LoRA, vis-reg).  Used to answer: "is DeLock's gap vs vanilla purely
+    # from compute budget, or from the LoRA/vis-reg mechanism?"
+    #
+    # Note: bs=16 may OOM on the 3090 for full-FT (DeLock LoRA run peaked 23.81 GB).
+    # A 100-step probe must be run before the full 10k.  If it OOMs, reduce to
+    # bs=8 / num_train_steps=20_000 to keep effective samples constant.
+    TrainConfig(
+        name="pi05_libero_budget_matched",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=16,  # matches DeLock run; probe for OOM before full 10k
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=50_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,  # disabled to match DeLock training exactly
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10_000,
+        # No LoRA, no vis_reg_lambda — full-FT from pi05_base, vanilla SFT.
     ),
     #
     # Fine-tuning Aloha configs.
@@ -930,6 +1086,48 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets-preview/checkpoints/pi05_droid/params"),
         num_train_steps=20_000,
         batch_size=32,
+    ),
+    #
+    # DeLock (https://suninghuang19.github.io/delock_page/): low-data post-training
+    # of pi0.5-BASE on DROID with (1) LoRA on Gemma_2b VLM (r=16) + Gemma_300m action
+    # expert (r=32) attn+ffn, and (2) visual-encoder L2 weight-drift regularization
+    # toward the pre-trained SigLIP weights. Combined with test-time CPG
+    # (sample_actions_cpg in pi0_pytorch.py + serve_policy_attn.py routing) on the
+    # PyTorch inference path. Paper Appendix B: bs=32, 10k steps, AdamW, peak LR
+    # 5e-5 with cosine warmup 1000 / decay 50000, EMA disabled.
+    TrainConfig(
+        name="pi05_droid_delock",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=10,  # paper: action horizon 10
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotDROIDDataConfig(
+            repo_id="your_hf_username/my_droid_dataset",  # user must replace
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                asset_id="droid",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
+        # Freeze everything except (a) LoRA adapters in the LLM + action expert, and
+        # (b) the visual encoder (which is regularized via vis_reg_lambda but still
+        # trainable). This matches paper Appendix B.
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,  # paper disables EMA
+        num_train_steps=10_000,
+        batch_size=32,
+        # DeLock visual-encoder weight-drift regularization. λ is not published
+        # in the paper — 1e-4 is a defensible starting point and should be tuned
+        # per task. See baseline/delock/readme.md (open question O1).
+        vis_reg_lambda=1e-4,
     ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.

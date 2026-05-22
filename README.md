@@ -128,6 +128,62 @@ The current pipeline runs on **pre-recorded videos**. The next step is closed-lo
 - [ ] Compare attention patterns between offline (recorded demos) and online (closed-loop sim) rollouts on the same task
 - [ ] Resolve env conflict: robocasa requires `mujoco==3.3.1` + `numpy==2.2.5`, while openpi requires `numpy<2.0.0` (JAX constraint). Options: (a) run simulator in a subprocess with separate venv, communicating via policy server; (b) pin a mujoco/numpy combination that satisfies both; (c) drop JAX from the sim loop and use only the PyTorch policy path
 
+### Closed-Loop Sim (`viz_sim/`)
+
+Run a policy in closed loop inside a robosuite/robocasa MuJoCo sim. Two parallel
+setups live side-by-side, one per model family — they share the same canvas UI
+but use different action spaces and wire protocols.
+
+#### π₀ / π₀.₅ (openpi)
+
+```bash
+# Terminal 1 — openpi .venv
+bash viz_sim/run_pi0_policy_server.sh            # websocket on :8000
+# Defaults to CONFIG=pi05_robocasa365. Override per checkpoint, e.g.:
+#   CONFIG=pi05_droid   bash viz_sim/run_pi0_policy_server.sh
+#   CONFIG=pi05_libero  bash viz_sim/run_pi0_policy_server.sh
+#   CONFIG=pi0_droid    bash viz_sim/run_pi0_policy_server.sh
+
+# Terminal 2 — robocasa_sim conda env
+bash viz_sim/install_pi0_client_in_sim_env.sh    # one-time
+python viz_sim/run_pi0_policy_sim.py --config pi05_robocasa365 --task PickPlaceSingle
+```
+
+Per-config controller and action layout (see `viz_sim/README.md` for the
+full table):
+
+| `--config`           | Robot      | Controller                 | Model dims |
+|----------------------|------------|----------------------------|------------|
+| `pi05_droid` / `pi0_droid` | Panda      | JOINT_POSITION delta       | 8 `[Δjoint(7), grip(1)]` |
+| `pi05_libero`        | Panda      | OSC_POSE delta             | 7 `[Δeef(6), grip(1)]`   |
+| `pi05_robocasa365`   | PandaOmron | HYBRID_MOBILE_BASE composite | 12 layout B `[eef(6), grip, base_motion(4), cmode]` |
+
+The robocasa pipeline is wired end-to-end (registered `pi05_robocasa365`
+TrainConfig + `RobocasaInputs/Outputs` + sim-side slot remap for raw
+robosuite's `[arm 6, torso 1, base 3, right_gripper 1, cmode 1]` order).
+See `viz_sim/README.md` for the full schema and known OOD gaps tracked at
+[robocasa-benchmark/openpi#3](https://github.com/robocasa-benchmark/openpi/issues/3).
+
+#### NVIDIA GR00T-N1.7-DROID
+
+```bash
+# One-time: install GR00T server deps in its own uv venv
+cd third_party/Isaac-GR00T && uv sync --all-extras && cd -
+bash viz_sim/install_gr00t_client_in_sim_env.sh  # adds zmq/msgpack/scipy to robocasa_sim
+
+# Terminal 1 — Isaac-GR00T venv
+bash viz_sim/run_gr00t_server.sh                 # ZMQ REP on :5555
+# Override checkpoint with: MODEL=nvidia/GR00T-N1.7-3B bash viz_sim/run_gr00t_server.sh
+
+# Terminal 2 — robocasa_sim conda env
+python viz_sim/run_policy_sim_gr00t.py --task Lift --prompt "pick up the cube"
+```
+
+JOINT_POSITION controller; nested obs (`video`/`state`/`language`) at 180×320
+with a 16-frame history; relative joint deltas anchored at chunk start, gripper
+absolute and binarized. `viz_sim/gr00t_client.py` is a vendored ZMQ/msgpack
+client so the sim env doesn't need to import `gr00t`.
+
 ---
 
 ## Downloading Checkpoints for Visualization
@@ -143,6 +199,7 @@ Then use the scripts below to download the JAX checkpoint from GCS and convert i
 | Model | Script | PyTorch support |
 |-------|--------|-----------------|
 | π₀.₅-DROID | `bash scripts/get_pi05_droid_torch.sh` | yes |
+| π₀.₅-LIBERO | `bash scripts/get_pi05_libero_torch.sh` | yes |
 | π₀-DROID | `bash scripts/get_pi0_droid_torch.sh` | yes |
 | π₀-FAST-DROID | `bash scripts/get_pi0_fast_droid_torch.sh` | JAX only (no PyTorch impl for FAST) |
 | π₀-ALOHA-towel | `bash scripts/get_pi0_aloha_towel_torch.sh` | yes |

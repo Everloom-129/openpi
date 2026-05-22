@@ -24,6 +24,7 @@ for _p in [_PROJECT_ROOT, os.path.join(_PROJECT_ROOT, "src")]:
 from viz.dashboard import loader as _loader
 from viz.dashboard import loader_results as _rl
 from viz.dashboard.views import action_view, attn_matrix, cag_view, ckpt_compare, comparison, counterfactual, dataset_browser, denoising_view, episode_compare, grid_heatmap, image_heatmap, image_saliency, trajectory
+from viz.dashboard.views import gr00t_attn as gr00t_attn_view
 
 
 def _save_online_h5(slice_dict: dict, h5_path: str) -> None:
@@ -84,13 +85,93 @@ RESULTS_ROOT = os.environ.get(
     "RESULTS_ROOT",
     "/data3/tonyw/toy_cube_benchmark/pi05_vis/cube_gold",
 )
+# Layout: DATA_ATTN_ROOT/{ckpt}/{dataset}/{left,right}/{success,failure}/{date}/{episode}/...
+# Default DATA_ATTN_ROOT = grandparent of RESULTS_ROOT (i.e. strip ckpt+dataset).
+DATA_ATTN_ROOT = os.environ.get(
+    "DATA_ATTN_ROOT",
+    os.path.dirname(os.path.dirname(RESULTS_ROOT)),
+)
+_DEFAULT_CKPT = os.path.basename(os.path.dirname(RESULTS_ROOT))
+_DEFAULT_DATASET = os.path.basename(RESULTS_ROOT)
+
+
+def _list_checkpoints(data_root: str) -> list[str]:
+    if not os.path.isdir(data_root):
+        return []
+    return sorted(
+        d for d in os.listdir(data_root)
+        if os.path.isdir(os.path.join(data_root, d))
+    )
+
+
+def _select_side(side: str, default_ckpt: str, default_dataset: str) -> dict | None:
+    """Render a self-contained selector for one side (A or B) of a cross-comparison.
+
+    Returns dict with keys: ckpt, dataset, camera, outcome, date, episode, root.
+    Returns None if any level has no data.
+    """
+    _ckpts = _list_checkpoints(DATA_ATTN_ROOT)
+    if not _ckpts:
+        st.error(f"No checkpoints in `{DATA_ATTN_ROOT}`.")
+        return None
+    _idx = _ckpts.index(default_ckpt) if default_ckpt in _ckpts else 0
+    ckpt = st.selectbox(f"{side} · Checkpoint", _ckpts, index=_idx, key=f"x_{side}_ckpt")
+
+    _datasets = _list_datasets_for_ckpt(os.path.join(DATA_ATTN_ROOT, ckpt))
+    if not _datasets:
+        st.warning(f"{side}: no datasets under `{ckpt}`.")
+        return None
+    _di = _datasets.index(default_dataset) if default_dataset in _datasets else 0
+    dataset = st.selectbox(f"{side} · Dataset", _datasets, index=_di, key=f"x_{side}_ds")
+
+    base = os.path.join(DATA_ATTN_ROOT, ckpt, dataset)
+    _cams = [c for c in ("right", "left") if os.path.isdir(os.path.join(base, c))]
+    if not _cams:
+        st.warning(f"{side}: no camera data in `{base}`.")
+        return None
+    camera = st.radio(f"{side} · Camera", _cams, horizontal=True, key=f"x_{side}_cam")
+    root = os.path.join(base, camera)
+
+    _ocs = _rl.list_outcomes(root)
+    if not _ocs:
+        st.warning(f"{side}: no outcomes in `{root}`.")
+        return None
+    outcome = st.selectbox(f"{side} · Outcome", _ocs, key=f"x_{side}_oc")
+
+    _dates = _rl.list_dates(root, outcome)
+    if not _dates:
+        st.warning(f"{side}: no dates.")
+        return None
+    date = st.selectbox(f"{side} · Date", _dates, key=f"x_{side}_date")
+
+    _eps = _rl.list_episodes(root, outcome, date)
+    if not _eps:
+        st.warning(f"{side}: no episodes.")
+        return None
+    episode = st.selectbox(f"{side} · Episode", _eps, key=f"x_{side}_ep")
+
+    return {"ckpt": ckpt, "dataset": dataset, "camera": camera, "outcome": outcome,
+            "date": date, "episode": episode, "root": root}
+
+
+def _list_datasets_for_ckpt(ckpt_root: str) -> list[str]:
+    if not os.path.isdir(ckpt_root):
+        return []
+    out = []
+    for d in sorted(os.listdir(ckpt_root)):
+        dp = os.path.join(ckpt_root, d)
+        if os.path.isdir(dp) and any(
+            os.path.isdir(os.path.join(dp, c)) for c in ("left", "right")
+        ):
+            out.append(d)
+    return out
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("🧠 Pi0.5 Attention")
     st.markdown("---")
 
-    mode = st.radio("Mode", ["Offline (HDF5)", "Results (Benchmark)", "Compare Episodes", "Online (Inference)", "Online (Upload)", "Online (Dataset)", "Compare (Online)"], index=0)
+    mode = st.radio("Mode", ["Offline (HDF5)", "Results (Benchmark)", "Compare Episodes", "Compare Checkpoints", "Compare (Cross)", "Online (Inference)", "Online (GR00T)", "Online (Upload)", "Online (Dataset)", "Compare (Online)"], index=0)
 
     if mode == "Offline (HDF5)":
         checkpoints = _loader.list_checkpoints(ATTN_H5_ROOT)
@@ -118,19 +199,17 @@ with st.sidebar:
         st.caption(f"HDF5 root: `{ATTN_H5_ROOT}`")
 
     elif mode == "Results (Benchmark)":
-        # Dataset selector: scan sibling dirs of RESULTS_ROOT for those with left/ or right/
-        _res_parent = os.path.dirname(RESULTS_ROOT)
-        _default_ds = os.path.basename(RESULTS_ROOT)
-        _available_ds = []
-        if os.path.isdir(_res_parent):
-            for _d in sorted(os.listdir(_res_parent)):
-                _dp = os.path.join(_res_parent, _d)
-                if os.path.isdir(_dp) and any(
-                    os.path.isdir(os.path.join(_dp, c)) for c in ("left", "right")
-                ):
-                    _available_ds.append(_d)
-        _ds_idx = _available_ds.index(_default_ds) if _default_ds in _available_ds else 0
-        res_dataset = st.selectbox("Dataset", _available_ds or [_default_ds], index=_ds_idx, key="res_dataset")
+        # Checkpoint selector: scans DATA_ATTN_ROOT for ckpt subdirs.
+        _ckpts = _list_checkpoints(DATA_ATTN_ROOT)
+        _ckpt_idx = _ckpts.index(_DEFAULT_CKPT) if _DEFAULT_CKPT in _ckpts else 0
+        res_ckpt = st.selectbox("Checkpoint", _ckpts or [_DEFAULT_CKPT],
+                                index=_ckpt_idx, key="res_ckpt")
+        _res_parent = os.path.join(DATA_ATTN_ROOT, res_ckpt)
+
+        _available_ds = _list_datasets_for_ckpt(_res_parent)
+        _ds_idx = _available_ds.index(_DEFAULT_DATASET) if _DEFAULT_DATASET in _available_ds else 0
+        res_dataset = st.selectbox("Dataset", _available_ds or [_DEFAULT_DATASET],
+                                   index=_ds_idx, key="res_dataset")
         _effective_res_root = os.path.join(_res_parent, res_dataset)
 
         # Camera radio: only show cameras that actually exist for this dataset
@@ -228,6 +307,83 @@ with st.sidebar:
 
         st.markdown("---")
         st.caption(f"Camera: **{cmp_camera_ep}** · `{cmp_dataset}` · `{cmp_ep_date}`")
+
+    elif mode == "Compare Checkpoints":
+        _ckpts = _list_checkpoints(DATA_ATTN_ROOT)
+        if len(_ckpts) < 2:
+            st.error(f"Need at least 2 checkpoints in `{DATA_ATTN_ROOT}`; found {len(_ckpts)}.")
+            st.stop()
+        _idx_a = _ckpts.index(_DEFAULT_CKPT) if _DEFAULT_CKPT in _ckpts else 0
+        cc_ckpt_a = st.selectbox("Checkpoint A", _ckpts, index=_idx_a, key="cc_ckpt_a")
+        _idx_b = next((i for i, c in enumerate(_ckpts) if c != cc_ckpt_a), 0)
+        cc_ckpt_b = st.selectbox("Checkpoint B",
+                                 [c for c in _ckpts if c != cc_ckpt_a],
+                                 index=0, key="cc_ckpt_b")
+
+        # Dataset must exist under both ckpts
+        ds_a = set(_list_datasets_for_ckpt(os.path.join(DATA_ATTN_ROOT, cc_ckpt_a)))
+        ds_b = set(_list_datasets_for_ckpt(os.path.join(DATA_ATTN_ROOT, cc_ckpt_b)))
+        _shared_ds = sorted(ds_a & ds_b)
+        if not _shared_ds:
+            st.error(f"No dataset is present under both `{cc_ckpt_a}` and `{cc_ckpt_b}`.")
+            st.stop()
+        _ds_idx = _shared_ds.index(_DEFAULT_DATASET) if _DEFAULT_DATASET in _shared_ds else 0
+        cc_dataset = st.selectbox("Dataset", _shared_ds, index=_ds_idx, key="cc_dataset")
+
+        cc_root_a = os.path.join(DATA_ATTN_ROOT, cc_ckpt_a, cc_dataset)
+        cc_root_b = os.path.join(DATA_ATTN_ROOT, cc_ckpt_b, cc_dataset)
+
+        # Camera must exist on both sides
+        _cc_cameras = [c for c in ("right", "left")
+                       if os.path.isdir(os.path.join(cc_root_a, c))
+                       and os.path.isdir(os.path.join(cc_root_b, c))]
+        if not _cc_cameras:
+            st.error("No shared camera between the two checkpoints for this dataset.")
+            st.stop()
+        cc_camera = st.radio("Camera", _cc_cameras, horizontal=True, key="cc_camera")
+        cc_root_a = os.path.join(cc_root_a, cc_camera)
+        cc_root_b = os.path.join(cc_root_b, cc_camera)
+
+        # Shared outcome / date / episode
+        _oc_a = set(_rl.list_outcomes(cc_root_a))
+        _oc_b = set(_rl.list_outcomes(cc_root_b))
+        _shared_oc = sorted(_oc_a & _oc_b)
+        if not _shared_oc:
+            st.error("No shared outcome between the two checkpoints.")
+            st.stop()
+        cc_outcome = st.selectbox("Outcome", _shared_oc, key="cc_outcome")
+
+        _d_a = set(_rl.list_dates(cc_root_a, cc_outcome))
+        _d_b = set(_rl.list_dates(cc_root_b, cc_outcome))
+        _shared_d = sorted(_d_a & _d_b, reverse=True)
+        if not _shared_d:
+            st.error("No shared date between the two checkpoints.")
+            st.stop()
+        cc_date = st.selectbox("Date", _shared_d, key="cc_date")
+
+        _e_a = set(_rl.list_episodes(cc_root_a, cc_outcome, cc_date))
+        _e_b = set(_rl.list_episodes(cc_root_b, cc_outcome, cc_date))
+        _shared_e = sorted(_e_a & _e_b)
+        if not _shared_e:
+            st.error("No shared episode between the two checkpoints for this date.")
+            st.stop()
+        cc_episode = st.selectbox("Episode", _shared_e, key="cc_episode")
+
+        st.markdown("---")
+        st.caption(f"**A**: `{cc_ckpt_a}` · **B**: `{cc_ckpt_b}` · `{cc_dataset}/{cc_camera}/{cc_outcome}/{cc_date}/{cc_episode}`")
+
+    elif mode == "Compare (Cross)":
+        st.markdown("**Side A**")
+        x_side_a = _select_side("A", _DEFAULT_CKPT, _DEFAULT_DATASET)
+        st.markdown("---")
+        st.markdown("**Side B**")
+        x_side_b = _select_side("B", _DEFAULT_CKPT, _DEFAULT_DATASET)
+        if x_side_a and x_side_b:
+            st.markdown("---")
+            st.caption(
+                f"**A**: `{x_side_a['ckpt']}/{x_side_a['dataset']}/{x_side_a['camera']}` · `{x_side_a['episode']}`  \n"
+                f"**B**: `{x_side_b['ckpt']}/{x_side_b['dataset']}/{x_side_b['camera']}` · `{x_side_b['episode']}`"
+            )
 
     elif mode == "Online (Inference)":
         from viz.dashboard import inference as _inf
@@ -353,6 +509,87 @@ with st.sidebar:
                     st.success("Inference complete!")
                 except Exception as e:
                     st.error(f"Inference failed: {e}")
+
+    elif mode == "Online (GR00T)":
+        # ── Online (GR00T) sidebar ──────────────────────────────────────────
+        # Talks to a GR00T server launched with `ATTN=1` (serve_gr00t_attn.py).
+        # We only need a zmq client here; no model load in the dashboard process.
+        from viz.dashboard import inference_gr00t as _gi
+
+        st.caption(
+            "Server must be running with attention capture: "
+            "`CUDA_VISIBLE_DEVICES=0 ATTN=1 bash viz_sim/run_gr00t_server.sh`"
+        )
+        gr00t_host = st.text_input("Host", value="localhost", key="gr00t_host")
+        gr00t_port = st.number_input(
+            "Port", min_value=1, max_value=65535, value=5555, step=1, key="gr00t_port",
+        )
+        gr00t_prompt = st.text_input(
+            "Instruction", value="pick up the red cube", key="gr00t_prompt",
+        )
+
+        st.markdown("**Images** (ext + wrist) — uploaded images are letterboxed to 180×320.")
+        gr00t_ext_file = st.file_uploader(
+            "Exterior camera", type=["jpg", "jpeg", "png"], key="gr00t_ext_img"
+        )
+        gr00t_wrist_file = st.file_uploader(
+            "Wrist camera", type=["jpg", "jpeg", "png"], key="gr00t_wrist_img"
+        )
+
+        gr00t_run = st.button("▶ Run GR00T Inference", type="primary", key="gr00t_run")
+
+        if gr00t_run:
+            from PIL import Image as _PIL
+            import io as _io
+
+            if gr00t_ext_file is None or gr00t_wrist_file is None:
+                st.error("Upload both ext and wrist images.")
+            else:
+                with st.spinner("Connecting and running inference…"):
+                    try:
+                        ext_img = np.asarray(_PIL.open(_io.BytesIO(gr00t_ext_file.read())).convert("RGB"))
+                        wrist_img = np.asarray(_PIL.open(_io.BytesIO(gr00t_wrist_file.read())).convert("RGB"))
+
+                        # Letterbox to 180×320 to match the model's training res.
+                        # Reuse the helper from run_policy_sim_gr00t.py.
+                        import sys as _sys
+                        _sys.path.insert(0, os.path.join(_PROJECT_ROOT, "viz_sim"))
+                        from run_policy_sim_gr00t import _resize_with_pad as _pad
+
+                        ext_padded = _pad(ext_img, 180, 320)
+                        wrist_padded = _pad(wrist_img, 180, 320)
+
+                        # Build the nested obs the GR00T DROID embodiment expects.
+                        # State dims set to neutral defaults — the dashboard isn't
+                        # tracking a real robot. (eef pose at origin, gripper open,
+                        # joint pose at home pose mean from statistics.json.)
+                        obs = {
+                            "video": {
+                                "exterior_image_1_left": ext_padded[None, None, ...],
+                                "wrist_image_left":      wrist_padded[None, None, ...],
+                            },
+                            "state": {
+                                "eef_9d": np.array(
+                                    [[[0.5, 0.0, 0.3, 1, 0, 0, 0, 1, 0]]],
+                                    dtype=np.float32),
+                                "gripper_position": np.array([[[0.0]]], dtype=np.float32),
+                                "joint_position": np.array(
+                                    [[[0.01, 0.28, -0.02, -1.95, -0.03, 2.23, 0.10]]],
+                                    dtype=np.float32),
+                            },
+                            "language": {
+                                "annotation.language.language_instruction":
+                                    [[gr00t_prompt]],
+                            },
+                        }
+
+                        client = _gi.get_client(host=gr00t_host, port=int(gr00t_port))
+                        slice_dict = _gi.run_inference(client, obs, instruction=gr00t_prompt)
+                        st.session_state["gr00t_data"] = slice_dict
+                        st.success("Inference complete!")
+                    except Exception as e:
+                        st.error(f"Inference failed: {e}")
+                        st.exception(e)
 
     elif mode == "Online (Upload)":
         # ── Online (Upload) mode sidebar ──────────────────────────────────────
@@ -784,10 +1021,38 @@ elif mode == "Compare Episodes":
     if not cmp_ep_outcome_sel:
         st.info("Select at least one outcome (success / failure) in the sidebar.")
         st.stop()
-    episode_compare.render(
-        root=_cmp_root,
-        date=cmp_ep_date,
-        outcomes=cmp_ep_outcome_sel,
+    try:
+        episode_compare.render(
+            root=_cmp_root,
+            date=cmp_ep_date,
+            outcomes=cmp_ep_outcome_sel,
+        )
+    except Exception as _e:
+        import traceback as _tb
+        st.error(f"Compare Episodes render failed: **{type(_e).__name__}**: {_e}")
+        st.code(_tb.format_exc(), language="text")
+
+elif mode == "Compare Checkpoints":
+    st.header(f"🔀 Compare Checkpoints — `{cc_ckpt_a}` ↔ `{cc_ckpt_b}` · `{cc_dataset}` · {cc_camera}")
+    episode_compare.render_checkpoint_compare(
+        root_a=cc_root_a, root_b=cc_root_b,
+        label_a=cc_ckpt_a, label_b=cc_ckpt_b,
+        outcome=cc_outcome, date=cc_date, episode=cc_episode,
+    )
+
+elif mode == "Compare (Cross)":
+    if not (x_side_a and x_side_b):
+        st.info("Pick a checkpoint/dataset/episode on both sides in the sidebar.")
+        st.stop()
+    st.header(f"🔀 Cross Compare — A: `{x_side_a['ckpt']}/{x_side_a['dataset']}` ↔ B: `{x_side_b['ckpt']}/{x_side_b['dataset']}`")
+    label_a = f"{x_side_a['ckpt']}/{x_side_a['dataset']}/{x_side_a['episode']}"
+    label_b = f"{x_side_b['ckpt']}/{x_side_b['dataset']}/{x_side_b['episode']}"
+    episode_compare._render_comparison(
+        root_a=x_side_a['root'],
+        a=(x_side_a['outcome'], x_side_a['date'], x_side_a['episode']),
+        b=(x_side_b['outcome'], x_side_b['date'], x_side_b['episode']),
+        root_b=x_side_b['root'],
+        label_a=label_a, label_b=label_b,
     )
 
 elif mode == "Online (Inference)":
@@ -854,6 +1119,21 @@ elif mode == "Online (Inference)":
             mem_images=data.get("images"),
             mem_denoising=data.get("suffix_denoising"),
         )
+
+elif mode == "Online (GR00T)":
+    st.header("Online GR00T Mode")
+
+    if "gr00t_data" not in st.session_state:
+        st.info(
+            "1. Launch the server: `CUDA_VISIBLE_DEVICES=0 ATTN=1 bash viz_sim/run_gr00t_server.sh`\n"
+            "2. Upload an exterior + wrist image in the sidebar.\n"
+            "3. Click **▶ Run GR00T Inference**.\n\n"
+            "The view shows Qwen3-VL backbone attention. DiT (action-head) "
+            "attention is not captured yet — see task #8."
+        )
+        st.stop()
+
+    gr00t_attn_view.render(st.session_state["gr00t_data"])
 
 elif mode == "Online (Upload)":
     # ── Online (Upload) mode ──────────────────────────────────────────────────

@@ -277,3 +277,83 @@ class Pi0(_model.BaseModel):
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
+
+    def sample_actions_cpg(
+        self,
+        rng: at.KeyArrayLike,
+        observation_pos: _model.Observation,
+        observation_neg: _model.Observation,
+        *,
+        cpg_w: float | at.Float[at.Array, ""] = 1.0,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+    ) -> _model.Actions:
+        """DeLock contrastive prompt guidance sampling (JAX).
+
+        At each Euler step:
+            v_cpg = v(o, τ⁻, t) + w · (v(o, τ⁺, t) − v(o, τ⁻, t))
+            x_{t+dt} = x_t + dt · v_cpg
+
+        Reduces to vanilla `sample_actions(observation_pos)` when `cpg_w == 1.0`,
+        and to `sample_actions(observation_neg)` when `cpg_w == 0.0`.
+        Paper uses `cpg_w > 1` (extrapolation along the contrastive direction).
+
+        ``observation_pos`` / ``observation_neg`` must share images, image masks,
+        state, and image-token padding — only ``tokenized_prompt`` /
+        ``tokenized_prompt_mask`` differ. The prefix is KV-cached per prompt;
+        per-step cost is ~2× the suffix forward.
+        """
+        observation_pos = _model.preprocess_observation(None, observation_pos, train=False)
+        observation_neg = _model.preprocess_observation(None, observation_neg, train=False)
+
+        dt = -1.0 / num_steps
+        batch_size = observation_pos.state.shape[0]
+        if noise is None:
+            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+
+        # Build two KV caches (one per prompt) by forwarding each prefix once.
+        prefix_pos_tokens, prefix_pos_mask, prefix_pos_ar_mask = self.embed_prefix(observation_pos)
+        prefix_neg_tokens, prefix_neg_mask, prefix_neg_ar_mask = self.embed_prefix(observation_neg)
+        prefix_pos_attn_mask = make_attn_mask(prefix_pos_mask, prefix_pos_ar_mask)
+        prefix_neg_attn_mask = make_attn_mask(prefix_neg_mask, prefix_neg_ar_mask)
+        positions_pos = jnp.cumsum(prefix_pos_mask, axis=1) - 1
+        positions_neg = jnp.cumsum(prefix_neg_mask, axis=1) - 1
+        _, kv_cache_pos = self.PaliGemma.llm(
+            [prefix_pos_tokens, None], mask=prefix_pos_attn_mask, positions=positions_pos
+        )
+        _, kv_cache_neg = self.PaliGemma.llm(
+            [prefix_neg_tokens, None], mask=prefix_neg_attn_mask, positions=positions_neg
+        )
+
+        def _denoise(x_t, time, observation, prefix_tokens, prefix_mask, kv_cache):
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                observation, x_t, jnp.broadcast_to(time, batch_size)
+            )
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+            prefix_attn_mask_b = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+            full_attn_mask = jnp.concatenate([prefix_attn_mask_b, suffix_attn_mask], axis=-1)
+            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            (_, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=positions,
+                kv_cache=kv_cache,
+                adarms_cond=[None, adarms_cond],
+            )
+            return self.action_out_proj(suffix_out[:, -self.action_horizon :])
+
+        def step(carry):
+            x_t, time = carry
+            v_pos = _denoise(x_t, time, observation_pos,
+                             prefix_pos_tokens, prefix_pos_mask, kv_cache_pos)
+            v_neg = _denoise(x_t, time, observation_neg,
+                             prefix_neg_tokens, prefix_neg_mask, kv_cache_neg)
+            v_cpg = v_neg + cpg_w * (v_pos - v_neg)
+            return x_t + dt * v_cpg, time + dt
+
+        def cond(carry):
+            _, time = carry
+            return time >= -dt / 2
+
+        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+        return x_0

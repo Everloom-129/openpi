@@ -133,29 +133,71 @@ def init_train_state(
     return train_state, state_sharding
 
 
+def _vis_reg_filter(path_regex: str):
+    """Filter selecting visual-encoder params (DeLock weight-drift regularizer)."""
+    return nnx.All(nnx.Param, nnx_utils.PathRegex(path_regex))
+
+
+def _vis_drift_l2(current_params, vis_pre_params) -> jnp.ndarray:
+    """L2 penalty between current and pre-trained visual-encoder param subtrees.
+
+    Both pytrees must have identical structure (same paths, same shapes). We sum
+    the squared diff over all leaves and return a scalar.
+    """
+    diffs = jax.tree.map(lambda c, p: jnp.sum(jnp.square(c.astype(jnp.float32) - p.astype(jnp.float32))),
+                         current_params, vis_pre_params)
+    leaves = jax.tree.leaves(diffs)
+    if not leaves:
+        return jnp.zeros((), dtype=jnp.float32)
+    return jnp.stack(leaves).sum()
+
+
 @at.typecheck
 def train_step(
     config: _config.TrainConfig,
     rng: at.KeyArrayLike,
     state: training_utils.TrainState,
     batch: tuple[_model.Observation, _model.Actions],
+    vis_pre_params: Any = None,
 ) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
     model = nnx.merge(state.model_def, state.params)
     model.train()
+
+    use_vis_reg = (config.vis_reg_lambda > 0) and (vis_pre_params is not None)
 
     @at.typecheck
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
+        """Returns (total_loss, (bc_loss, reg_loss_scaled, reg_raw)).
+
+        We return the components alongside so the train info dict can log
+        them separately — this is the only way to know whether
+        `vis_reg_lambda` is in the right order of magnitude. If `reg_loss
+        ≪ bc_loss` the regularizer is doing nothing; if `reg_loss ≫ bc_loss`
+        it dominates and the model can't learn the task.
+        """
         chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        bc_loss = jnp.mean(chunked_loss)
+        if use_vis_reg:
+            vis_now = nnx.state(model, _vis_reg_filter(config.vis_reg_path_regex))
+            reg_raw = _vis_drift_l2(vis_now, vis_pre_params)
+            reg_scaled = config.vis_reg_lambda * reg_raw
+            total = bc_loss + reg_scaled
+        else:
+            reg_raw = jnp.zeros((), dtype=jnp.float32)
+            reg_scaled = jnp.zeros((), dtype=jnp.float32)
+            total = bc_loss
+        return total, (bc_loss, reg_scaled, reg_raw)
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    (loss, (bc_loss, reg_loss_scaled, reg_loss_raw)), grads = nnx.value_and_grad(
+        loss_fn, argnums=diff_state, has_aux=True,
+    )(model, train_rng, observation, actions)
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -185,6 +227,9 @@ def train_step(
     )
     info = {
         "loss": loss,
+        "loss_bc": bc_loss,
+        "loss_reg_scaled": reg_loss_scaled,  # λ · ‖θ_v − θ_v_pre‖² (the actual term added to loss)
+        "loss_reg_raw": reg_loss_raw,        # ‖θ_v − θ_v_pre‖² (pre-λ; tracks vis-encoder drift directly)
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
@@ -240,12 +285,41 @@ def main(config: _config.TrainConfig):
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
 
-    ptrain_step = jax.jit(
-        functools.partial(train_step, config),
-        in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
-        out_shardings=(train_state_sharding, replicated_sharding),
-        donate_argnums=(1,),
-    )
+    # DeLock: snapshot the visual-encoder param subtree as the pre-trained
+    # reference θ_v_pre. We snapshot AFTER weight loading so that the reference
+    # is the *loaded* pre-trained weights, not the random init. This must be
+    # done before any training step mutates the params.
+    vis_pre_params = None
+    vis_pre_sharding: Any = None
+    if config.vis_reg_lambda > 0:
+        merged = nnx.merge(train_state.model_def, train_state.params)
+        vis_pre_params = jax.tree.map(jnp.array,
+                                      nnx.state(merged, _vis_reg_filter(config.vis_reg_path_regex)))
+        n_leaves = len(jax.tree.leaves(vis_pre_params))
+        if n_leaves == 0:
+            raise ValueError(
+                f"DeLock vis_reg_lambda={config.vis_reg_lambda} > 0 but path regex "
+                f"{config.vis_reg_path_regex!r} matched zero parameters."
+            )
+        logging.info(f"DeLock vis-reg active: λ={config.vis_reg_lambda}, "
+                     f"{n_leaves} param leaves under {config.vis_reg_path_regex!r}")
+        vis_pre_sharding = jax.tree.map(lambda _: replicated_sharding, vis_pre_params)
+
+    if config.vis_reg_lambda > 0:
+        ptrain_step = jax.jit(
+            functools.partial(train_step, config),
+            in_shardings=(replicated_sharding, train_state_sharding, data_sharding, vis_pre_sharding),
+            out_shardings=(train_state_sharding, replicated_sharding),
+            donate_argnums=(1,),
+            static_argnames=(),
+        )
+    else:
+        ptrain_step = jax.jit(
+            functools.partial(train_step, config),
+            in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+            out_shardings=(train_state_sharding, replicated_sharding),
+            donate_argnums=(1,),
+        )
 
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
@@ -258,7 +332,10 @@ def main(config: _config.TrainConfig):
     infos = []
     for step in pbar:
         with sharding.set_mesh(mesh):
-            train_state, info = ptrain_step(train_rng, train_state, batch)
+            if vis_pre_params is not None:
+                train_state, info = ptrain_step(train_rng, train_state, batch, vis_pre_params)
+            else:
+                train_state, info = ptrain_step(train_rng, train_state, batch)
         infos.append(info)
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)

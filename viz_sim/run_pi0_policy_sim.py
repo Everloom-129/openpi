@@ -422,7 +422,16 @@ def main():
                     help="(robocasa only) zero env_action[7:11] (torso + base x/y/yaw) and "
                          "force control_mode=-1 so only the arm + gripper are driven. "
                          "Use to isolate manipulator behavior from mobile-base / torso noise.")
+    ap.add_argument("--prompt_neg", default=None,
+                    help="DeLock CPG: negative (trained) prompt that captures post-training bias. "
+                         "When set together with --cpg_w, the server runs contrastive prompt guidance: "
+                         "v_cpg = v_neg + w*(v_pos - v_neg), where v_pos is conditioned on --prompt.")
+    ap.add_argument("--cpg_w", type=float, default=None,
+                    help="DeLock CPG guidance scale. w=1 recovers vanilla --prompt sampling, "
+                         "w=0 recovers --prompt_neg sampling, w>1 extrapolates along the contrast.")
     args = ap.parse_args()
+    if (args.prompt_neg is None) != (args.cpg_w is None):
+        ap.error("--prompt_neg and --cpg_w must be set together (CPG is opt-in).")
 
     is_libero = args.config == "pi05_libero"
     is_robocasa = args.config == "pi05_robocasa365"
@@ -537,6 +546,9 @@ def main():
                 policy_obs = make_robocasa_obs(obs, args.prompt)
             else:
                 policy_obs = make_droid_obs(obs, args.prompt)
+            if args.prompt_neg is not None and args.cpg_w is not None:
+                policy_obs["prompt_neg"] = args.prompt_neg
+                policy_obs["cpg_w"] = float(args.cpg_w)
             result = policy.infer(policy_obs)
             chunk = np.asarray(result["actions"])  # (N, 7) libero, (N, 8) droid/robocasa365
             n_infer += 1

@@ -91,14 +91,52 @@ class AttnCapturingPolicy(_base_policy.BasePolicy):
                 camera=perturb.get("camera"),
                 layer=int(perturb.get("layer", 7)),
             )
-        self._gpt.enable_attn_buffer()
+
+        # DeLock contrastive prompt guidance: client may set `prompt_neg`
+        # (trained prompt that captures post-training bias) and `cpg_w`
+        # (guidance scale). When both are present, route through the
+        # CPG-capable Policy.infer_cpg path; otherwise fall back to the
+        # standard infer().
+        prompt_neg = obs.pop("prompt_neg", None) if isinstance(obs, dict) else None
+        cpg_w = obs.pop("cpg_w", None) if isinstance(obs, dict) else None
+        use_cpg = prompt_neg is not None and cpg_w is not None
+
+        # Attention buffer mixes both forwards under CPG (τ⁺ and τ⁻ both write
+        # to the same global buffer); the resulting `text_to_img_attn` would
+        # be incoherent. Skip the capture in CPG mode — to compare τ⁺ vs τ⁻
+        # attention, run two non-CPG rollouts (one per prompt) and diff client
+        # side. This matches paper Fig 4(a)'s methodology anyway.
+        capture_attn = not use_cpg
+        if capture_attn:
+            self._gpt.enable_attn_buffer()
+        # Always capture the per-denoising-step action trajectory: it's a
+        # `(num_steps, action_horizon, action_dim)` artifact that's small and
+        # cheap, and the CPG sweep runner needs it to build the export npz.
+        self._gpt.enable_action_traj_buffer()
         try:
-            result = self._inner.infer(obs)
-            buf = self._gpt.get_attn_buffer() or {}
+            if use_cpg:
+                obs_neg = {**obs, "prompt": prompt_neg}
+                result = self._inner.infer_cpg(obs, obs_neg, cpg_w=float(cpg_w))
+            else:
+                result = self._inner.infer(obs)
+            buf = self._gpt.get_attn_buffer() if capture_attn else {}
+            buf = buf or {}
+            traj_buf = self._gpt.get_action_traj_buffer() or []
         finally:
-            self._gpt.clear_attn_buffer()
+            if capture_attn:
+                self._gpt.clear_attn_buffer()
+            self._gpt.clear_action_traj_buffer()
             if perturb is not None:
                 self._gpt.clear_perturbation()
+
+        if traj_buf:
+            try:
+                # (num_steps, action_horizon, action_dim) float32
+                result["action_trajectory"] = np.stack(
+                    [np.asarray(x, dtype=np.float32) for x in traj_buf], axis=0,
+                )
+            except Exception as e:  # fail-soft, never break inference
+                logging.warning("action trajectory stacking failed: %s", e)
 
         if buf:
             try:
